@@ -2039,3 +2039,37 @@ class LinearModelWithBaselineHRF(LinearModelWithBaseline, HRFEncodingModel):
     @tf.function
     def _predict_no_hrf(self, paradigm, parameters, weights):
         return LinearModelWithBaseline._predict(self, paradigm, parameters, weights)
+
+
+# **********************************************************************************************************************
+from braincoder.stimuli import ContrastSensitivityStimulus
+class ContrastSensitivity(EncodingModel):
+    
+    parameter_label = [
+        'width_r', 'SFp', 'CSp', 'width_l', 'crf_exp', 'amplitude', 'baseline']
+    
+    def __init__(self, paradigm=None, data=None, parameters=None,
+                    weights=None, omega=None, allow_neg_amplitudes=False, verbosity=logging.INFO, 
+                    **kwargs):
+    
+        if allow_neg_amplitudes:
+            self._transform_parameters_forward = self._transform_parameters_forward1
+            self._transform_parameters_backward = self._transform_parameters_backward1
+        else:
+            self._transform_parameters_forward = self._transform_parameters_forward2
+            self._transform_parameters_backward = self._transform_parameters_backward2
+
+        self.stimulus_type = ContrastSensitivityStimulus
+        # self._basis_predictions = self.
+
+    @tf.function
+    def _basis_predictions_without_amplitude(self, paradigm, parameters):
+        # paradigm: n_batches x n_timepoints x n_stimulus_features
+        # parameters:: n_batches x n_voxels x n_parameters
+
+        # norm: n_batches x n_timepoints x n_voxels
+
+        # output: n_batches x n_timepoints x n_voxels
+
+        return tf.tensordot(paradigm, parameters[:, :, :-1], (2, 1))[:, :, 0, :] + parameters[:, :, -1]
+    
