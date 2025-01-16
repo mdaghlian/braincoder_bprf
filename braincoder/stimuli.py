@@ -21,7 +21,6 @@ class Stimulus(object):
     def clean_paradigm(self, paradigm):
 
         if (not isinstance(paradigm, pd.DataFrame)) and (paradigm is not None):
-
             if isinstance(paradigm, pd.Series):
                 paradigm = paradigm.to_frame()
                 paradigm.columns = self.dimension_labels
@@ -167,4 +166,4 @@ class ContrastSensitivityStimulus(Stimulus):
         self.bijectors = [
             tfp.bijectors.Identity(name=label) for label in self.dimension_labels
         ]
-        # Inheriting the rest from the basic stimulus class should work
+        # Inheriting the rest from the basic stimulus class should work        
