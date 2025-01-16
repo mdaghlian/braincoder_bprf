@@ -13,8 +13,8 @@ requirements = ['tqdm', 'pandas', 'matplotlib', 'seaborn', 'pingouin']
 test_requirements = []
 
 setup(
-    author="Gilles de Hollander",
-    author_email='giles.de.hollander@gmail.com',
+    # author="Gilles de Hollander",
+    # author_email='giles.de.hollander@gmail.com',
     python_requires='>=3.6',
     classifiers=[
         'Development Status :: 2 - Pre-Alpha',
@@ -26,18 +26,18 @@ setup(
         'Programming Language :: Python :: 3.7',
         'Programming Language :: Python :: 3.8',
     ],
-    description="Bayesian encoding/decoding of fMRI data",
+    # description="Bayesian encoding/decoding of fMRI data",
     install_requires=requirements,
     license="MIT license",
     long_description=readme,
-    keywords='braincoder',
-    name='braincoder',
-    packages=find_packages(include=['braincoder', 'braincoder.*']),
-    package_data={'braincoder': ['data/szinte2024/*']},
+    keywords='bcoder_mini',
+    name='bcoder_mini',
+    packages=find_packages(include=['bcoder_mini', 'bcoder_mini.*']),
+    package_data={'bcoder_mini': ['data/szinte2024/*']},
     include_package_data=True,
     test_suite='tests',
     tests_require=test_requirements,
-    url='https://github.com/Gilles86/braincoder',
+    # url='https://github.com/Gilles86/braincoder',
     version='0.1.0',
     zip_safe=False,
 )

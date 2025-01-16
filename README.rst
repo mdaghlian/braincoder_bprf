@@ -1,11 +1,10 @@
-Welcome to Braincoder's documentation!
-======================================
+bcoder_minimal -> stripped down version of brain coder (from Gilles86)
 
-**Braincoder** is a package to fit encoding models to neural data (for now fMRI) and
-to then *invert* those models to decode stimulus information from neural data.
+Removing the decoding part. Using it just as a tensorflow implementation of prfpy essentially
 
-Important links
-===============
+
+TODO: update all the citation stuff to accurately give everyone their credit!!
+............
 
 - Official source code repo: https://github.com/Gilles86/braincoder/tree/main
 - HTML documentation (stable release): https://braincoder-devs.github.io/
