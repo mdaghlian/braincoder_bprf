@@ -161,7 +161,7 @@ class EncodingModel(object):
         self._weights = format_weights(weights)
 
     def to_discrete_model(self, grid, parameters=None, weights=None):
-
+        
         grid = np.array(grid, dtype=np.float32)[:, np.newaxis]
         parameters = format_parameters(parameters)
         weights = format_weights(weights)
@@ -1496,7 +1496,6 @@ class GaussianPRF2D(EncodingModel):
 
 
     def get_rf(self, as_frame=False, unpack=False, parameters=None):
-
         grid_coordinates = self.grid_coordinates.values
 
         parameters = self._get_parameters(parameters)
@@ -1527,12 +1526,11 @@ class GaussianPRF2D(EncodingModel):
         rf = self._get_rf(self.grid_coordinates, parameters)
         baseline = parameters[:, tf.newaxis, :, 3]
         result = tf.tensordot(paradigm, rf, (2, 2))[:, :, 0, :] + baseline
-
         return result
 
     @tf.function
     def _get_rf(self, grid_coordinates, parameters, normalize=True):
-
+        
         # n_batches x n_populations x  n_grid_spaces
         x = grid_coordinates[:, 0][tf.newaxis, tf.newaxis, :]
         y = grid_coordinates[:, 1][tf.newaxis, tf.newaxis, :]
@@ -1548,7 +1546,6 @@ class GaussianPRF2D(EncodingModel):
         if normalize:
             norm = sd * tf.sqrt(2 * np.pi) / self.pixel_area
             gauss = gauss / norm
-        
         return gauss
 
     @tf.function
@@ -2045,31 +2042,245 @@ class LinearModelWithBaselineHRF(LinearModelWithBaseline, HRFEncodingModel):
 from braincoder.stimuli import ContrastSensitivityStimulus
 class ContrastSensitivity(EncodingModel):
     
-    parameter_label = [
-        'width_r', 'SFp', 'CSp', 'width_l', 'crf_exp', 'amplitude', 'baseline']
-    
-    def __init__(self, paradigm=None, data=None, parameters=None,
-                    weights=None, omega=None, allow_neg_amplitudes=False, verbosity=logging.INFO, 
-                    **kwargs):
-    
-        if allow_neg_amplitudes:
-            self._transform_parameters_forward = self._transform_parameters_forward1
-            self._transform_parameters_backward = self._transform_parameters_backward1
-        else:
-            self._transform_parameters_forward = self._transform_parameters_forward2
-            self._transform_parameters_backward = self._transform_parameters_backward2
+    parameter_labels = [
+        'width_r',      # 0
+        'SFp',          # 1
+        'CSp',          # 2
+        'width_l',      # 3
+        'crf_exp',      # 4
+        'amplitude',    # 5
+        'baseline',     # 6
+        ]
+    stimulus_type = ContrastSensitivityStimulus
 
-        self.stimulus_type = ContrastSensitivityStimulus
-        # self._basis_predictions = self.
+    def __init__(self, data=None, parameters=None,  
+                    SF_seq=None, CON_seq=None,               
+                    weights=None, omega=None, allow_neg_amplitudes=False, bounds=None, 
+                    verbosity=logging.INFO, 
+                    **kwargs):
+        self.data = data
+        self.parameters = format_parameters(parameters)
+        self.weights = weights
+        self.omega = omega
+        grid = np.vstack([SF_seq, CON_seq]).T
+        self.stim_sequence = pd.DataFrame(
+            grid, columns=['SF', 'CON']).astype('float32')
+        self._stim_sequence = self.stim_sequence.values
+        self.n_SF = len(self.stim_sequence['SF'].unique())
+        self.n_CON = len(self.stim_sequence['CON'].unique())
+
+        self.stimulus = self.stimulus_type()
+        self.paradigm = self.stimulus.clean_paradigm(self.stim_sequence)
+
+        if omega is not None:
+            self.omega_chol = np.linalg.cholesky(omega)
+
+    def get_csf_for_plot(self, SF_grid, CON_grid, parameters=None):
+        ''' Get the csf for a grid of SF and CON values '''
+        if len(SF_grid.shape) == 1:
+            SF_grid, CON_grid = np.meshgrid(SF_grid, CON_grid)
+        SF_grid, CON_grid = SF_grid.flatten(), CON_grid.flatten()
+        grid = np.vstack([SF_grid, CON_grid]).T
+        stim_sequence = pd.DataFrame(
+            grid, columns=['SF', 'CON']).astype('float32')
+        stim_sequence = stim_sequence.values
+
+        parameters = self._get_parameters(parameters)
+        parameters = self.parameters.values[np.newaxis, ...]
+
+        csf = self._get_csf(stim_sequence, parameters).numpy()[0]
+        
+        return csf, SF_grid, CON_grid
+
+    def get_csf(self, as_frame=False, unpack=False, parameters=None):
+        ''' Get the csf seq at each pt in the SF'''
+        grid = self.stim_sequence.values
+
+        parameters = self._get_parameters(parameters)
+        parameters = self.parameters.values[np.newaxis, ...]
+        csf = self._get_csf(grid, parameters).numpy()[0]
+
+        return csf
+
 
     @tf.function
-    def _basis_predictions_without_amplitude(self, paradigm, parameters):
+    def _basis_predictions(self, paradigm, parameters):
         # paradigm: n_batches x n_timepoints x n_stimulus_features
         # parameters:: n_batches x n_voxels x n_parameters
 
         # norm: n_batches x n_timepoints x n_voxels
 
         # output: n_batches x n_timepoints x n_voxels
-
-        return tf.tensordot(paradigm, parameters[:, :, :-1], (2, 1))[:, :, 0, :] + parameters[:, :, -1]
+        csf = self._get_csf(self.stim_sequence, parameters)
+        baseline = parameters[:, :, 6, tf.newaxis]
+        # result = tf.tensordot(paradigm, rf, (2, 2))[:, :, 0, :] + baseline
+        result = csf + baseline
+        # Want the output to be n_batches x n_timepoints x n_voxels
+        result = tf.transpose(result, [0, 2, 1])
+        return result
     
+    @tf.function
+    def _get_csf(self, stim_sequence, parameters):
+
+        # n_batches x n_populations x  n_grid_spaces
+        SF_seq = stim_sequence[:, 0][tf.newaxis, tf.newaxis, :]
+        CON_seq = stim_sequence[:, 1][tf.newaxis, tf.newaxis, :]
+
+        
+        # n_batches x n_populations x n_grid_spaces (broadcast)
+        width_r = parameters[:, :, 0, tf.newaxis]
+        SFp = parameters[:, :, 1, tf.newaxis]
+        CSp = parameters[:, :, 2, tf.newaxis]
+        width_l = parameters[:, :, 3, tf.newaxis]        
+        crf_exp = parameters[:, :, 4, tf.newaxis]
+        amplitude = parameters[:, :, 5, tf.newaxis]
+        
+        # Safeguard against log of non-positive values
+        SF_seq_safe = tf.maximum(SF_seq, 1e-8)
+        SFp_safe = tf.maximum(SFp, 1e-8)
+        CSp_safe = tf.maximum(CSp, 1e-8)
+
+        # Logarithmic transformations
+        log10 = tf.math.log(10.0)
+        log_SF_seq  = tf.math.log(SF_seq_safe) / log10
+        log_SFp     = tf.math.log(SFp_safe) / log10
+        log_CSp     = tf.math.log(CSp_safe) / log10        
+
+        # log_SF_seq  = tf.keras.ops.log10(SF_seq_safe)
+        # log_SFp     = tf.keras.ops.log10(SFp_safe) 
+        # log_CSp     = tf.keras.ops.log10(CSp_safe) 
+
+        # Split stimulus space into left and right
+        is_left = SF_seq < SFp
+
+        # Create the curves
+        L_curve = tf.math.pow(10.0, log_CSp - ((log_SF_seq - log_SFp) ** 2) * (width_l ** 2))
+        R_curve = tf.math.pow(10.0, log_CSp - ((log_SF_seq - log_SFp) ** 2) * (width_r ** 2))
+
+        # Combine the curves using boolean masks
+        csf = tf.where(is_left, L_curve, R_curve)
+
+        # Contrast sensitivity
+        cthresh = 100 / tf.maximum(csf, 1e-8)
+
+        ncsf_resp = ((CON_seq ** crf_exp) / (CON_seq ** crf_exp + cthresh ** crf_exp)) * amplitude
+        return ncsf_resp
+
+    @tf.function
+    def _transform_parameters_forward(self, parameters):
+        ''' Force amplidute to be positive '''
+        par_out = tf.concat([
+            parameters[:, 0][:, tf.newaxis],                # width_r
+            parameters[:, 1][:, tf.newaxis],                # SFp            
+            parameters[:, 2][:, tf.newaxis],                # CSp
+            parameters[:, 3][:, tf.newaxis],                # width_l
+            parameters[:, 4][:, tf.newaxis],                # crf_exp
+            tf.math.softplus(parameters[:, 5][:, tf.newaxis]), # amplitude
+            parameters[:, 6][:, tf.newaxis]],               # baseline
+            axis=1)
+        # Force them all to be positive
+
+        # par_out = tf.concat([
+        #     tf.math.softplus(parameters[:, 0][:, tf.newaxis]),                # width_r
+        #     tf.math.softplus(parameters[:, 1][:, tf.newaxis]),                # SFp
+        #     tf.math.softplus(parameters[:, 2][:, tf.newaxis]),                # CSp
+        #     tf.math.softplus(parameters[:, 3][:, tf.newaxis]),                # width_l
+        #     tf.math.softplus(parameters[:, 4][:, tf.newaxis]),                # crf_exp
+        #     tf.math.softplus(parameters[:, 5][:, tf.newaxis]),                # amplitude
+        #     parameters[:, 6][:, tf.newaxis]],               # baseline
+        #     axis=1)        
+        return par_out
+    
+    @tf.function
+    def _transform_parameters_backward(self, parameters):
+        par_out = tf.concat([
+            parameters[:, 0][:, tf.newaxis],                # width_r
+            parameters[:, 1][:, tf.newaxis],                # SFp            
+            parameters[:, 2][:, tf.newaxis],                # CSp
+            parameters[:, 3][:, tf.newaxis],                # width_l
+            parameters[:, 4][:, tf.newaxis],                # crf_exp
+            tfp.math.softplus_inverse(parameters[:, 5][:, tf.newaxis]), # amplitude
+            parameters[:, 6][:, tf.newaxis]],               # baseline
+            axis=1)
+        # Force them all to be positive
+        # par_out = tf.concat([
+        #     tfp.math.softplus_inverse(parameters[:, 0][:, tf.newaxis]),                # width_r
+        #     tfp.math.softplus_inverse(parameters[:, 1][:, tf.newaxis]),                # SFp
+        #     tfp.math.softplus_inverse(parameters[:, 2][:, tf.newaxis]),                # CSp
+        #     tfp.math.softplus_inverse(parameters[:, 3][:, tf.newaxis]),                # width_l
+        #     tfp.math.softplus_inverse(parameters[:, 4][:, tf.newaxis]),                # crf_exp
+        #     tfp.math.softplus_inverse(parameters[:, 5][:, tf.newaxis]),                # amplitude
+        #     parameters[:, 6][:, tf.newaxis]],               # baseline
+        #     axis=1)
+        return par_out
+    
+    # def get_pseudoWWT(self, remove_baseline=True):
+
+    #     parameters = self._get_parameters().copy()
+        
+    #     if remove_baseline:
+    #         parameters['baseline'] = np.float32(0.0)
+
+    #     csf = self.get_csf(parameters=parameters.astype(np.float32))
+
+    #     return csf # ?? hmm
+
+    # def to_linear_model(self):
+    #     return LinearModelWithBaseline(self.paradigm, self.data, self.parameters[['baseline']], weights=self.get_csf())
+
+    # def unpack_stimulus(self, stimulus):
+    #     return np.reshape(stimulus, (-1, self.n_x, self.n_y))    
+    
+
+class ContrastSensitivityWithHRF(HRFEncodingModel, ContrastSensitivity):
+    def __init__(
+        self, data=None, parameters=None,  
+        SF_seq=None, CON_seq=None,               
+        weights=None, omega=None, allow_neg_amplitudes=False, bounds=None,
+        hrf_model=None, flexible_hrf_parameters=False, verbosity=logging.INFO, **kwargs
+        ):
+
+        ContrastSensitivity.__init__(
+            self, data=data, parameters=parameters,
+            SF_seq=SF_seq, CON_seq=CON_seq,
+            weights=weights, omega=omega, allow_neg_amplitudes=allow_neg_amplitudes,
+            bounds=bounds, verbosity=verbosity, **kwargs
+        )
+        HRFEncodingModel.__init__(
+            self, hrf_model=hrf_model, flexible_hrf_parameters=flexible_hrf_parameters,             
+            verbosity=logging.INFO, **kwargs
+        )
+    
+    # def to_linear_model(self):
+    #     return LinearModelWithBaselineHRF(self.paradigm, self.data,
+    #                                       self.parameters[[
+    #                                           'baseline']], weights=self.get_rf().T,
+    #                                       hrf_model=self.hrf_model)
+
+    @tf.function
+    def _transform_parameters_forward(self, parameters):
+
+        if self.flexible_hrf_parameters:
+            n_hrf_pars = len(self.hrf_model.parameter_labels)
+
+            encoding_pars = ContrastSensitivity._transform_parameters_forward(self, parameters[:, :-n_hrf_pars])
+            hrf_pars = self.hrf_model._transform_parameters_forward(parameters[:, -n_hrf_pars:])
+            
+            return tf.concat([encoding_pars, hrf_pars], axis=1)
+        else:
+            return ContrastSensitivity._transform_parameters_forward(self, parameters)
+
+    @tf.function
+    def _transform_parameters_backward(self, parameters):
+        
+        if self.flexible_hrf_parameters:
+            n_hrf_pars = len(self.hrf_model.parameter_labels)
+
+            encoding_pars = ContrastSensitivity._transform_parameters_backward(self, parameters[:, :-n_hrf_pars])
+            hrf_pars = self.hrf_model._transform_parameters_backward(parameters[:, -n_hrf_pars:])
+            
+
+
+            return tf.concat([encoding_pars, hrf_pars], axis=1)
+        else:
+            return ContrastSensitivity._transform_parameters_backward(self, parameters)        

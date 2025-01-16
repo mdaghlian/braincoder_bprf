@@ -149,9 +149,7 @@ class ParameterFitter(object):
             def get_ssq(parameters):
                 predictions = self.model._predict(
                     paradigm_[tf.newaxis, ...], parameters[tf.newaxis, ...], None)
-
                 residuals = y - predictions[0]
-
                 ssq = tf.reduce_sum(residuals**2, 0)
                 return ssq
 
