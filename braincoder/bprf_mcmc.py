@@ -130,8 +130,9 @@ class BPRF(object):
             progressbar=True,
             **kwargs):
 
+        
+        
         n_voxels, n_pars = self.data.shape[1], len(self.model.parameter_labels)
-
         y = self.data.values
 
         if init_pars is None:
@@ -179,97 +180,105 @@ class BPRF(object):
 
         trainable_variables = [trainable_parameters]
 
-        if confounds is not None:
-            # n_voxels x 1 x n_timepoints x n variables
-            confounds = tf.repeat(
-                confounds[tf.newaxis, tf.newaxis, :, :], n_voxels, 0)
         paradigm_ = self.model.stimulus._clean_paradigm(self.paradigm)
+        priors_to_loop = list(self.model_prior.keys())
 
         # Define the prior
         @tf.function
-        def log_prior(parameters):
+        def log_prior_fn(parameters):
             # Log-prior function for the model
-            for p in self.model_prior.keys:
+            print(parameters.shape)
+            p_out = 0            
+            if priors_to_loop==[]:
+                return p_out
+            for p in priors_to_loop:
+                print(p)
                 i_p = self.model_labels[p]
-                p_out += self.model_prior[p].prior(parameters[tf.newaxis,i_p])
-            def ln_prior(self, params):
-                p_out = 
-                for v_p in self.fit_p_list:
-                    i_p = self.init_p_id[v_p]
-                    p_out += self.model_prior[v_p](params[i_p])
-
-                return p_out    
+                p_out += self.model_prior[p](parameters[:,i_p])
+            return p_out    
         normal_dist = tfp.distributions.Normal(loc=0.0, scale=1.0)
-        if confounds is None:
-            @tf.function
-            def log_posterior(parameters):
-                predictions = self.model._predict(
-                    paradigm_[tf.newaxis, ...], parameters[tf.newaxis, ...], None)
-                residuals = y - predictions[0]                
-                log_likelihood = tf.reduce_sum(normal_dist.log_prob(residuals))
-                return log_likelihood 
-
-        else:
-            @tf.function
-            def log_posterior(parameters):
-                predictions_ = self.model._predict(
-                    paradigm_[tf.newaxis, ...], parameters[tf.newaxis, ...], None)
-
-                predictions = tf.transpose(predictions_)[
-                    :, tf.newaxis, :, tf.newaxis]
-                X = tf.concat([predictions, confounds], -1)
-                beta = tf.linalg.lstsq(X, tf.transpose(
-                    y)[:, tf.newaxis, :, tf.newaxis])
-                predictions = tf.transpose((X @ beta)[:, 0, :, 0])
-
-                log_likelihood = tf.reduce_sum(normal_dist.log_prob(residuals))
-                return log_likelihood 
-        # HMC Transition Kernel
-        def target_log_prob_fn(*parameters):
-            return log_posterior(tf.stack(parameters))
-
-        # Initialize HMC sampler
-        kernel = tfp.mcmc.HamiltonianMonteCarlo(
-            target_log_prob_fn=target_log_prob_fn,
-            step_size=0.1,
-            num_leapfrog_steps=3
-        )
-
-        # Adaptive step size
-        kernel = tfp.mcmc.SimpleStepSizeAdaptation(
-            inner_kernel=kernel,
-            num_adaptation_steps=int(num_burnin_steps * 0.8)
-        )
-        print(init_pars.shape)
-        initial_state = [tf.convert_to_tensor(init_pars[i, :], dtype=tf.float32) for i in range(init_pars.shape[0])]
-        print(initial_state)
-        
         @tf.function
-        def run_chain():
-            return tfp.mcmc.sample_chain(
-                num_results=num_results,
-                num_burnin_steps=num_burnin_steps,
-                current_state=initial_state,
-                kernel=kernel,
-                trace_fn=lambda current_state, kernel_results: current_state
+        def log_posterior_fn(parameters, voxel_idx):
+            predictions = self.model._predict(
+                paradigm_[tf.newaxis, ...], parameters[tf.newaxis, ...], None)
+            residuals = y[:,voxel_idx] - tf.reshape(predictions, [-1])                            
+            log_likelihood = tf.reduce_sum(normal_dist.log_prob(residuals))
+            log_prior = log_prior_fn(parameters)
+            return log_likelihood + log_prior
+        
+        sampler = [] 
+        for voxel_idx in range(n_voxels):
+            # HMC Transition Kernel
+            def target_log_prob_fn(*parameters):
+                parameters = tf.stack(parameters, axis=-1)
+                return log_posterior_fn(parameters, voxel_idx)
+            
+            kernel_type = 'hmc'
+            if kernel_type=='hmc':
+                # Initialize HMC sampler
+                kernel = tfp.mcmc.HamiltonianMonteCarlo(
+                    target_log_prob_fn=target_log_prob_fn,
+                    step_size=0.1,
+                    num_leapfrog_steps=3
+                )
+
+                # Adaptive step size
+                kernel = tfp.mcmc.SimpleStepSizeAdaptation(
+                    inner_kernel=kernel,
+                    num_adaptation_steps=int(num_burnin_steps * 0.8)
+                )        
+            elif kernel_type == 'mh':
+                # Initialize MH sampler
+                kernel = tfp.mcmc.RandomWalkMetropolis(
+                    target_log_prob_fn=target_log_prob_fn
+                )
+            elif kernel_type == 'nuts':
+                # Initialize NUTS sampler
+                kernel = tfp.mcmc.NoUTurnSampler(
+                    target_log_prob_fn=target_log_prob_fn,
+                    step_size=0.1
+                )
+
+                # Adaptive step size
+                kernel = tfp.mcmc.DualAveragingStepSizeAdaptation(
+                    inner_kernel=kernel,
+                    num_adaptation_steps=int(num_burnin_steps * 0.8),
+                    target_accept_prob=0.8
+                )
+
+            initial_state = [tf.convert_to_tensor(init_pars[voxel_idx,i], dtype=tf.float32) for i in range(n_pars)]            
+            initial_state = [tf.expand_dims(i, axis=0) for i in initial_state]
+            if progressbar:
+                print("Running HMC...")
+
+            
+            @tf.function
+            def run_chain():
+                return tfp.mcmc.sample_chain(
+                    num_results=num_results,
+                    num_burnin_steps=num_burnin_steps,
+                    current_state=initial_state,                    
+                    kernel=kernel,
+                    trace_fn=lambda current_state, kernel_results: kernel_results,
+                    seed=1234,
+                )
+
+      
+            samples, beep = run_chain()
+            all_samples = tf.stack(samples, axis=-1).numpy()
+            all_samples = all_samples.reshape(-1, init_pars.shape[1])
+
+            self.estimated_parameters = pd.DataFrame(
+                all_samples, columns=self.model.parameter_labels
             )
-
-        if progressbar:
-            print("Running HMC...")
-
-        samples, _ = run_chain()
-        return samples
+            return self.estimated_parameters 
+            sampler.append(samples)
         # Convert samples to DataFrame
-        all_samples = tf.stack(samples, axis=-1).numpy()
-        all_samples = all_samples.reshape(-1, init_pars.shape[1])
 
-        self.estimated_parameters = pd.DataFrame(
-            all_samples, columns=self.model.parameter_labels
-        )
+        # self.estimated_parameters.index.name = 'sample'
 
-        self.estimated_parameters.index.name = 'sample'
-
-        return self.estimated_parameters
+        # return self.estimated_parameters
+        return sampler
     
 
 
