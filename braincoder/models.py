@@ -1499,7 +1499,7 @@ class GaussianPRF2D(EncodingModel):
         grid_coordinates = self.grid_coordinates.values
 
         parameters = self._get_parameters(parameters)
-        parameters = self.parameters.values[np.newaxis, ...]
+        parameters = parameters.values[np.newaxis, ...] # MD CHANGED!!!
 
         rf = self._get_rf(grid_coordinates, parameters).numpy()[0]
 
@@ -2145,10 +2145,6 @@ class ContrastSensitivity(EncodingModel):
         log_SF_seq  = tf.math.log(SF_seq_safe) / log10
         log_SFp     = tf.math.log(SFp_safe) / log10
         log_CSp     = tf.math.log(CSp_safe) / log10        
-
-        # log_SF_seq  = tf.keras.ops.log10(SF_seq_safe)
-        # log_SFp     = tf.keras.ops.log10(SFp_safe) 
-        # log_CSp     = tf.keras.ops.log10(CSp_safe) 
 
         # Split stimulus space into left and right
         is_left = SF_seq < SFp
