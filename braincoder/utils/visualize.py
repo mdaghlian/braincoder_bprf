@@ -24,3 +24,40 @@ def show_animation(images, vmin=None, vmax=None):
         fig, ims, interval=150, blit=True, repeat_delay=1500)
 
     return HTML(ani.to_html5_video())
+
+
+
+import matplotlib.pyplot as plt
+import pandas as pd
+from .stats import get_rsq
+def quick_plot(model, parameters, data=None):
+    if isinstance(parameters, pd.Series):
+        parameters = parameters.to_frame().T
+    elif isinstance(parameters, dict):
+        parameters = pd.DataFrame(parameters)
+    elif isinstance(parameters, pd.DataFrame):
+        pass
+
+    rf = model.get_rf(
+        parameters=parameters,
+    ).reshape(model.n_x, model.n_y).T
+
+    pred = model.predict(
+        parameters=parameters, 
+    )
+    
+    # Matplotlib figure
+    fig, ax = plt.subplots(
+        1, 2, figsize=(10, 5),
+        width_ratios=[1, 4]
+        )
+    ax[0].imshow(rf, cmap='gray', origin='lower')
+    ax[0].axis('off')
+    ax[0].set_title('Receptive Field')
+    if data is not None:
+        ax[1].plot(data.T, '--k', label='Data', alpha=0.5, )
+    ax[1].plot(pred, '-g', label='Prediction', alpha=0.5,)
+    ax[1].legend()
+    return 
+
+    

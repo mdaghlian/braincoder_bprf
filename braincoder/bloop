@@ -53,6 +53,7 @@ class BPRF(object):
         self.fixed_vals = {}                                        # We can fix some parameters. To speed things up, don't include them in the MCMC process
         self.bounds = {}
         self.mcmc_sampler = [None] * self.data.shape[1]             # For each voxel, we will store the MCMC samples
+        
         # How to estimate the offset and slope for time series. "glm" or "mcmc" (is it just another MCMC parameter, or use glm )                
         # self.beta_method = kwargs.get('beta_method', 'mcmc') # glm or mcmc 
         # self.fixed_baseline = kwargs.get('fixed_baseline', None) # If using glm, fix baseline?      
@@ -123,23 +124,26 @@ class BPRF(object):
                     )
 
     def fit(self, 
+            idx = None, 
             num_results=1000, num_burnin_steps=500, 
             init_pars=None,
             confounds=None,
-            fixed_pars=None,            
+            fixed_pars=None,
             progressbar=True,
-            idx = None, 
             kernel_type='hmc',
             **kwargs):
 
-        n_voxels, n_pars = self.data.shape[1], len(self.model.parameter_labels)
         # Which voxels to fit?    
         if idx is None:
-            idx = range(n_voxels)
-            # beeep
+            idx = range(self.data.shape[1])
         elif isinstance(idx, int):
-            idx = [idx]            
+            full_idx = np.zeros(self.data.shape[1], dtype=bool)
+            full_idx[idx] = True
+            idx = np.where(full_idx)[0]
+        else:
+            idx = np.array(idx)
         
+        n_voxels, n_pars = self.data.shape[1], len(self.model.parameter_labels)
         y = self.data.values
 
         if init_pars is None:
@@ -158,34 +162,34 @@ class BPRF(object):
         # Therefore, we only optimize voxels where there is variance to explain
         meaningful_ts = ssq_data > 0.0
 
-        # if fixed_pars is None:
-        #     parameter_ix = range(n_pars)
-        # else:
-        #     parameter_ix = [ix for ix, label in enumerate(self.model.parameter_labels) if label not in fixed_pars]
+        if fixed_pars is None:
+            parameter_ix = range(n_pars)
+        else:
+            parameter_ix = [ix for ix, label in enumerate(self.model.parameter_labels) if label not in fixed_pars]
 
-        #     print('*** Only fitting: ***')
-        #     for ix in parameter_ix:
-        #         print(f' * {self.model.parameter_labels[ix]}')
+            print('*** Only fitting: ***')
+            for ix in parameter_ix:
+                print(f' * {self.model.parameter_labels[ix]}')
 
-        # parameter_ix = tf.constant(parameter_ix, dtype=tf.int32)
+        parameter_ix = tf.constant(parameter_ix, dtype=tf.int32)
 
-        # n_meaningful_ts = tf.reduce_sum(tf.cast(meaningful_ts, tf.int32))
-        # n_trainable_pars = len(parameter_ix)
+        n_meaningful_ts = tf.reduce_sum(tf.cast(meaningful_ts, tf.int32))
+        n_trainable_pars = len(parameter_ix)
 
-        # update_feature_ix, update_parameter_ix = tf.meshgrid(tf.cast(tf.where(meaningful_ts), tf.int32), parameter_ix)
-        # update_ix = tf.stack((tf.reshape(update_feature_ix, tf.size(update_feature_ix)),
-        #                       tf.reshape(update_parameter_ix, tf.size(update_parameter_ix))), 1)
+        update_feature_ix, update_parameter_ix = tf.meshgrid(tf.cast(tf.where(meaningful_ts), tf.int32), parameter_ix)
+        update_ix = tf.stack((tf.reshape(update_feature_ix, tf.size(update_feature_ix)),
+                              tf.reshape(update_parameter_ix, tf.size(update_parameter_ix))), 1)
 
-        # print(
-        #     f'Number of problematic voxels (mask): {tf.reduce_sum(tf.cast(meaningful_ts == False, tf.int32))}')
-        # print(
-        #     f'Number of voxels remaining (mask): {tf.reduce_sum(tf.cast(meaningful_ts == True, tf.int32))}')
+        print(
+            f'Number of problematic voxels (mask): {tf.reduce_sum(tf.cast(meaningful_ts == False, tf.int32))}')
+        print(
+            f'Number of voxels remaining (mask): {tf.reduce_sum(tf.cast(meaningful_ts == True, tf.int32))}')
 
-        # trainable_parameters = tf.Variable(initial_value=tf.gather_nd(init_pars, update_ix),
-        #                                    shape=(n_meaningful_ts*n_trainable_pars),
-        #                                    name='estimated_parameters', dtype=tf.float32)
+        trainable_parameters = tf.Variable(initial_value=tf.gather_nd(init_pars, update_ix),
+                                           shape=(n_meaningful_ts*n_trainable_pars),
+                                           name='estimated_parameters', dtype=tf.float32)
 
-        # trainable_variables = [trainable_parameters]
+        trainable_variables = [trainable_parameters]
 
         paradigm_ = self.model.stimulus._clean_paradigm(self.paradigm)
         priors_to_loop = list(self.model_prior.keys())
@@ -194,6 +198,7 @@ class BPRF(object):
         @tf.function
         def log_prior_fn(parameters):
             # Log-prior function for the model
+            print(parameters.shape)
             p_out = 0            
             if priors_to_loop==[]:
                 return p_out
@@ -211,31 +216,28 @@ class BPRF(object):
             log_likelihood = tf.reduce_sum(normal_dist.log_prob(residuals))
             log_prior = log_prior_fn(parameters)
             return log_likelihood + log_prior
-        
-        # Loop through the voxels to fit!
+
         for voxel_idx in idx:
-            
-            # Define the target log probability function
+            # HMC Transition Kernel
             def target_log_prob_fn(*parameters):
                 parameters = tf.stack(parameters, axis=-1)
                 return log_posterior_fn(parameters, voxel_idx)
             
-            # Set the kernel type for MCMC sampling
             if kernel_type=='hmc':
-                # Hamiltonian Monte Carlo
-                # -> still messing...
+                # Initialize HMC sampler
                 kernel = tfp.mcmc.HamiltonianMonteCarlo(
                     target_log_prob_fn=target_log_prob_fn,
                     step_size=0.1,
                     num_leapfrog_steps=3
                 )
+
                 # Adaptive step size
                 kernel = tfp.mcmc.SimpleStepSizeAdaptation(
                     inner_kernel=kernel,
                     num_adaptation_steps=int(num_burnin_steps * 0.8)
                 )        
             elif kernel_type == 'mh':
-                # Metropolis-Hastings
+                # Initialize MH sampler
                 kernel = tfp.mcmc.RandomWalkMetropolis(
                     target_log_prob_fn=target_log_prob_fn
                 )
@@ -245,6 +247,7 @@ class BPRF(object):
                     target_log_prob_fn=target_log_prob_fn,
                     step_size=0.1
                 )
+
                 # Adaptive step size
                 kernel = tfp.mcmc.DualAveragingStepSizeAdaptation(
                     inner_kernel=kernel,
@@ -252,9 +255,11 @@ class BPRF(object):
                     target_accept_prob=0.8
                 )
 
-
             initial_state = [tf.convert_to_tensor(init_pars[voxel_idx,i], dtype=tf.float32) for i in range(n_pars)]            
             initial_state = [tf.expand_dims(i, axis=0) for i in initial_state]
+            if progressbar:
+                print(f"Running {kernel_type}...")
+
             
             @tf.function
             def run_chain():
@@ -267,16 +272,22 @@ class BPRF(object):
                     seed=1234,
                 )
 
+      
             samples, _ = run_chain()
-            # return samples
             all_samples = tf.stack(samples, axis=-1).numpy()
             all_samples = all_samples.reshape(-1, init_pars.shape[1])
-
-            estimated_parameters = pd.DataFrame(
+            return
+            self.estimated_parameters = pd.DataFrame(
                 all_samples, columns=self.model.parameter_labels
             )
-            self.mcmc_sampler[voxel_idx] = estimated_parameters            
-        return 
+            # return self.estimated_parameters 
+            self.mcmc_sampler[voxel_idx] = self.estimated_parameters
+        # Convert samples to DataFrame
+
+        # self.estimated_parameters.index.name = 'sample'
+
+        # return self.estimated_parameters
+        # return sampler
     
 
 
