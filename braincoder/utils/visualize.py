@@ -37,12 +37,13 @@ def quick_plot(model, parameters, data=None):
         parameters = pd.DataFrame(parameters)
     elif isinstance(parameters, pd.DataFrame):
         pass
-
+    print(parameters)
     rf = model.get_rf(
         parameters=parameters,
     ).reshape(model.n_x, model.n_y).T
 
     pred = model.predict(
+        paradigm=model.paradigm,
         parameters=parameters, 
     )
     

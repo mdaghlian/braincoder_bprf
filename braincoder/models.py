@@ -1738,23 +1738,49 @@ class DifferenceOfGaussiansPRF2D(GaussianPRF2D):
                           tfp.math.softplus_inverse(parameters[:, 6][:, tf.newaxis] - 1)], axis=1)
 
     @tf.function
-    def _get_rf(self, grid_coordinates, parameters):
+    def _get_rf(self, grid_coordinates, parameters, normalize=True):
+
+        # # n_batches x n_populations x n_grid_spaces (broadcast)
+        # mu_x = parameters[:, :, 0, tf.newaxis]
+        # mu_y = parameters[:, :, 1, tf.newaxis]
+        # sd = parameters[:, :, 2, tf.newaxis]
+        # amplitude = parameters[:, :, 4, tf.newaxis]
+
+        # srf_amplitude = parameters[:, :, 5, tf.newaxis]
+        # srf_size = parameters[:, :, 6, tf.newaxis]
+
+        # standard_prf = super()._get_rf(grid_coordinates, parameters)
+
+        # srf_pars = tf.concat([mu_x, mu_y, sd*srf_size, tf.zeros_like(mu_x), srf_amplitude*amplitude*srf_size], axis=2)
+        # sprf = super()._get_rf(grid_coordinates, srf_pars)
+
+        # return standard_prf - sprf
+
+        # ***********
+        # n_batches x n_populations x  n_grid_spaces
+        x = grid_coordinates[:, 0][tf.newaxis, tf.newaxis, :]
+        y = grid_coordinates[:, 1][tf.newaxis, tf.newaxis, :]
 
         # n_batches x n_populations x n_grid_spaces (broadcast)
         mu_x = parameters[:, :, 0, tf.newaxis]
         mu_y = parameters[:, :, 1, tf.newaxis]
         sd = parameters[:, :, 2, tf.newaxis]
         amplitude = parameters[:, :, 4, tf.newaxis]
+        
+        srf_amplitude = amplitude * parameters[:, :, 5, tf.newaxis]
+        srf_size = sd * parameters[:, :, 6, tf.newaxis]
 
-        srf_amplitude = parameters[:, :, 5, tf.newaxis]
-        srf_size = parameters[:, :, 6, tf.newaxis]
+        dx2 = (x-mu_x)**2
+        dy2 = (x-mu_y)**2
+        c_gauss = (tf.exp(-(dx2 + dy2)/(2*sd**2))) * amplitude
+        s_gauss = (tf.exp(-(dx2 + dy2)/(2*srf_size**2))) * srf_amplitude
 
-        standard_prf = super()._get_rf(grid_coordinates, parameters)
+        if normalize:
+            factor = tf.sqrt(2 * np.pi) / self.pixel_area
+            c_gauss = c_gauss/ ( sd * factor)
+            s_gauss = s_gauss/ ( srf_size * factor)
+        return c_gauss - s_gauss        
 
-        srf_pars = tf.concat([mu_x, mu_y, sd*srf_size, tf.zeros_like(mu_x), srf_amplitude*amplitude*srf_size], axis=2)
-        sprf = super()._get_rf(grid_coordinates, srf_pars)
-
-        return standard_prf - sprf
 
 
 class DifferenceOfGaussiansPRF2DWithHRF(HRFEncodingModel, DifferenceOfGaussiansPRF2D):
