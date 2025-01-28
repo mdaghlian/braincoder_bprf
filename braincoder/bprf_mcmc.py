@@ -27,59 +27,50 @@ class BPRF(object):
 
     def __init__(self, model, data,  **kwargs):        
         ''' __init__
-        Set up the object; with important info
-        '''
+        Set up and run "bayesian" pRF analysis. This class contains:
+        * model + stimulus/paradigm (from .models, used to generate predictions)
+        * prior definitions (per parameter)        
+
+        TODO: 
+        * add option to fix parameters
+        * more prior options
+        * work out how this jacobian thingy works with the priors + bijectors...
+
+
+        '''    
         self.model = copy.deepcopy(model)
         self.data = data.astype(np.float32)
-        self.memory_limit = kwargs.pop('memory_limit', 666666666)  # 8 GB?
-        self.paradigm = model.get_paradigm(model.paradigm)
-        log_dir = kwargs.get('log_dir', False)
-        if log_dir is None:
-            log_dir = op.abspath('logs/fit')
-
-        if log_dir is not False:
-            if not op.exists(log_dir):
-                os.makedirs(log_dir)
-            self.summary_writer = tf.summary.create_file_writer(op.join(log_dir,
-                                                                        datetime.datetime.now().strftime("%Y%m%d-%H%M%S")))
         self.kwargs = kwargs
-        self.model = model        
+        self.paradigm = model.get_paradigm(model.paradigm)
         self.n_params = len(self.model.parameter_labels)
         self.n_voxels = len(self.data)
-        self.model_labels = {l:i for i,l in enumerate(self.model.parameter_labels)}        
-
+        self.model_labels = {l:i for i,l in enumerate(self.model.parameter_labels)} # useful to have it as a dict per entry        
+        
         # MCMC specific information
-        self.p_prior = {}                                       # Prior for each parameter (e.g., normal distribution at 0 for "x")
-        self.p_prior_fn = {} 
-        self.p_bijector = {}
-        self.p_bijector_list = []
-        self.p_prior_type = {}                                  # For each parameter: can be "uniform" (just bounds), or "normal"
-        self.p_fixed_labels = {}                                        # We can fix some parameters. To speed things up, don't include them in the MCMC process
-        self.p_fitted_labels = {}
-        self.bounds = {}
-        self.mcmc_sampler = [None] * self.data.shape[1]             # For each voxel, we will store the MCMC samples
-        self.mcmc_stats = [None] * self.data.shape[1]
-        # How to estimate the offset and slope for time series. "glm" or "mcmc" (is it just another MCMC parameter, or use glm )                
-        # self.beta_method = kwargs.get('beta_method', 'mcmc') # glm or mcmc 
-        # self.fixed_baseline = kwargs.get('fixed_baseline', None) # If using glm, fix baseline?      
+        # Prior for each parameter (e.g., normal distribution at 0 for "x")      
+        # -> default no prior
+        self.p_prior = {p:PriorNone() for p in self.model_labels}                                        
+        self.p_prior_type = {p:'none' for p in self.model_labels}
+        # -> default no bijector 
+        self.p_bijector = {p:tfp.bijectors.Identity() for p in self.model_labels} # What to apply to the 
+        self.p_bijector_bw = {p:tfp.bijectors.Identity() for p in self.model_labels} # What to apply to the 
 
+        # Per voxel (row in data) - save the output of the MCMC sampler 
+        self.mcmc_sampler = [None] * self.data.shape[1]
+        self.mcmc_stats = [None] * self.data.shape[1]
+        
     def add_prior(self, pid, prior_type, **kwargs):
         ''' 
         Adds the prior to each parameter:
-        Used for 
-        [1] evaluating the posterior (e.g., to enforce parameter bounds)
-        [2] Initialising walker positions (if init_walker_method=='random_prior')
-        > randomly sample parameters from the prior distributions
 
         Options:
-            fixed:      will 'hide' the parameter from MCMC fitting procedure (not really a prior...)
             uniform:    uniform probability b/w the specified bounds (vmin, vmax). Otherwise infinite
             normal:     normal probability. (loc, scale)
             none:       The parameter can still vary, but it will not influence the outcome... 
 
         '''        
         if pid not in self.model_labels.keys(): # Is this a valid parameter to add? 
-            print('error...')
+            print(f'error... not {pid} not in model labels')
             return
         self.p_prior_type[pid] = prior_type 
         if prior_type=='normal':
@@ -90,36 +81,13 @@ class BPRF(object):
 
         elif prior_type=='uniform' :
             vmin = kwargs.get('vmin')
-            vmax = kwargs.get('vmax')
-            if vmin==vmax:
-                self.add_prior(
-                    pid=pid, prior_type='fixed', fixed_val=vmin,
-                )
-                return            
-            self.bounds[pid] = [vmin, vmax]
+            vmax = kwargs.get('vmax')        
             self.p_prior[pid] = PriorUniform(vmin, vmax)            
 
-        elif prior_type=='latent_uniform':
-            vmin = kwargs.get('vmin')
-            vmax = kwargs.get('vmax')
-            if vmin==vmax:
-                self.add_prior(
-                    pid=pid, prior_type='fixed', fixed_val=vmin,
-                )
-                return
-            self.bounds[pid] = [vmin, vmax]
-            self.p_prior[pid] = PriorLatentUniform(vmin, vmax)
-
-        elif prior_type=='fixed':
-            fixed_val = kwargs.get('fixed_val')
-            self.bounds[pid] = [fixed_val, fixed_val]
-            self.p_fixed_labels[pid] = tf.convert_to_tensor(fixed_val, dtype=tf.float32)
-            self.p_prior[pid] = PriorFixed(fixed_val)
-
         elif prior_type=='none':
-            self.p_prior[pid] = PriorNone()            
-        self.p_prior_fn[pid] = self.p_prior[pid].prior
-        self.p_bijector[pid] = self.p_prior[pid].bijector
+            self.p_prior[pid] = PriorNone()  
+        else:
+            raise ValueError(f"Prior type '{prior_type}' is not implemented")
     
     def add_priors_from_bounds(self, bounds, prior_type='uniform'):
         '''
@@ -127,9 +95,6 @@ class BPRF(object):
         Can setup more informative, like a normal using the other methods        
         '''        
         for i_p, v_p in enumerate(self.model_labels.keys()):
-            if v_p=='rsq':
-                continue
- 
             self.add_prior(
                 pid=v_p,
                 prior_type = prior_type,
@@ -137,6 +102,26 @@ class BPRF(object):
                 vmax = bounds[v_p][1],
                 )
             
+    def add_bijector(self, pid, bijector_type, **kwargs):
+        ''' add transformations to parameters so that they are fit smoothly        
+        
+        identity        - do nothing
+        softplus        - don't let anything be negative
+
+        '''
+        if bijector_type == 'identity':
+            self.p_bijector[pid] = tfp.bijector.Identity()        
+        elif bijector_type == 'softplus':
+            # Don't let anything be negative
+            self.p_bijector[pid] = tfp.bijectors.Softplus()
+        elif bijector_type == 'sigmoid':
+            self.p_bijector[pid] = tfp.bijectors.Sigmoid(
+                low=kwargs.get('low'), high=kwargs.get('high')
+            )
+
+
+
+        
     def prep_for_fitting(self):
         ''' Get everything ready for fitting...
         '''
@@ -145,25 +130,11 @@ class BPRF(object):
         for p in self.model_labels:
             self.p_bijector_list.append(
                 self.p_bijector[p]
-            )
-        self.p_bijector_list_BACK = []
-        for p in self.model_labels:
-            self.p_bijector_list_BACK.append(
-                self.p_bijector[p].inverse
-            )        
+            )      
         # Only loop through those parameters with a prior
         self.priors_to_loop = [
-            p for p,t in self.p_prior_type.items() if t not in ('fixed', 'none')
+            p for p,t in self.p_prior_type.items()# if t not in ('fixed', 'none')
         ]
-        # Create an index for those parameters we are fitting... 
-        self.p_fitted_labels = {}
-        i_p = 0
-        for k in self.model_labels:
-            if k in self.p_fixed_labels:
-                continue
-            self.p_fitted_labels[k] = i_p
-            i_p += 1    
-        self.n_params2fit = len(self.p_fitted_labels)
     
     @tf.function
     def _bprf_transform_parameters_forward(self, parameters):
@@ -181,13 +152,12 @@ class BPRF(object):
 
 
     def fit(self, 
-            num_results=1000, 
-            num_burnin_steps=500, 
-            init_pars=None,
-            confounds=None, # ...
-            # progressbar=True,
             idx = None, 
+            init_pars=None,
+            num_results=1000, 
             **kwargs):
+        
+        step_size = kwargs.pop('step_size', 1) # rest of the kwargs go to "hmc_sample"        
 
         # Which voxels to fit?    
         if idx is None: # all of them
@@ -196,14 +166,11 @@ class BPRF(object):
             idx = [idx]            
         
         y = self.data.values
-        # Initial parameters 
-        if init_pars is None:
-            init_pars = self.model.get_init_pars(
-                data=y, paradigm=self.paradigm, confounds=confounds)
-            print('using get_init_pars')
         init_pars = self.model._get_parameters(init_pars)
         # Use the bprf bijectors (not the model ones...)
-        init_pars = self._bprf_transform_parameters_forward(init_pars.values.astype(np.float32))
+        # init_pars = init_pars.values.astype(np.float32) # ???        
+        init_pars = self._bprf_transform_parameters_forward(init_pars.values.astype(np.float32)) # ???        
+
         # Clean the paradigm 
         paradigm_ = self.model.stimulus._clean_paradigm(self.paradigm)        
         
@@ -212,13 +179,15 @@ class BPRF(object):
         def log_prior_fn(parameters):
             # Log-prior function for the model
             p_out = 0            
-            if self.priors_to_loop==[]:
-                return p_out
+            # if self.priors_to_loop==[]:
+            #     return p_out
             for p in self.priors_to_loop:
-                i_p = self.p_fitted_labels[p]
-                p_out += self.p_prior_fn[p](parameters[:,i_p])
+                p_out += self.p_prior[p].prior(parameters[:,self.model_labels[p]])
             return p_out       
 
+        # Calculating the likelihood, based on the assumption that 
+        # the residuals are all normally distributed...
+        # simple - but I think it works; and has been applied in this context before (see Invernizzi et al)
         normal_dist = tfp.distributions.Normal(loc=0.0, scale=1.0)
         @tf.function
         def log_posterior_fn(parameters, voxel_idx):
@@ -231,31 +200,29 @@ class BPRF(object):
         
         # Loop through the voxels to fit!
         for voxel_idx in idx:
+            # -> make sure we are in the correct dtype 
             initial_state = [tf.convert_to_tensor(init_pars[voxel_idx,i], dtype=tf.float32) for i in range(self.n_params)]                          
+            # -> also make sure that the shape of the tensor is one that the "model" class likes 
             initial_state = [tf.expand_dims(i, axis=0) for i in initial_state]
-            # Define the target log probability function
+                        
+            # Define the target log probability function (for this voxel)
             def target_log_prob_fn(*parameters):
                 parameters = tf.stack(parameters, axis=-1)
                 return log_posterior_fn(parameters, voxel_idx)
             
-            # BASED ON GILLES OG mcmc (but not for decoding)                                            
-            # Quick test
-
-            bloop = target_log_prob_fn(*initial_state)
-            print(bloop)
-            # return
-
+            # CALLING GILLES' "sample_hmc" from .utils.mcmc
+            # quick test - does it work?
+            initial_ll = target_log_prob_fn(*initial_state)
+            print(f'idx={idx}; initial_ll={initial_ll}')
+            
             samples, stats = sample_hmc(
                 init_state = initial_state, 
                 target_log_prob_fn=target_log_prob_fn, 
                 unconstraining_bijectors=self.p_bijector_list, 
                 num_steps=num_results, 
                 # OTHER STUFF TO OPTIMIZE
-                step_size=1, 
-                # burnin=n_burnin,
-                # target_accept_prob=target_accept_prob, 
-                # unrolled_leapfrog_steps=unrolled_leapfrog_steps,
-                # max_tree_depth=max_tree_depth
+                step_size=step_size, 
+                **kwargs
                 )                
                                 
             # stuff to save...
@@ -264,12 +231,7 @@ class BPRF(object):
             # Apply bijectors                        
             estimated_p_dict = {}
             for i,p in enumerate(self.model_labels):
-                if self.p_prior_type[p] == 'latent_uniform':
-                    estimated_p_dict[p] = all_samples[:,i]
-                    # estimated_p_dict[f'L_{p}'] = all_samples[:,i]
-                    # estimated_p_dict[f'L_{p}'] = self.p_bijector[p].inverse(all_samples[:,i])
-                else:
-                    estimated_p_dict[p] = all_samples[:,i]
+                estimated_p_dict[p] = all_samples[:,i]
             estimated_parameters = pd.DataFrame(estimated_p_dict)
             self.mcmc_sampler[voxel_idx] = estimated_parameters            
             self.mcmc_stats[voxel_idx] = stats
@@ -311,8 +273,6 @@ class BPRF(object):
         this_rsq = get_rsq(this_data, this_pred)[:-1]
         return this_rsq
 
-
-
     @property
     def data(self):
         return self._data
@@ -334,79 +294,27 @@ class BPRF(object):
 
 # *** PRIORS ***
 class PriorBase():
-    bijector = tfp.bijectors.Identity()
-
+    prior_type = 'base'
+    def prior(self, param):
+        return self.distribution.log_prob(param)
+    
 class PriorNorm(PriorBase):
     def __init__(self, loc, scale):
+        self.prior_type = 'norm'
         self.loc = loc  # mean
         self.scale = scale  # standard deviation
         self.distribution = tfp.distributions.Normal(loc=self.loc, scale=self.scale)
 
-    def prior(self, p):
-        # Return the log probability of the parameter given the normal distribution
-        return self.distribution.log_prob(p)
-
 class PriorUniform(PriorBase):
     def __init__(self, vmin, vmax):
+        self.prior_type = 'uniform'
         self.vmin = vmin
         self.vmax = vmax
         self.distribution = tfp.distributions.Uniform(low=self.vmin, high=self.vmax)
 
-    def prior(self, param):
-        return self.distribution.log_prob(param)
-
-
-class PriorLatentUniform(PriorBase):  
-    '''Special case
-    Where the parameter is transformed by the NCDF
-    So the latent parameter is sampled from a normal distribution (mean 0, std 1)
-    And the actual parameter is transformed by the NCDF - so it is uniform
-    between the bounds
-    '''  
-    def __init__(self, vmin, vmax):
-        self.vmin = vmin
-        self.vmax = vmax
-        self.distribution = tfp.distributions.Normal(loc=0, scale=1)
-        # Set the bijector!
-        self.bijector = tfp.bijectors.Chain([
-                tfp.bijectors.Shift(shift=self.vmin),  # Scale to [vmin, vmax]
-                tfp.bijectors.Scale(scale= self.vmax - self.vmin),  # Scale to [vmin, vmax]
-                tfp.bijectors.NormalCDF(),  # Transform to uniform
-                ])
-
-    def prior(self, param):
-        return self.distribution.log_prob(param)
-
-
-class PriorFixed(PriorBase):
-
-    def __init__(self, fixed_val):
-        print('NOT WORKING YET')
-
-        self.fixed_val = fixed_val
-        self.tf_fixed_val = tf.convert_to_tensor(fixed_val, dtype=tf.float32)
-        self.vmin = fixed_val
-        self.vmax = fixed_val
-        # Set the bijector to just return the param
-        self.bijector = tfp.bijectors.Identity()
-        # self.bijector = tfp.bijectors.Chain([
-        #     tfp.bijectors.Chain([
-        #         tfp.bijectors.Shift(shift=self.tf_fixed_val),
-        #         tfp.bijectors.Scale(scale=0.0),  
-        #     ])
-        # ])
-    # def prior(self, param):
-    #     # Return 0 if param is equal to fixed_val, else -inf
-    #     return tf.where(tf.equal(param, self.fixed_val), tf.zeros_like(param), -tf.math.inf)
-
-    def prior(self,param):
-        return tf.zeros_like(param) 
-    
-
 class PriorNone(PriorBase):
     def __init__(self):
-        self.bounds = 'None'
-
+        self.prior_type = 'none'
     def prior(self, param):
-        # Return 0 for any parameter
         return tf.zeros_like(param)
+# *** BIJECTORS ***
