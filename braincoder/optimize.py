@@ -44,7 +44,7 @@ class WeightFitter(object):
 
 class ParameterFitter(object):
 
-    def __init__(self, model, data, paradigm, memory_limit=666666666, log_dir=False):
+    def __init__(self, model, data, paradigm, memory_limit=666666666/6, log_dir=False): #  memory_limit=666666666
         self.model = model
         self.data = data.astype(np.float32)
         self.paradigm = model.get_paradigm(paradigm)
