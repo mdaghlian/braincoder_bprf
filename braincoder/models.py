@@ -163,7 +163,7 @@ class EncodingModel(object):
         self._weights = format_weights(weights)
 
     def to_discrete_model(self, grid, parameters=None, weights=None):
-        
+
         grid = np.array(grid, dtype=np.float32)[:, np.newaxis]
         parameters = format_parameters(parameters)
         weights = format_weights(weights)
@@ -625,8 +625,27 @@ class HRFEncodingModel(object):
 
     @tf.function
     def _predict(self, paradigm, parameters, weights):
+
+        standardized_parameters = tf.identity(parameters)
+
+        n_batches, n_voxels = parameters.shape[0], parameters.shape[1]
+
+         # We define that baseline and amplitude are applied to the HRF-convolved signal
+         # If we don't do that, we can't easily recover these parameters using OLS...
+        if 'baseline' in self.parameter_labels:
+            baseline_idx = self.parameter_labels.index('baseline')
+            indices_baseline = tf.constant([[i, j, baseline_idx] for i in range(n_batches) for j in range(n_voxels)], dtype=tf.int32)
+            updates_baseline = tf.zeros((n_batches * n_voxels,), dtype=parameters.dtype)
+            standardized_parameters = tf.tensor_scatter_nd_update(standardized_parameters, indices_baseline, updates_baseline)
+
+        if 'amplitude' in self.parameter_labels:
+            amplitude_idx = self.parameter_labels.index('amplitude')
+            indices_amplitude = tf.constant([[i, j, amplitude_idx] for i in range(n_batches) for j in range(n_voxels)], dtype=tf.int32)
+            updates_amplitude = tf.ones((n_batches * n_voxels,), dtype=parameters.dtype)
+            standardized_parameters = tf.tensor_scatter_nd_update(standardized_parameters, indices_amplitude, updates_amplitude)
+
         pre_convolve = EncodingModel._predict(
-            self, paradigm, parameters, weights)
+            self, paradigm, standardized_parameters, weights)
 
         kwargs = {}
         # parameters: n_batch x n_units x n_parameters
@@ -634,7 +653,16 @@ class HRFEncodingModel(object):
             for ix, label in enumerate(self.hrf_model.parameter_labels):
                 kwargs[label] = parameters[:, :, -len(self.hrf_model.parameter_labels) + ix]
 
-        return self.hrf_model.convolve(pre_convolve, **kwargs)
+        # pred: n_batch x n_timepoints x n_units
+        pred_convolved = self.hrf_model.convolve(pre_convolve, **kwargs)
+
+        if 'amplitude' in self.parameter_labels:
+            pred_convolved *= parameters[:, :, amplitude_idx][:, tf.newaxis, :]
+        
+        if 'baseline' in self.parameter_labels:
+            pred_convolved += parameters[:, :, baseline_idx][:, tf.newaxis, :]
+
+        return pred_convolved
 
     @tf.function
     def _predict_no_hrf(self, paradigm, parameters, weights):
@@ -1436,6 +1464,7 @@ class GaussianPRF2D(EncodingModel):
 
 
     def get_rf(self, as_frame=False, unpack=False, parameters=None):
+
         grid_coordinates = self.grid_coordinates.values
 
         parameters = self._get_parameters(parameters)
@@ -1466,11 +1495,12 @@ class GaussianPRF2D(EncodingModel):
         rf = self._get_rf(self.grid_coordinates, parameters)
         baseline = parameters[:, tf.newaxis, :, 3]
         result = tf.tensordot(paradigm, rf, (2, 2))[:, :, 0, :] + baseline
+
         return result
 
     @tf.function
     def _get_rf(self, grid_coordinates, parameters, normalize=True):
-        
+
         # n_batches x n_populations x  n_grid_spaces
         x = grid_coordinates[:, 0][tf.newaxis, tf.newaxis, :]
         y = grid_coordinates[:, 1][tf.newaxis, tf.newaxis, :]
@@ -1486,6 +1516,7 @@ class GaussianPRF2D(EncodingModel):
         if normalize:
             norm = sd * tf.sqrt(2 * np.pi) / self.pixel_area
             gauss = gauss / norm
+        
         return gauss
 
     @tf.function
@@ -1678,7 +1709,7 @@ class DifferenceOfGaussiansPRF2D(GaussianPRF2D):
                           tfp.math.softplus_inverse(parameters[:, 6][:, tf.newaxis] - 1)], axis=1)
 
     @tf.function
-    def _get_rf(self, grid_coordinates, parameters, normalize=True):
+    def _get_rf(self, grid_coordinates, parameters):
 
         # n_batches x n_populations x n_grid_spaces (broadcast)
         mu_x = parameters[:, :, 0, tf.newaxis]
@@ -1692,35 +1723,10 @@ class DifferenceOfGaussiansPRF2D(GaussianPRF2D):
         standard_prf = super()._get_rf(grid_coordinates, parameters)
 
         srf_pars = tf.concat([mu_x, mu_y, sd*srf_size, tf.zeros_like(mu_x), srf_amplitude*amplitude*srf_size], axis=2)
+        print(parameters.shape, srf_pars.shape)
         sprf = super()._get_rf(grid_coordinates, srf_pars)
 
         return standard_prf - sprf
-
-        # # ***********
-        # # n_batches x n_populations x  n_grid_spaces
-        # x = grid_coordinates[:, 0][tf.newaxis, tf.newaxis, :]
-        # y = grid_coordinates[:, 1][tf.newaxis, tf.newaxis, :]
-
-        # # n_batches x n_populations x n_grid_spaces (broadcast)
-        # mu_x = parameters[:, :, 0, tf.newaxis]
-        # mu_y = parameters[:, :, 1, tf.newaxis]
-        # sd = parameters[:, :, 2, tf.newaxis]
-        # amplitude = parameters[:, :, 4, tf.newaxis]
-        
-        # srf_amplitude = amplitude * parameters[:, :, 5, tf.newaxis]
-        # srf_size = sd * parameters[:, :, 6, tf.newaxis]
-
-        # dx2 = (x-mu_x)**2
-        # dy2 = (x-mu_y)**2
-        # c_gauss = (tf.exp(-(dx2 + dy2)/(2*sd**2))) * amplitude
-        # s_gauss = (tf.exp(-(dx2 + dy2)/(2*srf_size**2))) * srf_amplitude
-
-        # if normalize:
-        #     factor = tf.sqrt(2 * np.pi) / self.pixel_area
-        #     c_gauss = c_gauss/ ( sd * factor)
-        #     s_gauss = s_gauss/ ( srf_size * factor)
-        # return c_gauss - s_gauss        
-
 
 
 class DifferenceOfGaussiansPRF2DWithHRF(HRFEncodingModel, DifferenceOfGaussiansPRF2D):
@@ -1972,8 +1978,6 @@ class LinearModelWithBaselineHRF(LinearModelWithBaseline, HRFEncodingModel):
     @tf.function
     def _predict_no_hrf(self, paradigm, parameters, weights):
         return LinearModelWithBaseline._predict(self, paradigm, parameters, weights)
-
-
 # **********************************************************************************************************************
 from braincoder.stimuli import ContrastSensitivityStimulus
 class ContrastSensitivity(EncodingModel):
@@ -2101,49 +2105,30 @@ class ContrastSensitivity(EncodingModel):
     @tf.function
     def _transform_parameters_forward(self, parameters):
         ''' Force amplidute to be positive '''
+        # Force them all to be positive (apart from baseline)
         par_out = tf.concat([
-            parameters[:, 0][:, tf.newaxis],                # width_r
-            parameters[:, 1][:, tf.newaxis],                # SFp            
-            parameters[:, 2][:, tf.newaxis],                # CSp
-            parameters[:, 3][:, tf.newaxis],                # width_l
-            parameters[:, 4][:, tf.newaxis],                # crf_exp
-            tf.math.softplus(parameters[:, 5][:, tf.newaxis]), # amplitude
+            tf.math.softplus(parameters[:, 0][:, tf.newaxis]),                # width_r
+            tf.math.softplus(parameters[:, 1][:, tf.newaxis]),                # SFp
+            tf.math.softplus(parameters[:, 2][:, tf.newaxis]),                # CSp
+            tf.math.softplus(parameters[:, 3][:, tf.newaxis]),                # width_l
+            tf.math.softplus(parameters[:, 4][:, tf.newaxis]),                # crf_exp
+            tf.math.softplus(parameters[:, 5][:, tf.newaxis]),                # amplitude
             parameters[:, 6][:, tf.newaxis]],               # baseline
-            axis=1)
-        # Force them all to be positive
-
-        # par_out = tf.concat([
-        #     tf.math.softplus(parameters[:, 0][:, tf.newaxis]),                # width_r
-        #     tf.math.softplus(parameters[:, 1][:, tf.newaxis]),                # SFp
-        #     tf.math.softplus(parameters[:, 2][:, tf.newaxis]),                # CSp
-        #     tf.math.softplus(parameters[:, 3][:, tf.newaxis]),                # width_l
-        #     tf.math.softplus(parameters[:, 4][:, tf.newaxis]),                # crf_exp
-        #     tf.math.softplus(parameters[:, 5][:, tf.newaxis]),                # amplitude
-        #     parameters[:, 6][:, tf.newaxis]],               # baseline
-        #     axis=1)        
+            axis=1)        
         return par_out
     
     @tf.function
     def _transform_parameters_backward(self, parameters):
+        # Force them all to be positive (apart from baseline)
         par_out = tf.concat([
-            parameters[:, 0][:, tf.newaxis],                # width_r
-            parameters[:, 1][:, tf.newaxis],                # SFp            
-            parameters[:, 2][:, tf.newaxis],                # CSp
-            parameters[:, 3][:, tf.newaxis],                # width_l
-            parameters[:, 4][:, tf.newaxis],                # crf_exp
-            tfp.math.softplus_inverse(parameters[:, 5][:, tf.newaxis]), # amplitude
+            tfp.math.softplus_inverse(parameters[:, 0][:, tf.newaxis]),                # width_r
+            tfp.math.softplus_inverse(parameters[:, 1][:, tf.newaxis]),                # SFp
+            tfp.math.softplus_inverse(parameters[:, 2][:, tf.newaxis]),                # CSp
+            tfp.math.softplus_inverse(parameters[:, 3][:, tf.newaxis]),                # width_l
+            tfp.math.softplus_inverse(parameters[:, 4][:, tf.newaxis]),                # crf_exp
+            tfp.math.softplus_inverse(parameters[:, 5][:, tf.newaxis]),                # amplitude
             parameters[:, 6][:, tf.newaxis]],               # baseline
             axis=1)
-        # Force them all to be positive
-        # par_out = tf.concat([
-        #     tfp.math.softplus_inverse(parameters[:, 0][:, tf.newaxis]),                # width_r
-        #     tfp.math.softplus_inverse(parameters[:, 1][:, tf.newaxis]),                # SFp
-        #     tfp.math.softplus_inverse(parameters[:, 2][:, tf.newaxis]),                # CSp
-        #     tfp.math.softplus_inverse(parameters[:, 3][:, tf.newaxis]),                # width_l
-        #     tfp.math.softplus_inverse(parameters[:, 4][:, tf.newaxis]),                # crf_exp
-        #     tfp.math.softplus_inverse(parameters[:, 5][:, tf.newaxis]),                # amplitude
-        #     parameters[:, 6][:, tf.newaxis]],               # baseline
-        #     axis=1)
         return par_out
     
     # def get_pseudoWWT(self, remove_baseline=True):

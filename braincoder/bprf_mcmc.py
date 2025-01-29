@@ -89,17 +89,17 @@ class BPRF(object):
         else:
             raise ValueError(f"Prior type '{prior_type}' is not implemented")
     
-    def add_priors_from_bounds(self, bounds, prior_type='uniform'):
+    def add_priors_from_bounds(self, bounds):
         '''
         Used to setup uninformative priors: i.e., uniform between the bouds
         Can setup more informative, like a normal using the other methods        
         '''        
-        for i_p, v_p in enumerate(self.model_labels.keys()):
+        for p in bounds.keys():
             self.add_prior(
-                pid=v_p,
-                prior_type = prior_type,
-                vmin = bounds[v_p][0],
-                vmax = bounds[v_p][1],
+                pid=p,
+                prior_type = 'uniform',
+                vmin = bounds[p][0],
+                vmax = bounds[p][1],
                 )
             
     def add_bijector(self, pid, bijector_type, **kwargs):
@@ -119,6 +119,14 @@ class BPRF(object):
                 low=kwargs.get('low'), high=kwargs.get('high')
             )
 
+    def add_bijector_from_bounds(self, bounds):
+        for p in bounds.keys():
+            self.add_bijector(
+                pid=p,
+                bijector_type = 'sigmoid',
+                vmin = bounds[p][0],
+                vmax = bounds[p][1],
+                )
 
 
         
@@ -168,9 +176,9 @@ class BPRF(object):
         y = self.data.values
         init_pars = self.model._get_parameters(init_pars)
         # Use the bprf bijectors (not the model ones...)
-        # init_pars = init_pars.values.astype(np.float32) # ???        
-        init_pars = self._bprf_transform_parameters_forward(init_pars.values.astype(np.float32)) # ???        
-
+        init_pars = init_pars.values.astype(np.float32) # ???        
+        # init_pars = self._bprf_transform_parameters_forward(init_pars.values.astype(np.float32)) # ???        
+        print(init_pars)
         # Clean the paradigm 
         paradigm_ = self.model.stimulus._clean_paradigm(self.paradigm)        
         
@@ -204,17 +212,23 @@ class BPRF(object):
             initial_state = [tf.convert_to_tensor(init_pars[voxel_idx,i], dtype=tf.float32) for i in range(self.n_params)]                          
             # -> also make sure that the shape of the tensor is one that the "model" class likes 
             initial_state = [tf.expand_dims(i, axis=0) for i in initial_state]
-                        
             # Define the target log probability function (for this voxel)
             def target_log_prob_fn(*parameters):
                 parameters = tf.stack(parameters, axis=-1)
                 return log_posterior_fn(parameters, voxel_idx)
-            
+            # Check the gradient with respect to each parameter
+            with tf.GradientTape() as tape:
+                tape.watch(initial_state)
+                log_prob = target_log_prob_fn(*initial_state)
+            gradients = tape.gradient(log_prob, initial_state)
+            for i, grad in enumerate(gradients):
+                print(f'Gradient for parameter {i}: {grad.numpy()}')
             # CALLING GILLES' "sample_hmc" from .utils.mcmc
             # quick test - does it work?
             initial_ll = target_log_prob_fn(*initial_state)
-            print(f'idx={idx}; initial_ll={initial_ll}')
-            
+            initial_prior = log_prior_fn(init_pars)
+            print(f'idx={idx}; initial_ll={initial_ll}, initial_prior={initial_prior}')
+            # bloop
             samples, stats = sample_hmc(
                 init_state = initial_state, 
                 target_log_prob_fn=target_log_prob_fn, 
