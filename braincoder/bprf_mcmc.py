@@ -43,7 +43,7 @@ class BPRF(object):
         self.kwargs = kwargs
         self.paradigm = model.get_paradigm(model.paradigm)
         self.n_params = len(self.model.parameter_labels)
-        self.n_voxels = len(self.data)
+        self.n_voxels = self.data.shape[-1]
         self.model_labels = {l:i for i,l in enumerate(self.model.parameter_labels)} # useful to have it as a dict per entry        
         
         # MCMC specific information
@@ -127,8 +127,6 @@ class BPRF(object):
                 vmin = bounds[p][0],
                 vmax = bounds[p][1],
                 )
-
-
         
     def prep_for_fitting(self):
         ''' Get everything ready for fitting...
@@ -177,8 +175,9 @@ class BPRF(object):
         init_pars = self.model._get_parameters(init_pars)
         # Use the bprf bijectors (not the model ones...)
         init_pars = init_pars.values.astype(np.float32) # ???        
+        # # Maybe should be applying some transform here? 
         # init_pars = self._bprf_transform_parameters_forward(init_pars.values.astype(np.float32)) # ???        
-        print(init_pars)
+
         # Clean the paradigm 
         paradigm_ = self.model.stimulus._clean_paradigm(self.paradigm)        
         
@@ -187,8 +186,8 @@ class BPRF(object):
         def log_prior_fn(parameters):
             # Log-prior function for the model
             p_out = 0            
-            # if self.priors_to_loop==[]:
-            #     return p_out
+            if self.priors_to_loop==[]:
+                return p_out
             for p in self.priors_to_loop:
                 p_out += self.p_prior[p].prior(parameters[:,self.model_labels[p]])
             return p_out       
@@ -213,22 +212,26 @@ class BPRF(object):
             # -> also make sure that the shape of the tensor is one that the "model" class likes 
             initial_state = [tf.expand_dims(i, axis=0) for i in initial_state]
             # Define the target log probability function (for this voxel)
+            
             def target_log_prob_fn(*parameters):
                 parameters = tf.stack(parameters, axis=-1)
                 return log_posterior_fn(parameters, voxel_idx)
+            
+            print('Lets run some checks with everything...')
             # Check the gradient with respect to each parameter
             with tf.GradientTape() as tape:
                 tape.watch(initial_state)
                 log_prob = target_log_prob_fn(*initial_state)
             gradients = tape.gradient(log_prob, initial_state)
+            print('Using tape.gradient to check gradients w/respect to each parameter')
             for i, grad in enumerate(gradients):
                 print(f'Gradient for parameter {i}: {grad.numpy()}')
             # CALLING GILLES' "sample_hmc" from .utils.mcmc
             # quick test - does it work?
             initial_ll = target_log_prob_fn(*initial_state)
-            initial_prior = log_prior_fn(init_pars)
-            print(f'idx={idx}; initial_ll={initial_ll}, initial_prior={initial_prior}')
-            # bloop
+            print(f'idx={idx}; initial_ll={initial_ll}')
+            print('Calling "sample_hmc" from braincoder.utils.mcmc')
+
             samples, stats = sample_hmc(
                 init_state = initial_state, 
                 target_log_prob_fn=target_log_prob_fn, 
@@ -249,7 +252,98 @@ class BPRF(object):
             estimated_parameters = pd.DataFrame(estimated_p_dict)
             self.mcmc_sampler[voxel_idx] = estimated_parameters            
             self.mcmc_stats[voxel_idx] = stats
-        return     
+
+    def fit_all(self, 
+            idx = None, 
+            init_pars=None,
+            num_results=1000, 
+            **kwargs):
+        '''
+        Experimental - can we fit everything at once?
+        Does that even make sense?
+        '''
+        
+        step_size = kwargs.pop('step_size', 1) # rest of the kwargs go to "hmc_sample"                
+        y = self.data.values
+        init_pars = self.model._get_parameters(init_pars)
+        # Use the bprf bijectors (not the model ones...)
+        init_pars = init_pars.values.astype(np.float32) # ???        
+        # # Maybe should be applying some transform here? 
+        # init_pars = self._bprf_transform_parameters_forward(init_pars.values.astype(np.float32)) # ???        
+
+        # Clean the paradigm 
+        paradigm_ = self.model.stimulus._clean_paradigm(self.paradigm)        
+        
+        # Define the prior in 'tf'
+        @tf.function
+        def log_prior_fn(parameters):
+            # Log-prior function for the model
+            p_out = 0            
+            if self.priors_to_loop==[]:
+                return p_out
+            for p in self.priors_to_loop:
+                p_out += self.p_prior[p].prior(parameters[:,self.model_labels[p]])
+            return p_out       
+
+        # Calculating the likelihood, based on the assumption that 
+        # the residuals are all normally distributed...
+        # simple - but I think it works; and has been applied in this context before (see Invernizzi et al)
+        normal_dist = tfp.distributions.Normal(loc=0.0, scale=1.0)
+        # @tf.function
+        def log_posterior_fn(parameters):
+            predictions = self.model._predict(
+                paradigm_[tf.newaxis, ...], parameters[tf.newaxis, ...], None)
+            
+            residuals = y - predictions[0]
+            log_likelihood = tf.reduce_sum(normal_dist.log_prob(residuals))
+            log_prior = tf.reduce_sum(log_prior_fn(parameters))
+            return log_likelihood + log_prior
+        
+        # -> make sure we are in the correct dtype 
+        initial_state = [tf.convert_to_tensor(init_pars[:,i], dtype=tf.float32) for i in range(self.n_params)]                          
+        # Define the target log probability function (for this voxel)
+        
+        def target_log_prob_fn(*parameters):
+            parameters = tf.stack(parameters, axis=-1)
+            return log_posterior_fn(parameters)
+        
+        print('Lets run some checks with everything...')
+        # Check the gradient with respect to each parameter
+        log_prob = target_log_prob_fn(*initial_state)
+        # with tf.GradientTape() as tape:
+        #     tape.watch(initial_state)
+        #     log_prob = target_log_prob_fn(*initial_state)
+        # gradients = tape.gradient(log_prob, initial_state)
+        # print('Using tape.gradient to check gradients w/respect to each parameter')
+        # for i, grad in enumerate(gradients):
+        #     print(f'Gradient for parameter {i}: {grad.numpy()}')
+
+        # # CALLING GILLES' "sample_hmc" from .utils.mcmc
+        # # quick test - does it work?
+        # initial_ll = target_log_prob_fn(*initial_state)
+        # print(f'idx={idx}; initial_ll={initial_ll}')
+        # print('Calling "sample_hmc" from braincoder.utils.mcmc')
+
+        samples, stats = sample_hmc(
+            init_state = initial_state, 
+            target_log_prob_fn=target_log_prob_fn, 
+            unconstraining_bijectors=self.p_bijector_list, 
+            num_steps=num_results, 
+            # OTHER STUFF TO OPTIMIZE
+            step_size=step_size, 
+            **kwargs
+            )                
+                            
+        # stuff to save...        
+        all_samples = tf.stack(samples, axis=-1).numpy()
+        # nsteps, n_voxels, n_params
+        
+        for ivx in range(self.n_voxels):
+            estimated_p_dict = {}
+            for i,p in enumerate(self.model_labels):
+                estimated_p_dict[p] = all_samples[:,ivx,i]
+            self.mcmc_sampler[ivx] = pd.DataFrame(estimated_p_dict)
+        self.mcmc_stats = stats            
 
     def ln_posterior(self, params, response):
         prior = self.ln_prior(params)
