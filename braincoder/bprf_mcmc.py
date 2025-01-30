@@ -204,7 +204,8 @@ class BPRF(object):
             log_likelihood = tf.reduce_sum(normal_dist.log_prob(residuals))
             log_prior = log_prior_fn(parameters)
             return log_likelihood + log_prior
-        
+
+       
         # Loop through the voxels to fit!
         for voxel_idx in idx:
             # -> make sure we are in the correct dtype 
@@ -212,7 +213,9 @@ class BPRF(object):
             # -> also make sure that the shape of the tensor is one that the "model" class likes 
             initial_state = [tf.expand_dims(i, axis=0) for i in initial_state]
             # Define the target log probability function (for this voxel)
-            
+            step_size = [tf.fill([1] + [1] * (len(s.shape) - 1),
+                                tf.constant(step_size, np.float32)) for s in initial_state]             
+            print(step_size)
             def target_log_prob_fn(*parameters):
                 parameters = tf.stack(parameters, axis=-1)
                 return log_posterior_fn(parameters, voxel_idx)
@@ -254,9 +257,8 @@ class BPRF(object):
             self.mcmc_stats[voxel_idx] = stats
 
     def fit_all(self, 
-            idx = None, 
             init_pars=None,
-            num_results=1000, 
+            num_results=100, 
             **kwargs):
         '''
         Experimental - can we fit everything at once?
