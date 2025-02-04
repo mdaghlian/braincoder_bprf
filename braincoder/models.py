@@ -4,7 +4,7 @@ import logging
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
-from .utils import norm, format_data, format_paradigm, format_parameters, format_weights, logit, restrict_radians, lognormalpdf_n, von_mises_pdf, lognormal_pdf_mode_fwhm, norm2d
+from .utils import norm, format_data, format_paradigm, format_parameters, format_weights, logit, log10, restrict_radians, lognormalpdf_n, von_mises_pdf, lognormal_pdf_mode_fwhm, norm2d
 from tensorflow_probability import distributions as tfd
 from braincoder.utils.math import aggressive_softplus, aggressive_softplus_inverse, norm
 import pandas as pd
@@ -67,11 +67,9 @@ class EncodingModel(object):
         
         paradigm = self.get_paradigm(paradigm)
         paradigm_ = self._get_paradigm(paradigm)[np.newaxis, ...]
-
         parameters = self._get_parameters(parameters)
         
         parameters_ = parameters.values[np.newaxis, ...] if parameters is not None else None
-
         predictions = self._predict(paradigm_, parameters_, weights_)[0]
 
         if weights is None:
@@ -2093,15 +2091,22 @@ class ContrastSensitivity(EncodingModel):
         csf = self._get_csf(stim_sequence, parameters).numpy()[0]
         
         return csf, SF_grid, CON_grid
-
-    def get_csf(self, as_frame=False, unpack=False, parameters=None):
-        ''' Get the csf seq at each pt in the SF'''
-        grid = self.stim_sequence.values
-
+    
+    def get_csf_curve(self, SF_values, parameters=None):
+        ''' Get the csf for a grid of SF and CON values '''
+        CON_values = np.ones_like(SF_values)
+        stim_sequence = pd.DataFrame({
+            'SF' : SF_values,
+            'CON' : CON_values,
+            },
+        ).astype('float32')
+        stim_sequence = stim_sequence.values
         parameters = self._get_parameters(parameters)
         parameters = self.parameters.values[np.newaxis, ...]
-        csf = self._get_csf(grid, parameters).numpy()[0]
 
+        csf = self._asymetric_parabola(stim_sequence, parameters).numpy()[0]
+
+        
         return csf
 
 
@@ -2113,29 +2118,25 @@ class ContrastSensitivity(EncodingModel):
         # norm: n_batches x n_timepoints x n_voxels
 
         # output: n_batches x n_timepoints x n_voxels
-        csf = self._get_csf(self.stim_sequence, parameters)
+        csf = self._get_csf(paradigm[0], parameters)
+
         baseline = parameters[:, :, 6, tf.newaxis]
-        # result = tf.tensordot(paradigm, rf, (2, 2))[:, :, 0, :] + baseline
         result = csf + baseline
         # Want the output to be n_batches x n_timepoints x n_voxels
         result = tf.transpose(result, [0, 2, 1])
         return result
     
     @tf.function
-    def _get_csf(self, stim_sequence, parameters):
-
+    def _asymetric_parabola(self, stim_sequence, parameters):
         # n_batches x n_populations x  n_grid_spaces
         SF_seq = stim_sequence[:, 0][tf.newaxis, tf.newaxis, :]
-        CON_seq = stim_sequence[:, 1][tf.newaxis, tf.newaxis, :]
 
-        
+        # Unpack parameters with broadcasting                
         # n_batches x n_populations x n_grid_spaces (broadcast)
         width_r = parameters[:, :, 0, tf.newaxis]
         SFp = parameters[:, :, 1, tf.newaxis]
         CSp = parameters[:, :, 2, tf.newaxis]
         width_l = parameters[:, :, 3, tf.newaxis]        
-        crf_exp = parameters[:, :, 4, tf.newaxis]
-        amplitude = parameters[:, :, 5, tf.newaxis]
         
         # Safeguard against log of non-positive values
         SF_seq_safe = tf.maximum(SF_seq, 1e-8)
@@ -2143,25 +2144,89 @@ class ContrastSensitivity(EncodingModel):
         CSp_safe = tf.maximum(CSp, 1e-8)
 
         # Logarithmic transformations
-        log10 = tf.math.log(10.0)
-        log_SF_seq  = tf.math.log(SF_seq_safe) / log10
-        log_SFp     = tf.math.log(SFp_safe) / log10
-        log_CSp     = tf.math.log(CSp_safe) / log10        
+        log_SF_seq  = log10(SF_seq_safe)
+        log_SFp     = log10(SFp_safe)
+        log_CSp     = log10(CSp_safe)
 
-        # Split stimulus space into left and right
-        is_left = SF_seq < SFp
-
+        # Logarithmic transformations
+        log_SF_seq  = log10(SF_seq_safe)
+        log_SFp     = log10(SFp_safe)
+        log_CSp     = log10(CSp_safe)
+        
         # Create the curves
-        L_curve = tf.math.pow(10.0, log_CSp - ((log_SF_seq - log_SFp) ** 2) * (width_l ** 2))
-        R_curve = tf.math.pow(10.0, log_CSp - ((log_SF_seq - log_SFp) ** 2) * (width_r ** 2))
+        log_sf_diff = (log_SF_seq - log_SFp) ** 2
+        L_curve = tf.math.pow(10.0, log_CSp - (log_sf_diff) * (width_l ** 2))
+        R_curve = tf.math.pow(10.0, log_CSp - (log_sf_diff) * (width_r ** 2))
 
         # Combine the curves using boolean masks
-        csf = tf.where(is_left, L_curve, R_curve)
+        
+        # # Split stimulus space into left and right
+        # is_left = log_SF_seq > log_SFp
+        # csf = tf.where(is_left, L_curve, R_curve) # REMOVE THE "WHERE" - makes unstable gradients
+        # Smooth transition instead of hard `tf.where`
+        alpha = 50.0  # Adjust to control smoothness
+        blend_factor = sigmoid(alpha * (log_SF_seq - log_SFp))
+        csf = blend_factor * R_curve + (1 - blend_factor) * L_curve        
+        return csf 
 
+    @tf.function
+    def _apply_crf(self, stim_sequence, parameters,csf):
+        # n_batches x n_populations x  n_grid_spaces
+        CON_seq = stim_sequence[:, 1][tf.newaxis, tf.newaxis, :]    
+        # n_batches x n_populations x n_grid_spaces (broadcast)        
+        crf_exp = parameters[:, :, 4, tf.newaxis]
+        amplitude = parameters[:, :, 5, tf.newaxis]        
         # Contrast sensitivity
-        cthresh = 100 / tf.maximum(csf, 1e-8)
-
+        cthresh = 100 / tf.clip_by_value(csf, 1e-8, 1e8) # Prevent extremes
         ncsf_resp = ((CON_seq ** crf_exp) / (CON_seq ** crf_exp + cthresh ** crf_exp)) * amplitude
+        return ncsf_resp    
+    
+    @tf.function
+    def _get_csf(self, stim_sequence, parameters):
+        csf = self._asymetric_parabola(stim_sequence, parameters)
+        ncsf_resp = self._apply_crf(stim_sequence, parameters, csf)
+
+        # n_batches x n_populations x  n_grid_spaces
+        # SF_seq = stim_sequence[:, 0][tf.newaxis, tf.newaxis, :]
+        # CON_seq = stim_sequence[:, 1][tf.newaxis, tf.newaxis, :]
+
+        # # Unpack parameters with broadcasting                
+        # # n_batches x n_populations x n_grid_spaces (broadcast)
+        # width_r = parameters[:, :, 0, tf.newaxis]
+        # SFp = parameters[:, :, 1, tf.newaxis]
+        # CSp = parameters[:, :, 2, tf.newaxis]
+        # width_l = parameters[:, :, 3, tf.newaxis]        
+        # crf_exp = parameters[:, :, 4, tf.newaxis]
+        # amplitude = parameters[:, :, 5, tf.newaxis]
+        
+        # # Safeguard against log of non-positive values
+        # SF_seq_safe = tf.maximum(SF_seq, 1e-8)
+        # SFp_safe = tf.maximum(SFp, 1e-8)
+        # CSp_safe = tf.maximum(CSp, 1e-8)
+
+        # # Logarithmic transformations
+        # log_SF_seq  = log10(SF_seq_safe)
+        # log_SFp     = log10(SFp_safe)
+        # log_CSp     = log10(CSp_safe)
+        
+        # # Create the curves
+        # log_sf_diff = (log_SF_seq - log_SFp) ** 2
+        # L_curve = tf.math.pow(10.0, log_CSp - (log_sf_diff) * (width_l ** 2))
+        # R_curve = tf.math.pow(10.0, log_CSp - (log_sf_diff) * (width_r ** 2))
+
+        # # Combine the curves using boolean masks
+        
+        # # # Split stimulus space into left and right
+        # # is_left = SF_seq < SFp
+        # # csf = tf.where(is_left, L_curve, R_curve) # REMOVE THE "WHERE" - makes unstable gradients
+        # # Smooth transition instead of hard `tf.where`
+        # alpha = 50.0 # Adjust to control smoothness
+        # blend_factor = sigmoid(alpha * (SF_seq - SFp))
+        # csf = blend_factor * R_curve + (1 - blend_factor) * L_curve        
+        # # Contrast sensitivity
+        # cthresh = 100 / tf.clip_by_value(csf, 1e-8, 1e8) # Prevent extremes
+
+        # ncsf_resp = ((CON_seq ** crf_exp) / (CON_seq ** crf_exp + cthresh ** crf_exp)) * amplitude
         return ncsf_resp
 
     @tf.function
