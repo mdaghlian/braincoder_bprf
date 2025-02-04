@@ -160,11 +160,11 @@ class BPRF(object):
     def fit(self, 
             idx = None, 
             init_pars=None,
-            num_results=1000, 
+            num_steps=1000, 
             **kwargs):
         
         step_size = kwargs.pop('step_size', 1) # rest of the kwargs go to "hmc_sample"        
-
+        paradigm = kwargs.pop('paradigm', self.paradigm)
         # Which voxels to fit?    
         if idx is None: # all of them
             idx = range(self.n_voxels)
@@ -179,7 +179,7 @@ class BPRF(object):
         # init_pars = self._bprf_transform_parameters_forward(init_pars.values.astype(np.float32)) # ???        
 
         # Clean the paradigm 
-        paradigm_ = self.model.stimulus._clean_paradigm(self.paradigm)        
+        paradigm_ = self.model.stimulus._clean_paradigm(paradigm)        
         
         # Define the prior in 'tf'
         @tf.function
@@ -239,7 +239,7 @@ class BPRF(object):
                 init_state = initial_state, 
                 target_log_prob_fn=target_log_prob_fn, 
                 unconstraining_bijectors=self.p_bijector_list, 
-                num_steps=num_results, 
+                num_steps=num_steps, 
                 # OTHER STUFF TO OPTIMIZE
                 step_size=step_size, 
                 **kwargs
@@ -258,7 +258,7 @@ class BPRF(object):
 
     def fit_all(self, 
             init_pars=None,
-            num_results=100, 
+            num_steps=100, 
             **kwargs):
         '''
         Experimental - can we fit everything at once?
@@ -266,6 +266,7 @@ class BPRF(object):
         '''
         
         step_size = kwargs.pop('step_size', 1) # rest of the kwargs go to "hmc_sample"                
+        paradigm = kwargs.pop('paradigm', self.paradigm)
         y = self.data.values
         init_pars = self.model._get_parameters(init_pars)
         # Use the bprf bijectors (not the model ones...)
@@ -274,7 +275,7 @@ class BPRF(object):
         # init_pars = self._bprf_transform_parameters_forward(init_pars.values.astype(np.float32)) # ???        
 
         # Clean the paradigm 
-        paradigm_ = self.model.stimulus._clean_paradigm(self.paradigm)        
+        paradigm_ = self.model.stimulus._clean_paradigm(paradigm)        
         
         # Define the prior in 'tf'
         @tf.function
@@ -291,7 +292,7 @@ class BPRF(object):
         # the residuals are all normally distributed...
         # simple - but I think it works; and has been applied in this context before (see Invernizzi et al)
         normal_dist = tfp.distributions.Normal(loc=0.0, scale=1.0)
-        # @tf.function
+        @tf.function
         def log_posterior_fn(parameters):
             predictions = self.model._predict(
                 paradigm_[tf.newaxis, ...], parameters[tf.newaxis, ...], None)
@@ -304,7 +305,6 @@ class BPRF(object):
         # -> make sure we are in the correct dtype 
         initial_state = [tf.convert_to_tensor(init_pars[:,i], dtype=tf.float32) for i in range(self.n_params)]                          
         # Define the target log probability function (for this voxel)
-        
         def target_log_prob_fn(*parameters):
             parameters = tf.stack(parameters, axis=-1)
             return log_posterior_fn(parameters)
@@ -312,6 +312,7 @@ class BPRF(object):
         print('Lets run some checks with everything...')
         # Check the gradient with respect to each parameter
         log_prob = target_log_prob_fn(*initial_state)
+        print(log_prob)
         # with tf.GradientTape() as tape:
         #     tape.watch(initial_state)
         #     log_prob = target_log_prob_fn(*initial_state)
@@ -330,7 +331,7 @@ class BPRF(object):
             init_state = initial_state, 
             target_log_prob_fn=target_log_prob_fn, 
             unconstraining_bijectors=self.p_bijector_list, 
-            num_steps=num_results, 
+            num_steps=num_steps, 
             # OTHER STUFF TO OPTIMIZE
             step_size=step_size, 
             **kwargs
