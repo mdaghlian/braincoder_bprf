@@ -55,3 +55,6 @@ sg_execution_times.rst
 
 test*.ipynb
 z_*
+sim_output/*
+*.pkl
+ctest*

@@ -171,7 +171,7 @@ class BPRF(object):
             self.fix_update_index = tf.concat(indices_list, axis=0)  # shape: [num_updates, 2]
             self.fix_update_value = tf.concat(updates_list, axis=0)    # shape: [num_updates]
             # Define the update function
-            self.fix_update_fn = lambda parameters: tf.tensor_scatter_nd_update(parameters, self.fix_update_index, self.fix_update_value)             
+            self.fix_update_fn = FixUdateFn(self.fix_update_index, self.fix_update_value).update_fn             
 
             # Also ensure that priors & bijectors are correct
             for p in self.fixed_pars.keys():
@@ -180,7 +180,7 @@ class BPRF(object):
                 self.p_bijector_bw[p] = tfp.bijectors.Identity()
             
         else:
-            self.fix_update_fn = lambda parameters: parameters
+            self.fix_update_fn = FixUdateFn().update_fn             
         
         # Set the bijectors (to project to a useful fitting space)
         self.p_bijector_list = []
@@ -394,6 +394,20 @@ class BPRF(object):
     @paradigm.setter
     def paradigm(self, paradigm):
         self._paradigm = format_paradigm(paradigm)
+
+
+# *** FIX UPDATE FN **
+class FixUdateFn():
+    '''Replace lambda to make it pickleable'''
+    def __init__(self, fix_update_index=None, fix_update_value=None):
+        self.fix_update_index = fix_update_index
+        self.fix_update_value = fix_update_value
+
+    def update_fn(self, parameters):
+        if self.fix_update_index is None:
+            return parameters
+        else:
+            tf.tensor_scatter_nd_update(parameters, self.fix_update_index, self.fix_update_value)             
 
 # *** PRIORS ***
 class PriorBase():
