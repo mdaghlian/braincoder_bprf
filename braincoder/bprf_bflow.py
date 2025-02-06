@@ -18,7 +18,7 @@ from .models import LinearModelWithBaseline
 softplus_inverse = tfp.math.softplus_inverse
 
 import copy
-class BPRF(object):
+class BPRF_bflow(object):
     ''' Wrapper to do bayesian prf fitting
     designed by Marcus Daghlian
     '''
@@ -76,15 +76,14 @@ class BPRF(object):
             loc = kwargs.get('loc')    
             scale = kwargs.get('scale')    
             self.p_prior[pid]   = PriorNorm(loc, scale)            
+
         elif prior_type=='uniform' :
             vmin = kwargs.get('vmin')
             vmax = kwargs.get('vmax')        
             self.p_prior[pid] = PriorUniform(vmin, vmax)            
+
         elif prior_type=='none':
             self.p_prior[pid] = PriorNone()  
-        elif prior_type=='fixed':
-            fixed_val = kwargs.get('fixed_val')
-            self.p_prior[pid] = PriorFixed(fixed_val)
         else:
             raise ValueError(f"Prior type '{prior_type}' is not implemented")
     
@@ -94,26 +93,13 @@ class BPRF(object):
         Can setup more informative, like a normal using the other methods        
         '''        
         for p in bounds.keys():
-            if bounds[p][0]!=bounds[p][1]:
-                self.add_prior(
-                    pid=p,
-                    prior_type = 'uniform',
-                    vmin = bounds[p][0],
-                    vmax = bounds[p][1],
-                    )
-            else:
-                self.add_prior(
-                    pid=p,
-                    prior_type = 'fixed',
-                    fixed_val = bounds[p][0],
-                    )                
-    
-    def sample_from_priors(self, n):
-        samples = []
-        for p in self.model_labels:
-            samples.append(self.p_prior[p].sampler(n))
-        return tf.stack(samples, axis=-1)
-    
+            self.add_prior(
+                pid=p,
+                prior_type = 'uniform',
+                vmin = bounds[p][0],
+                vmax = bounds[p][1],
+                )
+            
     def add_bijector(self, pid, bijector_type, **kwargs):
         ''' add transformations to parameters so that they are fit smoothly        
         
@@ -138,8 +124,8 @@ class BPRF(object):
             self.add_bijector(
                 pid=p,
                 bijector_type = 'sigmoid',
-                low = bounds[p][0],
-                high = bounds[p][1],
+                vmin = bounds[p][0],
+                vmax = bounds[p][1],
                 )
         
     def prep_for_fitting(self, **kwargs):
@@ -235,8 +221,9 @@ class BPRF(object):
         y = self.data.values
         init_pars = self.model._get_parameters(init_pars)
         # Use the bprf bijectors (not the model ones...)
-        init_pars = init_pars.values.astype(np.float32) # ???
-        # bloop
+        init_pars = init_pars.values.astype(np.float32) # ???        
+        # # Maybe should be applying some transform here? 
+        # init_pars = self._bprf_transform_parameters_forward(init_pars.values.astype(np.float32)) # ???        
 
         # Clean the paradigm 
         paradigm_ = self.model.stimulus._clean_paradigm(paradigm)        
@@ -255,33 +242,14 @@ class BPRF(object):
         # Calculating the likelihood, based on the assumption that 
         # the residuals are all normally distributed...
         # simple - but I think it works; and has been applied in this context before (see Invernizzi et al)
-        normal_dist = tfp.distributions.Normal(loc=0.0, scale=1)
+        normal_dist = tfp.distributions.Normal(loc=0.0, scale=1.0)
         @tf.function
         def log_posterior_fn(parameters):
-            parameters = self.fix_update_fn(parameters)
+            # parameters = self.fix_update_fn(parameters)
             predictions = self.model._predict(
                 paradigm_[tf.newaxis, ...], parameters[tf.newaxis, ...], None)            
             residuals = y[:, vx_bool] - predictions[0]
-            # ** [1] Just use N(0,1)
-            # log_likelihood = tf.reduce_sum(normal_dist.log_prob(residuals))
-
-            # ** [2] Use N(0, std)         
-            residuals_std  = tf.math.reduce_std(residuals, axis=0)
-            # normal_dist = tfp.distributions.Normal(loc=0.0, scale=residuals_std)
-            log_likelihood = tf.reduce_sum(normal_dist.log_prob(residuals/residuals_std) - tf.math.log(residuals_std))
-            
-            # ** [3] Use N(0,std) custom implmentation
-            # residuals_std  = tf.math.reduce_std(residuals, axis=0) + 1e-6 # avoid div / 0
-            # # Compute the log likelihood manually.
-            # # log_prob = -0.5 * log(2π) - log(σ) - (x²) / (2σ²)
-            # log_prob = (
-            #     -0.5 * tf.math.log(2.0 * np.pi)
-            #     - tf.math.log(residuals_std)
-            #     - (residuals ** 2) / (2.0 * residuals_std ** 2)
-            # )
-            # # Sum over all samples and columns.
-            # log_likelihood = tf.reduce_sum(log_prob)            
-            
+            log_likelihood = tf.reduce_sum(normal_dist.log_prob(residuals))
             log_prior = tf.reduce_sum(log_prior_fn(parameters))
             return log_likelihood + log_prior
         
@@ -343,7 +311,7 @@ class BPRF(object):
     def ln_posterior(self, params, response):
         prior = self.ln_prior(params)
         like = self.ln_likelihood(params, response)
-        return prior + like # save both...
+        return prior + like, like # save both...
 
 
     def get_predictions(self, parameters=None):
@@ -400,9 +368,6 @@ class PriorBase():
     prior_type = 'base'
     def prior(self, param):
         return self.distribution.log_prob(param)
-    def sampler(self, n):
-        # Sample n instances
-        return self.distribution.sample(n)
     
 class PriorNorm(PriorBase):
     def __init__(self, loc, scale):
@@ -423,16 +388,6 @@ class PriorNone(PriorBase):
         self.prior_type = 'none'
     def prior(self, param):
         return tf.zeros_like(param)
-
-class PriorFixed(PriorBase):
-    def __init__(self, fixed_val):
-        self.prior_type = 'fixed'
-        self.fixed_val = tf.constant(fixed_val, dtype=tf.float32)
-    def prior(self, param):
-        return tf.zeros_like(param)
-    def sampler(self, n):
-        return tf.fill([n], self.fixed_val)
-
 # *** SAMPLER ***
 from timeit import default_timer as timer
 
