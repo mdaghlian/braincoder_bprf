@@ -262,27 +262,19 @@ class BPRF(object):
             predictions = self.model._predict(
                 paradigm_[tf.newaxis, ...], parameters[tf.newaxis, ...], None)            
             residuals = y[:, vx_bool] - predictions[0]
+            
+            
             # ** [1] Just use N(0,1)
-            # log_likelihood = tf.reduce_sum(normal_dist.log_prob(residuals))
+            # log_likelihood = tf.reduce_sum(normal_dist.log_prob(residuals), axis=0)
 
             # ** [2] Use N(0, std)         
             residuals_std  = tf.math.reduce_std(residuals, axis=0)
-            # normal_dist = tfp.distributions.Normal(loc=0.0, scale=residuals_std)
-            log_likelihood = tf.reduce_sum(normal_dist.log_prob(residuals/residuals_std) - tf.math.log(residuals_std))
-            
-            # ** [3] Use N(0,std) custom implmentation
-            # residuals_std  = tf.math.reduce_std(residuals, axis=0) + 1e-6 # avoid div / 0
-            # # Compute the log likelihood manually.
-            # # log_prob = -0.5 * log(2π) - log(σ) - (x²) / (2σ²)
-            # log_prob = (
-            #     -0.5 * tf.math.log(2.0 * np.pi)
-            #     - tf.math.log(residuals_std)
-            #     - (residuals ** 2) / (2.0 * residuals_std ** 2)
-            # )
-            # # Sum over all samples and columns.
-            # log_likelihood = tf.reduce_sum(log_prob)            
-            
-            log_prior = tf.reduce_sum(log_prior_fn(parameters))
+            # -> rescale based on std...
+            log_likelihood = normal_dist.log_prob(residuals/residuals_std) - tf.math.log(residuals_std)
+            log_likelihood = tf.reduce_sum(log_likelihood, axis=0)
+                         
+            log_prior = log_prior_fn(parameters)            
+            # Return vector of length idx (optimize each chain separately)
             return log_likelihood + log_prior
         
         # -> make sure we are in the correct dtype 
