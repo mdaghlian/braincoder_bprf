@@ -14,7 +14,7 @@ hrf_model:
   tr: 1.5
 
 simulation:
-  noise: 0.1
+  noise: 0.5
 
 grid_fit:
   grid_points:

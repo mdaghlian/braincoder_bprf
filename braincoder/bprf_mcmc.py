@@ -272,7 +272,6 @@ class BPRF(object):
             # -> rescale based on std...
             log_likelihood = normal_dist.log_prob(residuals/residuals_std) - tf.math.log(residuals_std)
             log_likelihood = tf.reduce_sum(log_likelihood, axis=0)
-                         
             log_prior = log_prior_fn(parameters)            
             # Return vector of length idx (optimize each chain separately)
             return log_likelihood + log_prior
@@ -499,51 +498,4 @@ def bprf_sample_NUTS(
     duration = timer() - start
     stats['elapsed_time'] = duration
 
-    return samples, stats
-
-@tf.function
-def bprf_sample_hmc(
-        init_state,
-        step_size,
-        target_log_prob_fn,
-        unconstraining_bijectors,
-        target_accept_prob=0.85,
-        num_leapfrog_steps=10,
-        num_steps=50,
-        burnin=50):
-    
-    def trace_fn(_, pkr):
-        return {
-            'log_prob': pkr.inner_results.accepted_results.target_log_prob,
-            'is_accepted': pkr.inner_results.is_accepted,
-            'accept_ratio': tf.exp(pkr.inner_results.log_accept_ratio),
-            'step_size': pkr.inner_results.accepted_results.step_size}
-    print(step_size)
-    hmc  = tfp.mcmc.HamiltonianMonteCarlo(
-        target_log_prob_fn=target_log_prob_fn,
-        step_size=step_size,
-        num_leapfrog_steps=num_leapfrog_steps    
-    )
-    # hmc = tfp.mcmc.TransformedTransitionKernel(
-    #     inner_kernel=hmc,
-    #     bijector=unconstraining_bijectors)    
-    # This adapts the inner kernel's step_size.
-    hmc = tfp.mcmc.SimpleStepSizeAdaptation(
-        inner_kernel = hmc,
-        num_adaptation_steps=int(burnin * 0.8),
-        # log_accept_prob_getter_fn=lambda pkr: pkr.inner_results.log_accept_ratio,
-
-    )
-
-    start = timer()
-    # Sampling from the chain.
-    samples, stats = tfp.mcmc.sample_chain(
-        num_results=burnin + num_steps,
-        current_state=init_state,
-        kernel=hmc,
-        trace_fn=trace_fn
-        )
-
-    duration = timer() - start
-    stats['elapsed_time'] = duration
     return samples, stats
