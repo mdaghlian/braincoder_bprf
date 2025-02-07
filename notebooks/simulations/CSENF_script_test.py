@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
-
+import time
 import tensorflow as tf
 print('GPU devices available:', tf.config.list_physical_devices('GPU'))
 
@@ -42,9 +42,9 @@ config_path = args.config
 # --------------------------
 # Load configuration from YAML
 # --------------------------
-with open(config_path, 'r') as f:
+with open(opj(os.path.dirname(__file__), config_path), 'wb') as f:
     config = yaml.safe_load(f)
-
+bloop
 # Extract configuration variables
 bounds       = config['bounds']
 n_vx         = config['n_vx']
@@ -104,6 +104,7 @@ with open(f'./{output_name}/ground_truth.pkl', 'wb') as file:
 # --------------------------
 # Parameter fitting using grid search
 # --------------------------
+start_time = time.time()
 cfitter = ParameterFitter(model, data, model.paradigm)
 grid_pars = cfitter.fit_grid(
     width_r     = np.linspace(bounds['width_r'][0], bounds['width_r'][1], grid_points['width_r']),
@@ -117,10 +118,17 @@ grid_pars = cfitter.fit_grid(
 )
 ols_pars = cfitter.refine_baseline_and_amplitude(grid_pars)
 refined_pars = cfitter.fit(init_pars=ols_pars)  # You can also fix parameters if desired
+end_time = time.time()
+elapsed_time = end_time - start_time
 
+# Convert to hours, minutes, seconds
+hours, remainder = divmod(elapsed_time, 3600)
+minutes, seconds = divmod(remainder, 60)
+cfit_time = f"Elapsed time - classical fitting: {int(hours)}h {int(minutes)}m {seconds:.2f}s"
+print(cfit_time)
 # Save the cfitter object
 with open(f'./{output_name}/cfitter.pkl', 'wb') as file:
-    pickle.dump(cfitter, file)
+    pickle.dump({'cfitter':cfitter, 'cfit_time':cfit_time}, file)
 
 # --------------------------
 # Bayesian pRF fitting using MCMC
@@ -135,6 +143,8 @@ init_pars_dict = {
 }
 init_pars = pd.DataFrame(init_pars_dict)
 
+start_time = time.time()
+
 bfitter.fit_mcmc(
     init_pars=init_pars,
     num_steps=mcmc_params['num_steps'],
@@ -144,7 +154,15 @@ bfitter.fit_mcmc(
     target_accept_prob=mcmc_params['target_accept_prob'],
     sampler_fn=mcmc_params['sampler_fn']
 )
-print("Elapsed time for MCMC:", bfitter.mcmc_stats['elapsed_time'])
+
+end_time = time.time()
+elapsed_time = end_time - start_time
+
+# Convert to hours, minutes, seconds
+hours, remainder = divmod(elapsed_time, 3600)
+minutes, seconds = divmod(remainder, 60)
+bfit_time = f"Elapsed time - MCMC fitting: {int(hours)}h {int(minutes)}m {seconds:.2f}s "
+print(bfit_time)
 
 with open(f'./{output_name}/bfitter.pkl', 'wb') as file:
-    pickle.dump(bfitter, file)
+    pickle.dump({'bfitter':bfitter, 'bfit_time':bfit_time}, file)

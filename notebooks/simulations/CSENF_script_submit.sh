@@ -4,17 +4,18 @@
 #$ -V
 
 # Get the directory of this script.
+output_name="csf_vx1000_npt5"
+config_name="config.yml"
 this_dir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 nr_jobs=1
-job_name="ctest"
-
-# Build the qsub command.
-# Note the addition of the -b y flag to indicate a binary job.
-job="qsub -b y -q cuda.q@jupiter -pe smp ${nr_jobs} -wd ${this_dir} -N ${job_name} -o ${job_name}.txt"
+output_file=$this_dir/output_$output_name
+if [ ! -d "$output_file" ]; then
+    mkdir "$output_file"
+fi
+job="qsub -b y -j y -q cuda.q@jupiter -pe smp ${nr_jobs} -wd ${output_file} -N ${output_name} -o ${output_name}.txt"
 
 # Path to the python script to be executed by the job
 script_path="${this_dir}/CSENF_script_test.py"
-echo $script_path
-exit 1
+cp $this_dir/$config_name $output_file/$config_name
 # Submit the job, explicitly calling the current conda python interpreter.
-${job} "$(which python)" "${script_path}"
+${job} "$(which python)" "${script_path} --output ${output_name} --config ${config_name}"
