@@ -4,6 +4,7 @@
 #$ -V
 
 import os
+from os.path import join as opj
 import sys
 import yaml
 import pickle
@@ -14,14 +15,14 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 import time
 import tensorflow as tf
+from scipy import io
+# tf.config.set_visible_devices([], 'GPU')
 print('GPU devices available:', tf.config.list_physical_devices('GPU'))
 
-from scipy import io
 import braincoder
 from braincoder.utils.visualize import *
-import prfpy_csenf
 
-from os.path import join as opj
+
 from braincoder.models import ContrastSensitivity, ContrastSensitivityWithHRF
 from braincoder.hrf import SPMHRFModel, CustomHRFModel, HRFModel
 from braincoder.stimuli import ContrastSensitivityStimulus
@@ -42,9 +43,13 @@ config_path = args.config
 # --------------------------
 # Load configuration from YAML
 # --------------------------
-with open(opj(os.path.dirname(__file__), config_path), 'wb') as f:
+this_path = opj(os.path.dirname(__file__), output_name)
+with open(opj(os.path.dirname(__file__), config_path), 'r') as f:
     config = yaml.safe_load(f)
-bloop
+
+if not os.path.exists(this_path):
+    os.makedirs(this_path)
+
 # Extract configuration variables
 bounds       = config['bounds']
 n_vx         = config['n_vx']
@@ -59,6 +64,7 @@ init_param_values = config['initial_parameters']
 # --------------------------
 # Load stimulus sequences
 # --------------------------
+import prfpy_csenf
 seq_path = os.path.join(os.path.dirname(prfpy_csenf.__path__[0]))
 sfs_seq = np.load(opj(seq_path, 'eg_sfs_seq.npy'))
 con_seq = np.load(opj(seq_path, 'eg_con_seq.npy'))
@@ -98,7 +104,7 @@ ground_truth = {
     'bounds': bounds,
     'config': config
 }
-with open(f'./{output_name}/ground_truth.pkl', 'wb') as file:
+with open(opj(this_path, 'ground_truth.pkl'), 'wb') as file:
     pickle.dump(ground_truth, file)
 
 # --------------------------
@@ -127,7 +133,7 @@ minutes, seconds = divmod(remainder, 60)
 cfit_time = f"Elapsed time - classical fitting: {int(hours)}h {int(minutes)}m {seconds:.2f}s"
 print(cfit_time)
 # Save the cfitter object
-with open(f'./{output_name}/cfitter.pkl', 'wb') as file:
+with open(opj(this_path, 'cfitter.pkl'), 'wb') as file:
     pickle.dump({'cfitter':cfitter, 'cfit_time':cfit_time}, file)
 
 # --------------------------
@@ -164,5 +170,5 @@ minutes, seconds = divmod(remainder, 60)
 bfit_time = f"Elapsed time - MCMC fitting: {int(hours)}h {int(minutes)}m {seconds:.2f}s "
 print(bfit_time)
 
-with open(f'./{output_name}/bfitter.pkl', 'wb') as file:
+with open(opj(this_path, 'bfitter.pkl'), 'wb') as file:
     pickle.dump({'bfitter':bfitter, 'bfit_time':bfit_time}, file)

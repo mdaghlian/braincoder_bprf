@@ -1,10 +1,8 @@
 # config.yaml
 bounds:
-  width_r: [0, 1.5]
-  SFp: [0, 6]
-  CSp: [0, 200]
-  width_l: [0, 1.5]       # fixed parameter in our model
-  crf_exp: [0, 5]
+  x : [-1,1]
+  y : [-0.56, 0.56]
+  sd : [0.01, 2]
   amplitude: [0, 10]
   baseline: [-2, 2]
 
@@ -18,18 +16,16 @@ simulation:
 
 grid_fit:
   grid_points:
-    width_r: 5
-    SFp: 5
-    CSp: 10
-    width_l: 5
-    crf_exp: 5
+    x: 5
+    y: 5
+    sd: 10
   fixed:
     amplitude: 1.0
     baseline: 0
   use_correlation_cost: true
 
 mcmc:
-  num_steps: 500
+  num_steps: 5
   unrolled_leapfrog_steps: 1
   step_size: 1
   max_tree_depth: 10

@@ -2040,6 +2040,16 @@ class LinearModelWithBaselineHRF(LinearModelWithBaseline, HRFEncodingModel):
         return LinearModelWithBaseline._predict(self, paradigm, parameters, weights)
 # **********************************************************************************************************************
 from braincoder.stimuli import ContrastSensitivityStimulus
+Chung_Legge_default = pd.DataFrame({
+    'width_r': [1.28,],
+    'SFp': [2.5,],  # c/deg
+    'CSp': [166,],
+    'width_l': [0.68,],
+    # MADE UP - > just for model consistency
+    'amplitude': [1.0,],
+    'baseline': [0,], 
+    'crf_exp' : [0,], 
+}).astype('float32')
 class ContrastSensitivity(EncodingModel):
     
     parameter_labels = [
@@ -2086,7 +2096,7 @@ class ContrastSensitivity(EncodingModel):
         stim_sequence = stim_sequence.values
 
         parameters = self._get_parameters(parameters)
-        parameters = self.parameters.values[np.newaxis, ...]
+        parameters = parameters.values[np.newaxis, ...]
 
         csf = self._get_csf(stim_sequence, parameters).numpy()[0]
         
@@ -2102,7 +2112,7 @@ class ContrastSensitivity(EncodingModel):
         ).astype('float32')
         stim_sequence = stim_sequence.values
         parameters = self._get_parameters(parameters)
-        parameters = self.parameters.values[np.newaxis, ...]
+        parameters = parameters.values[np.newaxis, ...]
 
         csf = self._asymetric_parabola(stim_sequence, parameters).numpy()[0]
 
@@ -2126,6 +2136,36 @@ class ContrastSensitivity(EncodingModel):
         result = tf.transpose(result, [0, 2, 1])
         return result
     
+    def quick_aulcsf(self, parameters, **kwargs):
+        parameters = self._get_parameters(parameters=parameters)
+        parameters = parameters.values[np.newaxis, ...]  
+        SF_levels = kwargs.get('SF_levels', np.array([ 0.5,  1.,   3.,   6.,  12.,  18. ]))
+        normalize_AUC = kwargs.get('normalize_AUC', True)
+        stim_sequence = pd.DataFrame({'SF':SF_levels, 'CON':SF_levels*0}).astype('float32')
+        log_SF_levels = np.log10(SF_levels)#.reshape(1,-1)
+        # Generate grid to make the CSF     
+        csf_curve = self._asymetric_parabola(
+            stim_sequence = stim_sequence,
+            parameters = parameters
+            ).numpy()
+        logcsf_curve = np.log10(csf_curve)    
+        logcsf_curve[logcsf_curve<0] = 0 # Cannot have negative logCSF
+        aulcsf = np.trapz(logcsf_curve.T, x=log_SF_levels, axis=0) 
+        if not normalize_AUC:
+            return aulcsf
+        # Chung & Legge, normalized 
+        parameters = self._get_parameters(Chung_Legge_default)
+        parameters = parameters.values[np.newaxis, ...]    
+        csf_curve = self._asymetric_parabola(
+            stim_sequence = stim_sequence,
+            parameters = parameters
+            ).numpy()            
+        logcsf_curve = np.log10(csf_curve)    
+        logcsf_curve[logcsf_curve<0] = 0 # Cannot have negative logCSF    
+        CL_aulcsf = np.trapz(logcsf_curve.T, x=log_SF_levels, axis=0) 
+        norm_aulcsf = 100 * aulcsf / CL_aulcsf
+        return norm_aulcsf
+
     @tf.function
     def _asymetric_parabola(self, stim_sequence, parameters):
         # n_batches x n_populations x  n_grid_spaces
@@ -2166,7 +2206,8 @@ class ContrastSensitivity(EncodingModel):
         # Smooth transition instead of hard `tf.where`
         alpha = 50.0  # Adjust to control smoothness
         blend_factor = sigmoid(alpha * (log_SF_seq - log_SFp))
-        csf = blend_factor * R_curve + (1 - blend_factor) * L_curve        
+        csf = blend_factor * R_curve + (1 - blend_factor) * L_curve  
+              
         return csf 
 
     @tf.function
@@ -2186,47 +2227,6 @@ class ContrastSensitivity(EncodingModel):
         csf = self._asymetric_parabola(stim_sequence, parameters)
         ncsf_resp = self._apply_crf(stim_sequence, parameters, csf)
 
-        # n_batches x n_populations x  n_grid_spaces
-        # SF_seq = stim_sequence[:, 0][tf.newaxis, tf.newaxis, :]
-        # CON_seq = stim_sequence[:, 1][tf.newaxis, tf.newaxis, :]
-
-        # # Unpack parameters with broadcasting                
-        # # n_batches x n_populations x n_grid_spaces (broadcast)
-        # width_r = parameters[:, :, 0, tf.newaxis]
-        # SFp = parameters[:, :, 1, tf.newaxis]
-        # CSp = parameters[:, :, 2, tf.newaxis]
-        # width_l = parameters[:, :, 3, tf.newaxis]        
-        # crf_exp = parameters[:, :, 4, tf.newaxis]
-        # amplitude = parameters[:, :, 5, tf.newaxis]
-        
-        # # Safeguard against log of non-positive values
-        # SF_seq_safe = tf.maximum(SF_seq, 1e-8)
-        # SFp_safe = tf.maximum(SFp, 1e-8)
-        # CSp_safe = tf.maximum(CSp, 1e-8)
-
-        # # Logarithmic transformations
-        # log_SF_seq  = log10(SF_seq_safe)
-        # log_SFp     = log10(SFp_safe)
-        # log_CSp     = log10(CSp_safe)
-        
-        # # Create the curves
-        # log_sf_diff = (log_SF_seq - log_SFp) ** 2
-        # L_curve = tf.math.pow(10.0, log_CSp - (log_sf_diff) * (width_l ** 2))
-        # R_curve = tf.math.pow(10.0, log_CSp - (log_sf_diff) * (width_r ** 2))
-
-        # # Combine the curves using boolean masks
-        
-        # # # Split stimulus space into left and right
-        # # is_left = SF_seq < SFp
-        # # csf = tf.where(is_left, L_curve, R_curve) # REMOVE THE "WHERE" - makes unstable gradients
-        # # Smooth transition instead of hard `tf.where`
-        # alpha = 50.0 # Adjust to control smoothness
-        # blend_factor = sigmoid(alpha * (SF_seq - SFp))
-        # csf = blend_factor * R_curve + (1 - blend_factor) * L_curve        
-        # # Contrast sensitivity
-        # cthresh = 100 / tf.clip_by_value(csf, 1e-8, 1e8) # Prevent extremes
-
-        # ncsf_resp = ((CON_seq ** crf_exp) / (CON_seq ** crf_exp + cthresh ** crf_exp)) * amplitude
         return ncsf_resp
 
     @tf.function
