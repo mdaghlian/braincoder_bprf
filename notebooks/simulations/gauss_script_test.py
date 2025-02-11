@@ -36,6 +36,7 @@ parser.add_argument("--config", type=str, default="gauss_config.yml", help="Path
 args = parser.parse_args()
 
 output_name = args.output
+output_name = '/data1/projects/dumoulinlab/Lab_members/Marcus/programs/braincoder_bprf/notebooks/simulations/output_gauss'
 config_path = args.config
 
 # --------------------------
@@ -124,7 +125,7 @@ grid_pars = cfitter.fit_grid(
     sd=np.linspace(bounds['sd'][0], bounds['sd'][0], grid_points['sd']), 
     baseline=grid_fixed['baseline'],
     amplitude=grid_fixed['amplitude'],
-    use_correlation_cost=use_correlation_cost)
+    use_correlation_cost=use_corr_cost)
 ols_pars = cfitter.refine_baseline_and_amplitude(grid_pars)
 refined_pars = cfitter.fit(init_pars=ols_pars)
 end_time = time.time()

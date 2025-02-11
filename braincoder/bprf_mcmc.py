@@ -1,21 +1,11 @@
-# MCMC fitting for bprf
 import pandas as pd
 import numpy as np
-import datetime
+from .utils import format_data, format_paradigm, get_rsq, calculate_log_prob_t, calculate_log_prob_gauss, format_parameters
 import tensorflow as tf
-import os.path as op
-import os
-from tqdm.auto import tqdm
-from .utils import format_data, format_parameters, format_paradigm, logit, get_rsq
-from braincoder.stimuli import ImageStimulus
-import logging
-from tensorflow.math import softplus, sigmoid
-from tensorflow.linalg import lstsq
 import tensorflow_probability as tfp
 from tensorflow_probability import distributions as tfd
-from .models import LinearModelWithBaseline
+from tensorflow_probability import bijectors as tfb
 
-softplus_inverse = tfp.math.softplus_inverse
 
 import copy
 class BPRF(object):
@@ -29,21 +19,27 @@ class BPRF(object):
         * model + stimulus/paradigm (from .models, used to generate predictions)
         * prior definitions (per parameter)        
 
-        TODO: 
-        * add option to fix parameters
-        * more prior options
-        * work out how this jacobian thingy works with the priors + bijectors...
-
 
         '''    
         self.model = copy.deepcopy(model)
         self.data = data.astype(np.float32)
         self.kwargs = kwargs
         self.paradigm = model.get_paradigm(model.paradigm)
-        self.n_params = len(self.model.parameter_labels)
         self.n_voxels = self.data.shape[-1]
         self.model_labels = {l:i for i,l in enumerate(self.model.parameter_labels)} # useful to have it as a dict per entry        
-        
+        self.n_model_params = len(self.model_labels) # length of model parameters only... 
+
+        # We can also fit noise -> 
+        self.noise_method = kwargs.get('noise_method', 'fit_tdist')  # 'fit_normal' 'none'
+        assert self.noise_method in ('fit_tdist', 'fit_normal', 'none') 
+        if self.noise_method=='fit_tdist':
+            # Fit the t-distribution including dof, scale 
+            self.model_labels['noise_dof'] = len(self.model_labels) 
+            self.model_labels['noise_scale'] = len(self.model_labels) 
+        elif self.noise_method=='fit_normal':
+            self.model_labels['noise_scale'] = len(self.model_labels)  
+        self.n_params = len(self.model_labels)
+
         # MCMC specific information
         self.fixed_pars = {}
         # Prior for each parameter (e.g., normal distribution at 0 for "x")      
@@ -51,8 +47,21 @@ class BPRF(object):
         self.p_prior = {p:PriorNone() for p in self.model_labels}                                        
         self.p_prior_type = {p:'none' for p in self.model_labels}
         # -> default no bijector 
-        self.p_bijector = {p:tfp.bijectors.Identity() for p in self.model_labels} # What to apply to the 
-        self.p_bijector_bw = {p:tfp.bijectors.Identity() for p in self.model_labels} # What to apply to the 
+        self.p_bijector = {p:tfb.Identity() for p in self.model_labels} # What to apply to the 
+        # If fitting noise - apply these priors and bijectors by default
+        if self.noise_method=='fit_tdist':
+            self.add_bijector(pid='noise_dof', bijector_type=tfb.Softplus())
+            self.add_bijector(pid='noise_scale', bijector_type=tfb.Exp())
+            self.add_prior(pid='noise_dof', prior_type='Exponential', distribution=tfd.Exponential(rate=0.8))
+            self.add_prior(pid='noise_scale', prior_type='HalfNormal', distribution=tfd.HalfNormal(scale=1.0))
+        elif self.noise_method=='fit_normal':
+            self.add_bijector(pid='noise_scale', bijector_type=tfb.Exp())
+            self.add_prior(pid='noise_scale', prior_type='HalfNormal', distribution=tfd.HalfNormal(scale=1.0))                        
+
+        # # Hiearchical prior
+        # self.hier_prior = {p:PriorNone() for p in self.model_labels}                                        
+        # self.hier_prior_type = {p:'none' for p in self.model_labels}
+        
         # Per voxel (row in data) - save the output of the MCMC sampler 
         self.mcmc_sampler = [None] * self.data.shape[1]
         self.mcmc_stats = [None] * self.data.shape[1]
@@ -62,7 +71,7 @@ class BPRF(object):
         Adds the prior to each parameter:
 
         Options:
-            uniform:    uniform probability b/w the specified bounds (vmin, vmax). Otherwise infinite
+            uniform:    uniform probability b/w the specified bounds (low, high). Otherwise infinite
             normal:     normal probability. (loc, scale)
             none:       The parameter can still vary, but it will not influence the outcome... 
 
@@ -77,16 +86,16 @@ class BPRF(object):
             scale = kwargs.get('scale')    
             self.p_prior[pid]   = PriorNorm(loc, scale)            
         elif prior_type=='uniform' :
-            vmin = kwargs.get('vmin')
-            vmax = kwargs.get('vmax')        
-            self.p_prior[pid] = PriorUniform(vmin, vmax)            
+            low = kwargs.get('low')
+            high = kwargs.get('high')        
+            self.p_prior[pid] = PriorUniform(low, high)            
         elif prior_type=='none':
             self.p_prior[pid] = PriorNone()  
         elif prior_type=='fixed':
             fixed_val = kwargs.get('fixed_val')
             self.p_prior[pid] = PriorFixed(fixed_val)
         else:
-            raise ValueError(f"Prior type '{prior_type}' is not implemented")
+            self.p_prior[pid] = PriorGeneral(prior_type=prior_type, distribution=kwargs.get('distribution'))
     
     def add_priors_from_bounds(self, bounds):
         '''
@@ -98,15 +107,32 @@ class BPRF(object):
                 self.add_prior(
                     pid=p,
                     prior_type = 'uniform',
-                    vmin = bounds[p][0],
-                    vmax = bounds[p][1],
+                    low = bounds[p][0],
+                    high = bounds[p][1],
                     )
             else:
                 self.add_prior(
                     pid=p,
                     prior_type = 'fixed',
                     fixed_val = bounds[p][0],
-                    )                
+                    )    
+                
+    # def add_hierarchical_prior(self, pid, prior_type, h_prior_type='normal', **kwargs):
+    #     ''' Add a hiearchical prior...
+    #     i.e., fit the prior across all vertices
+
+    #     Say we look at parameter 'x' 
+    #     we could make the prior for 'x' be N(0,5); i.e., a normal distribution with loc=0, scale=5
+    #     OR -> we can make a hyper prior: and try to fit the loc and scale...
+    #     '''
+    #     # [1] make sure the 'p_prior' is none, because we are doing hierarchical priors now! 
+    #     self.p_prior[pid] = PriorNone
+    #     self.p_prior_type[pid] = 'none'
+
+    #     # [2] add the h_priors to the model_labels
+    #     current_n_params = self.n_params
+    #     self.model_labels[f'{pid}_loc'] = 
+
     
     def sample_from_priors(self, n):
         samples = []
@@ -122,12 +148,12 @@ class BPRF(object):
 
         '''
         if bijector_type == 'identity':
-            self.p_bijector[pid] = tfp.bijector.Identity()        
+            self.p_bijector[pid] = tfb.Identity()        
         elif bijector_type == 'softplus':
             # Don't let anything be negative
-            self.p_bijector[pid] = tfp.bijectors.Softplus()
+            self.p_bijector[pid] = tfb.Softplus()
         elif bijector_type == 'sigmoid':
-            self.p_bijector[pid] = tfp.bijectors.Sigmoid(
+            self.p_bijector[pid] = tfb.Sigmoid(
                 low=kwargs.get('low'), high=kwargs.get('high')
             )
         else:
@@ -147,7 +173,7 @@ class BPRF(object):
         '''        
         # Ok lets map everything so we can fix some parameters
         # Are there any parameters to fix? 
-        if len(self.fixed_pars) != 0:
+        if (len(self.fixed_pars) != 0):
             # Build the indices and update values lists.
             indices_list = []
             updates_list = []
@@ -176,8 +202,7 @@ class BPRF(object):
             # Also ensure that priors & bijectors are correct
             for p in self.fixed_pars.keys():
                 self.p_prior_type[p] = 'none'
-                self.p_bijector[p] = tfp.bijectors.Identity()
-                self.p_bijector_bw[p] = tfp.bijectors.Identity()
+                self.p_bijector[p] = tfb.Identity()
             
         else:
             self.fix_update_fn = FixUdateFn().update_fn             
@@ -217,7 +242,6 @@ class BPRF(object):
         Experimental - can we fit everything at once?
         Does that even make sense?
         '''
-        sampler_fn_id = kwargs.pop('sampler_fn', 'NUTS')
         if idx is None: # all of them?
             idx = range(self.n_voxels)
         elif isinstance(idx, int):
@@ -226,17 +250,15 @@ class BPRF(object):
         vx_bool[idx] = True
         self.n_vx_to_fit = len(idx)
         self.fixed_pars = fixed_pars
-        # if not isinstance(self.fixed_pars, pd.DataFrame):
-        #     self.fixed_pars = pd.DataFrame(self.fixed_pars).astype('float32')
+        if not isinstance(self.fixed_pars, pd.DataFrame):
+            self.fixed_pars = pd.DataFrame.from_dict(self.fixed_pars, orient='index').T.astype('float32')        
         self.prep_for_fitting(**kwargs)
         step_size = kwargs.pop('step_size', 1) # rest of the kwargs go to "hmc_sample"                
         paradigm = kwargs.pop('paradigm', self.paradigm)
         
         y = self.data.values
-        init_pars = self.model._get_parameters(init_pars)
-        # Use the bprf bijectors (not the model ones...)
-        init_pars = init_pars.values.astype(np.float32) # ???
-        # bloop
+        init_pars = format_parameters(init_pars)
+        init_pars = init_pars.values.astype(np.float32) 
 
         # Clean the paradigm 
         paradigm_ = self.model.stimulus._clean_paradigm(paradigm)        
@@ -252,26 +274,23 @@ class BPRF(object):
                 p_out += self.p_prior[p].prior(parameters[:,self.model_labels[p]])
             return p_out       
 
-        # Calculating the likelihood, based on the assumption that 
-        # the residuals are all normally distributed...
-        # simple - but I think it works; and has been applied in this context before (see Invernizzi et al)
-        normal_dist = tfp.distributions.Normal(loc=0.0, scale=1)
+        # Calculating the likelihood
+        # First lets make the function which returns the likelihood of the residuals
+        # -> based on our 'noise_method'
+        residual_ln_likelihood_fn = self._create_residual_ln_likelihood_fn()
+        # normal_dist = tfd.Normal(loc=0.0, scale=1.0)
         @tf.function
         def log_posterior_fn(parameters):
             parameters = self.fix_update_fn(parameters)
             predictions = self.model._predict(
-                paradigm_[tf.newaxis, ...], parameters[tf.newaxis, ...], None)            
-            residuals = y[:, vx_bool] - predictions[0]
+                paradigm_[tf.newaxis, ...], parameters[tf.newaxis, :self.n_model_params], None)     # Only include those parameters that are fed to the model
+            residuals = y[:, vx_bool] - predictions[0]                        
             
-            
-            # ** [1] Just use N(0,1)
-            # log_likelihood = tf.reduce_sum(normal_dist.log_prob(residuals), axis=0)
-
-            # ** [2] Use N(0, std)         
-            residuals_std  = tf.math.reduce_std(residuals, axis=0)
             # -> rescale based on std...
-            log_likelihood = normal_dist.log_prob(residuals/residuals_std) - tf.math.log(residuals_std)
-            log_likelihood = tf.reduce_sum(log_likelihood, axis=0)
+            # residuals_std  = tf.math.reduce_std(residuals, axis=0)
+            # log_likelihood = normal_dist.log_prob(residuals/residuals_std) - tf.math.log(residuals_std)
+            # log_likelihood = tf.reduce_sum(log_likelihood, axis=0)            # -> rescale based on std...
+            log_likelihood = residual_ln_likelihood_fn(parameters, residuals)
             log_prior = log_prior_fn(parameters)            
             # Return vector of length idx (optimize each chain separately)
             return log_likelihood + log_prior
@@ -298,17 +317,9 @@ class BPRF(object):
         # CALLING GILLES' "sample_hmc" from .utils.mcmc
         # quick test - does it work?
         initial_ll = target_log_prob_fn(*initial_state)
-        print(f'initial_ll={initial_ll}')
-        
-        if sampler_fn_id == 'NUTS':
-            sampler_fn = bprf_sample_NUTS
-        elif sampler_fn_id == 'hmc':
-            sampler_fn = bprf_sample_hmc
-            
-
-
-        print(f"Starting {sampler_fn_id} sampling...")
-        samples, stats = sampler_fn(
+        print(f'initial_ll={initial_ll}')            
+        print(f"Starting NUTS sampling...")
+        samples, stats = bprf_sample_NUTS(
             init_state = initial_state, 
             target_log_prob_fn=target_log_prob_fn, 
             unconstraining_bijectors=self.p_bijector_list, 
@@ -317,7 +328,7 @@ class BPRF(object):
             step_size=step_size, 
             **kwargs
             )                
-                            
+        print('Finished NUTS sampling...')
         # stuff to save...        
         all_samples = tf.stack(samples, axis=-1).numpy()
         # nsteps, n_voxels, n_params
@@ -327,15 +338,48 @@ class BPRF(object):
             for i,p in enumerate(self.model_labels):
                 estimated_p_dict[p] = all_samples[:,ivx_loc,i]
             for p,v in self.fixed_pars.items():
-                estimated_p_dict[p] = v
+                estimated_p_dict[p] = estimated_p_dict[p]*0 + v.values
             self.mcmc_sampler[ivx_fit] = pd.DataFrame(estimated_p_dict)
         self.mcmc_stats = stats            
 
-    def ln_posterior(self, params, response):
-        prior = self.ln_prior(params)
-        like = self.ln_likelihood(params, response)
-        return prior + like # save both...
-
+    def _create_residual_ln_likelihood_fn(self):
+        # Calculating the likelihood
+        if self.noise_method == 'fit_tdist':
+            @tf.function
+            def residual_ln_likelihood_fn(parameters, residuals):                    
+                resid_ln_likelihood = calculate_log_prob_t(
+                    data=residuals, scale=parameters[:,self.model_labels['noise_scale']], dof=parameters[:,self.model_labels['noise_dof']]
+                )
+                resid_ln_likelihood = tf.reduce_sum(resid_ln_likelihood, axis=0)       
+                # Return vector of length idx (optimize each chain separately)
+                return resid_ln_likelihood
+        elif self.noise_method == 'fit_norm':
+            # Assume residuals are normally distributed (loc=0.0)
+            # Add the scale as an extra parameters to be fit             
+            @tf.function
+            def residual_ln_likelihood_fn(parameters, residuals):                    
+                # -> rescale based on std...
+                resid_ln_likelihood = calculate_log_prob_gauss(
+                    data=residuals, scale=parameters[:,self.model_labels['noise_scale']],
+                )
+                resid_ln_likelihood = tf.reduce_sum(resid_ln_likelihood, axis=0)       
+                return resid_ln_likelihood              
+        
+        else: 
+            # Do not fit the noise - assume it is normally distributed
+            # -> calculate scale based on the standard deviation of the residuals 
+            @tf.function
+            def residual_ln_likelihood_fn(parameters, residuals):                    
+                # [1] Use N(0, std)         
+                residuals_std  = tf.math.reduce_std(residuals, axis=0)
+                # -> rescale based on std...
+                resid_ln_likelihood = calculate_log_prob_gauss(
+                    data=residuals, scale=residuals_std,
+                )
+                resid_ln_likelihood = tf.reduce_sum(resid_ln_likelihood, axis=0)       
+                return resid_ln_likelihood     
+        
+        return residual_ln_likelihood_fn
 
     def get_predictions(self, parameters=None):
 
@@ -398,7 +442,7 @@ class FixUdateFn():
         if self.fix_update_index is None:
             return parameters
         else:
-            tf.tensor_scatter_nd_update(parameters, self.fix_update_index, self.fix_update_value)             
+            return tf.tensor_scatter_nd_update(parameters, self.fix_update_index, self.fix_update_value)             
 
 # *** PRIORS ***
 class PriorBase():
@@ -417,17 +461,17 @@ class PriorNorm(PriorBase):
         self.distribution = tfp.distributions.Normal(loc=self.loc, scale=self.scale)
 
 class PriorUniform(PriorBase):
-    def __init__(self, vmin, vmax):
+    def __init__(self, low, high):
         self.prior_type = 'uniform'
-        self.vmin = vmin
-        self.vmax = vmax
-        self.distribution = tfp.distributions.Uniform(low=self.vmin, high=self.vmax)
+        self.low = low
+        self.high = high
+        self.distribution = tfp.distributions.Uniform(low=self.low, high=self.high)
 
 class PriorNone(PriorBase):
     def __init__(self):
         self.prior_type = 'none'
     def prior(self, param):
-        return tf.zeros_like(param)
+        return tf.zeros_like(param)        
 
 class PriorFixed(PriorBase):
     def __init__(self, fixed_val):
@@ -437,6 +481,11 @@ class PriorFixed(PriorBase):
         return tf.zeros_like(param)
     def sampler(self, n):
         return tf.fill([n], self.fixed_val)
+
+class PriorGeneral(PriorBase):
+    def __init__(self, prior_type, distribution):
+        self.prior_type = prior_type
+        self.distribution = distribution
 
 # *** SAMPLER ***
 from timeit import default_timer as timer
