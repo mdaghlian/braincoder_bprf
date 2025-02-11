@@ -66,3 +66,35 @@ def von_mises_pdf(x, mu, kappa):
     pdf = tf.exp(kappa * tf.cos(x - mu)) / (TWO_PI * tf.math.bessel_i0(kappa))
 
     return pdf
+
+@tf.function
+def calculate_log_prob_gauss(data, scale):
+    '''calculate_log_prob_gauss (assume loc=0.0)
+
+    Faster than remaking a tfd.Normal over and over again...
+    data    shape n x m
+    scale   shape n x 1
+    '''    
+    # scale = tf.maximum(scale, 1e-10)  # Avoid division by zero
+    # To have mu; do data-mu
+    log_pdf = -0.5 * (tf.math.log(2 * np.pi) + tf.math.log(scale**2) + (data / scale)**2)
+    return log_pdf
+
+def calculate_log_prob_t(data, scale, dof):
+    '''calculate_log_prob_t (assume loc=0.0)
+
+    Faster than remaking a tfd.StudentT over and over again...
+    data    shape n x m
+    scale   shape n x 1
+    dof     shape n x 1    
+    '''
+    # scale = tf.maximum(scale, 1e-8)
+    # dof = tf.maximum(dof, 1e-8)
+    log_pdf = (
+        tf.math.lgamma((dof + 1) / 2)
+        - tf.math.lgamma(dof / 2)
+        - 0.5 * tf.math.log(dof * np.pi)
+        - tf.math.log(scale)
+        - (dof + 1) / 2 * tf.math.log(1 + (data / scale) ** 2 / dof)
+    )
+    return log_pdf
