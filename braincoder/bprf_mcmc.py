@@ -243,7 +243,7 @@ class BPRF(object):
         Does that even make sense?
         '''
         if idx is None: # all of them?
-            idx = range(self.n_voxels)
+            idx = np.arange(self.n_voxels).tolist()
         elif isinstance(idx, int):
             idx = [idx]
         vx_bool = np.zeros(self.n_voxels, dtype=bool)
@@ -253,7 +253,7 @@ class BPRF(object):
         if not isinstance(self.fixed_pars, pd.DataFrame):
             self.fixed_pars = pd.DataFrame.from_dict(self.fixed_pars, orient='index').T.astype('float32')        
         self.prep_for_fitting(**kwargs)
-        step_size = kwargs.pop('step_size', 1) # rest of the kwargs go to "hmc_sample"                
+        step_size = kwargs.pop('step_size', 0.0001) # rest of the kwargs go to "hmc_sample"                
         paradigm = kwargs.pop('paradigm', self.paradigm)
         
         y = self.data.values
@@ -282,8 +282,9 @@ class BPRF(object):
         @tf.function
         def log_posterior_fn(parameters):
             parameters = self.fix_update_fn(parameters)
+            par4pred = parameters[:,:self.n_model_params] # chop out any hyper / noise parameters
             predictions = self.model._predict(
-                paradigm_[tf.newaxis, ...], parameters[tf.newaxis, :self.n_model_params], None)     # Only include those parameters that are fed to the model
+                paradigm_[tf.newaxis, ...], par4pred[tf.newaxis, ...], None)     # Only include those parameters that are fed to the model
             residuals = y[:, vx_bool] - predictions[0]                        
             
             # -> rescale based on std...
