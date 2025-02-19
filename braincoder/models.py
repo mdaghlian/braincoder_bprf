@@ -10,7 +10,7 @@ from tensorflow.math import softplus, sigmoid
 import pandas as pd
 import scipy.stats as ss
 from .stimuli import Stimulus, OneDimensionalRadialStimulus, OneDimensionalGaussianStimulus, OneDimensionalStimulusWithAmplitude, OneDimensionalRadialStimulusWithAmplitude, ImageStimulus, TwoDimensionalStimulus
-from patsy import dmatrix
+from patsy import dmatrix, build_design_matrices
 
 class EncodingModel(object):
 
@@ -121,9 +121,7 @@ class EncodingModel(object):
                                  stddev=noise,
                                  dtype=tf.float32)
 
-        paradigm_ = self._get_paradigm(paradigm)
-
-        return self._predict(paradigm_, parameters, weights) + noise
+        return self._predict(paradigm, parameters, weights) + noise
 
     def _gradient(self, stimuli, parameters):
         stimuli = tf.convert_to_tensor(stimuli)
@@ -460,8 +458,6 @@ class EncodingModel(object):
             else:
                 raise ValueError('Please provide paradigm!')
 
-        paradigm = self.stimulus.clean_paradigm(paradigm)
-
         return paradigm
 
     def _get_paradigm(self, paradigm):
@@ -477,7 +473,9 @@ class EncodingModel(object):
 class EncodingRegressionModel(EncodingModel):
 
     def __init__(self, paradigm=None, data=None, parameters=None,
-                regressors={}, weights=None, omega=None, verbosity=logging.INFO, **kwargs):
+                regressors={}, weights=None, omega=None,
+                baseline_parameter_values=None,
+                 verbosity=logging.INFO, **kwargs):
 
         self.regressors = regressors
 
@@ -491,16 +489,27 @@ class EncodingRegressionModel(EncodingModel):
 
             base_paradigm = paradigm[self.stimulus.dimension_labels]
 
+        else:
+            raise ValueError('Please provide paradigm!')
+
+        self.base_parameter_labels = self.parameter_labels
+        self.set_paradigm(paradigm, regressors)
+
         super().__init__(paradigm=base_paradigm, data=data, parameters=parameters,
                          weights=weights, omega=omega, verbosity=logging.INFO, **kwargs)
         
-        self.base_parameter_labels = self.parameter_labels
-        self.paradigm = paradigm
-        self.set_paradigm(paradigm, regressors)
+
+        # If baseline_parameter_values is not provided, use empty dictionary
+        baseline_parameter_values = baseline_parameter_values or {}
+
+        # If parameter is not in baseline_parameter_values, set it to 0
+        self.baseline_parameter_values = {
+            param: baseline_parameter_values.get(param, 0.0)
+            for param in self.base_parameter_labels
+        }
 
         self._basis_basis_predictions = self._basis_predictions
         self._basis_predictions = self._basis_predictions_regressors
-
 
         self._base_transform_parameters_forward = self._transform_parameters_forward
         self._base_transform_parameters_backward = self._transform_parameters_backward
@@ -508,19 +517,6 @@ class EncodingRegressionModel(EncodingModel):
         self._transform_parameters_forward = lambda x: x
         self._transform_parameters_backward = lambda x: x
 
-
-    def build_design_matrices(self, paradigm, regressors):
-
-        design_matrices = {}
-        parameter_names = []
-
-        for parameter in self.base_parameter_labels:
-            if parameter in self.regressors:
-                design_matrices[parameter] = dmatrix(self.regressors[parameter], paradigm)
-            else:
-                design_matrices[parameter] = dmatrix('1', paradigm)
-
-        return design_matrices
 
     def _get_regressor_parameter_labels(self, design_matrices):
         regressor_parameters = []
@@ -541,7 +537,7 @@ class EncodingRegressionModel(EncodingModel):
             end_ix = ix + design_matrices[parameter].shape[1]
 
             parameters.append(tf.reduce_sum(np.asarray(design_matrices[parameter], dtype=np.float32)[:, np.newaxis, :] * \
-                                      regressor_parameters[:, :, ix:end_ix], axis=2))
+                                      regressor_parameters[:, :, ix:end_ix], axis=2) + self.baseline_parameter_values[parameter])
 
             ix = end_ix
 
@@ -550,20 +546,48 @@ class EncodingRegressionModel(EncodingModel):
 
         return parameters
 
+    def build_design_matrices(self, paradigm, regressors=None):
+
+        design_matrices = {}
+
+        if not hasattr(self, 'design_matrices'):
+            for parameter in self.base_parameter_labels:
+                if parameter in regressors:
+                    design_matrices[parameter] = dmatrix(self.regressors[parameter], paradigm)
+                else:
+                    design_matrices[parameter] = dmatrix('1', paradigm)
+        else:
+            assert regressors is None, 'Regressors should be set when the model is initialized.'
+
+            for parameter in self.base_parameter_labels:
+                design_info = self.design_matrices[parameter].design_info
+                design_matrices[parameter] = build_design_matrices([design_info], paradigm)[0]
+
+        return design_matrices
+
+
     def set_paradigm(self, paradigm, regressors=None):
 
-        if regressors is None:
-            regressors = {}
+        if not hasattr(self, 'paradigm'):
 
-        self.paradigm = paradigm
+            if regressors is None:
+                regressors = {}
 
-        self.design_matrices = self.build_design_matrices(paradigm, self.regressors)
-        self.parameter_labels = self._get_regressor_parameter_labels(self.design_matrices)
+            if regressors is None:
+                raise Exception('For EncodignRegressionModel, the regressors should be set when the model is initialized.')
+                # regressors = self.regressors
 
-        for paradigm_label in self.stimulus.dimension_labels:
-            if paradigm_label not in paradigm:
-                raise ValueError('Paradigm is missing required dimension: ' + paradigm_label + \
-                                  '\nNote that `EncodingRegressionModel` requires a paradigm named stimulus dimensions!')
+            self.paradigm = paradigm
+
+            self.design_matrices = self.build_design_matrices(paradigm, regressors)
+            self.parameter_labels = self._get_regressor_parameter_labels(self.design_matrices)
+
+        else:
+            if regressors is not None:
+                raise Exception('For EncodingRegressionModel, the regressors should be set when the model is initialized.')
+
+            self.design_matrices = self.build_design_matrices(paradigm)
+            self.paradigm = paradigm
 
         self.base_paradigm = paradigm[self.stimulus.dimension_labels]
 
@@ -572,29 +596,35 @@ class EncodingRegressionModel(EncodingModel):
         result = self._basis_basis_predictions(self.base_paradigm.values[:, np.newaxis, :], base_parameters)
         return tf.reshape(result, [1, result.shape[0], -1])
 
-    def get_paradigm(self, paradigm):
+    def _get_paradigm(self, paradigm):
+
+        # if not paradigm.equals(self.paradigm):
+        #     raise Exception('For EncodignRegressionModel, the paradigm should be set when the model is initialized OR using set_paradigm().')
+
+        paradigm = self.stimulus._clean_paradigm(paradigm)
+
         return paradigm
 
-def get_transformed_parameters(self, paradigm, parameters):
-    design_matrices = self.build_design_matrices(paradigm, self.regressors)
+    def get_conditionspecific_parameters(self, conditions, parameters):
 
+        design_matrices = self.build_design_matrices(conditions)
 
-    if hasattr(parameters, 'values'):
-        parameters_ = parameters.values
-    else:
-        parameters_ = np.array(parameters)
+        if hasattr(parameters, 'values'):
+            parameters_ = parameters.values
+        else:
+            parameters_ = np.array(parameters)
 
-    parameters_ = parameters_[np.newaxis, ...]
+        parameters_ = parameters_[np.newaxis, ...]
 
-    transformed_parameters = self._get_base_parameters(design_matrices, parameters_).numpy()
+        transformed_parameters = self._get_base_parameters(design_matrices, parameters_).numpy()
 
-    transformed_parameters = np.reshape(transformed_parameters, (-1, transformed_parameters.shape[-1]))
+        transformed_parameters = np.reshape(transformed_parameters, (-1, transformed_parameters.shape[-1]))
 
-    transformed_parameters = pd.DataFrame(transformed_parameters,
-                                          index=pd.MultiIndex.from_product([paradigm.index, parameters.index]),
-                                          columns=self.base_parameter_labels)
+        transformed_parameters = pd.DataFrame(transformed_parameters,
+                                            index=pd.MultiIndex.from_product([conditions.index, parameters.index]),
+                                            columns=self.base_parameter_labels)
 
-    return transformed_parameters
+        return transformed_parameters
 
 
 
@@ -1721,7 +1751,6 @@ class DifferenceOfGaussiansPRF2D(GaussianPRF2D):
         standard_prf = super()._get_rf(grid_coordinates, parameters)
 
         srf_pars = tf.concat([mu_x, mu_y, sd*srf_size, tf.zeros_like(mu_x), srf_amplitude*amplitude*srf_size], axis=2)
-        print(parameters.shape, srf_pars.shape)
         sprf = super()._get_rf(grid_coordinates, srf_pars)
 
         return standard_prf - sprf
@@ -1810,21 +1839,23 @@ class DivisiveNormalizationGaussianPRF2D(GaussianPRF2D):
         mu_x = parameters[:, :, 0, tf.newaxis]
         mu_y = parameters[:, :, 1, tf.newaxis]
         sd = parameters[:, :, 2, tf.newaxis]
-        rf_amplitude = parameters[:, :, 3, tf.newaxis]
         rf_parameters = tf.concat([mu_x, mu_y, sd, tf.zeros_like(mu_x), tf.ones_like(mu_x)], axis=2)
         rf = self._get_rf(self.grid_coordinates, rf_parameters)
 
-        srf_amplitude = parameters[:, :, 4, tf.newaxis]
         srf_size = parameters[:, :, 5, tf.newaxis]
 
         srf_parameters = tf.concat([mu_x, mu_y, sd*srf_size, tf.zeros_like(mu_x), tf.ones_like(mu_x)], axis=2)
 
         srf = self._get_rf(self.grid_coordinates, srf_parameters)
 
-        neural_baseline = parameters[tf.newaxis, :, :, 6]
-        surround_baseline = parameters[tf.newaxis, :, :, 7]
 
-        # [1,150,2365], [1,2365,1]
+        # From n_batches x n_voxels to 
+        # n_batches x n_timespoints x n_populations
+        rf_amplitude = parameters[:, :, 3][:, tf.newaxis, :] 
+        srf_amplitude = parameters[:, :, 4][:, tf.newaxis, :] 
+        neural_baseline = parameters[:, :, 6][:, tf.newaxis, :] 
+        surround_baseline = parameters[:, :, 7][:, tf.newaxis, :] 
+
         neural_activation = rf_amplitude * tf.tensordot(paradigm, rf, (2, 2))[:, :, 0, :] + neural_baseline
         normalization = (srf_amplitude * rf_amplitude) * tf.tensordot(paradigm, srf, (2, 2))[:, :, 0, :] + surround_baseline
 
@@ -1860,7 +1891,9 @@ class DivisiveNormalizationGaussianPRF2DWithHRF(HRFEncodingModel, DivisiveNormal
 
             return tf.concat([encoding_pars, bold_baseline, hrf_pars], axis=1)
         else:
-            return DivisiveNormalizationGaussianPRF2D._transform_parameters_forward(self, parameters)
+            encoding_pars1 = DivisiveNormalizationGaussianPRF2D._transform_parameters_forward(self, parameters[:, :-1])
+            bold_baseline = parameters[:, -1:]
+            return tf.concat([encoding_pars1, bold_baseline], axis=1)
 
     @tf.function
     def _transform_parameters_backward(self, parameters):
@@ -1871,16 +1904,20 @@ class DivisiveNormalizationGaussianPRF2DWithHRF(HRFEncodingModel, DivisiveNormal
             encoding_pars = DivisiveNormalizationGaussianPRF2D._transform_parameters_backward(self, parameters[:, :-n_hrf_pars-1])
             bold_baseline = parameters[:, -n_hrf_pars-1][:, tf.newaxis]
             hrf_pars = self.hrf_model._transform_parameters_backward(parameters[:, -n_hrf_pars:])
-            
             return tf.concat([encoding_pars, bold_baseline, hrf_pars], axis=1)
+
         else:
-            return DivisiveNormalizationGaussianPRF2D._transform_parameters_backward(self, parameters)
+            encoding_pars1 =  DivisiveNormalizationGaussianPRF2D._transform_parameters_backward(self, parameters[:, :-1])
+            bold_baseline = parameters[:, -1:]
+            return tf.concat([encoding_pars1, bold_baseline], axis=1)
 
 
     @tf.function
     def _predict(self, paradigm, parameters, weights):
 
-        pre_convolve = DivisiveNormalizationGaussianPRF2D._predict(self, paradigm, parameters, weights)
+        
+        pre_convolve_parameters = parameters[..., :8]
+        pre_convolve = DivisiveNormalizationGaussianPRF2D._predict(self, paradigm, pre_convolve_parameters, weights)
 
         neural_baseline = parameters[tf.newaxis, :, :, 6]
         surround_baseline = parameters[tf.newaxis, :, :, 7]
