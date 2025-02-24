@@ -2085,7 +2085,7 @@ class ContrastSensitivity(EncodingModel):
         if omega is not None:
             self.omega_chol = np.linalg.cholesky(omega)
 
-    def get_csf_for_plot(self, SF_grid, CON_grid, parameters=None):
+    def get_csf_for_plot(self, SF_grid, CON_grid=np.array([1,1]), parameters=None):
         ''' Get the csf for a grid of SF and CON values '''
         if len(SF_grid.shape) == 1:
             SF_grid, CON_grid = np.meshgrid(SF_grid, CON_grid)

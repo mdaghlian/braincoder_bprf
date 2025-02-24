@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from .utils import format_data, format_paradigm, get_rsq, calculate_log_prob_t, calculate_log_prob_gauss, format_parameters
+from .utils import format_data, format_paradigm, get_rsq, calculate_log_prob_t, calculate_log_prob_gauss_loc0, format_parameters
 import tensorflow as tf
 import tensorflow_probability as tfp
 from tensorflow_probability import distributions as tfd
@@ -57,11 +57,6 @@ class BPRF(object):
         elif self.noise_method=='fit_normal':
             self.add_bijector(pid='noise_scale', bijector_type=tfb.Exp())
             self.add_prior(pid='noise_scale', prior_type='HalfNormal', distribution=tfd.HalfNormal(scale=1.0))                        
-
-        # # Hiearchical prior
-        # self.hier_prior = {p:PriorNone() for p in self.model_labels}                                        
-        # self.hier_prior_type = {p:'none' for p in self.model_labels}
-        
         # Per voxel (row in data) - save the output of the MCMC sampler 
         self.mcmc_sampler = [None] * self.data.shape[1]
         self.mcmc_stats = [None] * self.data.shape[1]
@@ -116,23 +111,7 @@ class BPRF(object):
                     prior_type = 'fixed',
                     fixed_val = bounds[p][0],
                     )    
-                
-    # def add_hierarchical_prior(self, pid, prior_type, h_prior_type='normal', **kwargs):
-    #     ''' Add a hiearchical prior...
-    #     i.e., fit the prior across all vertices
-
-    #     Say we look at parameter 'x' 
-    #     we could make the prior for 'x' be N(0,5); i.e., a normal distribution with loc=0, scale=5
-    #     OR -> we can make a hyper prior: and try to fit the loc and scale...
-    #     '''
-    #     # [1] make sure the 'p_prior' is none, because we are doing hierarchical priors now! 
-    #     self.p_prior[pid] = PriorNone
-    #     self.p_prior_type[pid] = 'none'
-
-    #     # [2] add the h_priors to the model_labels
-    #     current_n_params = self.n_params
-    #     self.model_labels[f'{pid}_loc'] = 
-
+            
     
     def sample_from_priors(self, n):
         samples = []
@@ -195,7 +174,7 @@ class BPRF(object):
                 updates_list.append(param_updates)
             # Concatenate all the indices and updates from each parameter fix.
             self.fix_update_index = tf.concat(indices_list, axis=0)  # shape: [num_updates, 2]
-            self.fix_update_value = tf.concat(updates_list, axis=0)    # shape: [num_updates]
+            self.fix_update_value = tf.concat(updates_list, axis=0)    # shape: [num_updates]            
             # Define the update function
             self.fix_update_fn = FixUdateFn(self.fix_update_index, self.fix_update_value).update_fn             
 
@@ -253,6 +232,7 @@ class BPRF(object):
         if not isinstance(self.fixed_pars, pd.DataFrame):
             self.fixed_pars = pd.DataFrame.from_dict(self.fixed_pars, orient='index').T.astype('float32')        
         self.prep_for_fitting(**kwargs)
+        self.n_params = len(self.model_labels)
         step_size = kwargs.pop('step_size', 0.0001) # rest of the kwargs go to "hmc_sample"                
         paradigm = kwargs.pop('paradigm', self.paradigm)
         
@@ -267,7 +247,7 @@ class BPRF(object):
         @tf.function
         def log_prior_fn(parameters):
             # Log-prior function for the model
-            p_out = 0.0            
+            p_out = tf.zeros(parameters.shape[0])  
             if self.priors_to_loop==[]:
                 return p_out
             for p in self.priors_to_loop:
@@ -292,9 +272,10 @@ class BPRF(object):
             # log_likelihood = normal_dist.log_prob(residuals/residuals_std) - tf.math.log(residuals_std)
             # log_likelihood = tf.reduce_sum(log_likelihood, axis=0)            # -> rescale based on std...
             log_likelihood = residual_ln_likelihood_fn(parameters, residuals)
-            log_prior = log_prior_fn(parameters)            
+            log_prior = log_prior_fn(parameters) 
+            print(f'log prior={log_prior}')           
             # Return vector of length idx (optimize each chain separately)
-            return log_likelihood + log_prior
+            return log_prior + log_likelihood
         
         # -> make sure we are in the correct dtype 
         initial_state = [tf.convert_to_tensor(init_pars[vx_bool,i], dtype=tf.float32) for i in range(self.n_params)]                          
@@ -306,7 +287,7 @@ class BPRF(object):
         print('Lets run some checks with everything...')
         # Check the gradient with respect to each parameter
         log_prob = target_log_prob_fn(*initial_state)
-        print(log_prob)
+        print(f'log prob {log_prob}')
         with tf.GradientTape() as tape:
             tape.watch(initial_state)
             log_prob = target_log_prob_fn(*initial_state)
@@ -360,13 +341,13 @@ class BPRF(object):
             @tf.function
             def residual_ln_likelihood_fn(parameters, residuals):                    
                 # -> rescale based on std...
-                resid_ln_likelihood = calculate_log_prob_gauss(
+                resid_ln_likelihood = calculate_log_prob_gauss_loc0(
                     data=residuals, scale=parameters[:,self.model_labels['noise_scale']],
                 )
                 resid_ln_likelihood = tf.reduce_sum(resid_ln_likelihood, axis=0)       
                 return resid_ln_likelihood              
         
-        else: 
+        elif self.noise_method == 'none': 
             # Do not fit the noise - assume it is normally distributed
             # -> calculate scale based on the standard deviation of the residuals 
             @tf.function
@@ -374,7 +355,7 @@ class BPRF(object):
                 # [1] Use N(0, std)         
                 residuals_std  = tf.math.reduce_std(residuals, axis=0)
                 # -> rescale based on std...
-                resid_ln_likelihood = calculate_log_prob_gauss(
+                resid_ln_likelihood = calculate_log_prob_gauss_loc0(
                     data=residuals, scale=residuals_std,
                 )
                 resid_ln_likelihood = tf.reduce_sum(resid_ln_likelihood, axis=0)       

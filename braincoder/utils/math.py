@@ -73,8 +73,8 @@ alpha = 100
 aggressive_softplus = lambda x: (1./alpha) * tf.math.softplus(alpha*x)
 aggressive_softplus_inverse = lambda y: (1./alpha) * tfp.math.softplus_inverse(alpha * y)
 @tf.function
-def calculate_log_prob_gauss(data, scale):
-    '''calculate_log_prob_gauss (assume loc=0.0)
+def calculate_log_prob_gauss_loc0(data, scale):
+    '''calculate_log_prob_gauss_loc0 (assume loc=0.0)
 
     Faster than remaking a tfd.Normal over and over again...
     data    shape n x m
@@ -84,6 +84,21 @@ def calculate_log_prob_gauss(data, scale):
     # To have mu; do data-mu
     log_pdf = -0.5 * (tf.math.log(2 * np.pi) + tf.math.log(scale**2) + (data / scale)**2)
     return log_pdf
+
+@tf.function
+def calculate_log_prob_gauss(data, loc, scale):
+    '''calculate_log_prob_gauss
+
+    data    shape n x m
+    loc    shape n x 1  
+    scale   shape n x 1
+
+    '''    
+    # scale = tf.maximum(scale, 1e-10)  # Avoid division by zero
+    # To have mu; do data-mu
+    log_pdf = -0.5 * (tf.math.log(2 * np.pi) + tf.math.log(scale**2) + ((data - loc) / scale)**2)
+    return log_pdf
+
 
 def calculate_log_prob_t(data, scale, dof):
     '''calculate_log_prob_t (assume loc=0.0)
