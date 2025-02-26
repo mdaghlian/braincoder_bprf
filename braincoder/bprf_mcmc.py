@@ -234,6 +234,7 @@ class BPRF(object):
         self.prep_for_fitting(**kwargs)
         self.n_params = len(self.model_labels)
         step_size = kwargs.pop('step_size', 0.0001) # rest of the kwargs go to "hmc_sample"                
+        step_size = [tf.constant(step_size, np.float32) for _ in range(self.n_params)]
         paradigm = kwargs.pop('paradigm', self.paradigm)
         
         y = self.data.values
