@@ -30,6 +30,7 @@ class BPRF_hier(BPRF):
         self.h_labels = {} # What are the labels for the hierarchical parameters? & their idx
         self.h_bijector = {} # What bijector to apply to the hierarchical parameters
         self.h_prior_type = {} # Meta prior
+        self.h_gp_function = {} # Using gaussian process?
         self.h_prior = {}
         self.h_mcmc_sampler = {}
 
@@ -61,7 +62,26 @@ class BPRF_hier(BPRF):
             # ... none for now...
             self.h_add_prior(pid=f'{pid}_loc', prior_type='none', **kwargs)
             self.h_add_prior(pid=f'{pid}_scale', prior_type='none', **kwargs)
+        elif h_prior_to_apply=='gp_weight':
+            # Gaussian process with weights
+            # -> Gaussian process generates a covariance matrix
+            # -> use this to define the 
+            self.h_labels[f'{pid}_gp_lengthscale'] = len(self.h_labels) 
+            self.h_labels[f'{pid}_gp_variance'] = len(self.h_labels)
+            self.h_gp_function = GPWeight(
+                weights=kwargs.pop('weights'),
+                kernel=kwargs.pop('kernel', 'RBF'),
+            )
+            self.h_add_bijector(pid=f'{pid}_gp_lengthscale', bijector_type=tfb.Exp())
+            self.h_add_bijector(pid=f'{pid}_gp_variance', bijector_type=tfb.Exp())
 
+            # [3] add the priors for the new parameters
+            # ... none for now...
+            self.h_add_prior(
+                pid=f'{pid}_gp_lengthscale', 
+                prior_type='none', 
+                **kwargs)
+            self.h_add_prior(pid=f'{pid}_gp_variance', prior_type='none', **kwargs)
     
     def h_add_bijector(self, pid, bijector_type, **kwargs):
         ''' add transformations to parameters so that they are fit smoothly        
@@ -199,6 +219,8 @@ class BPRF_hier(BPRF):
         self.h_labels_inv = {v:k for k,v in self.h_labels.items()}
 
         step_size = kwargs.pop('step_size', 0.0001) # rest of the kwargs go to "hmc_sample"                
+        self.total_n_params = self.n_params + self.h_n_params
+        step_size = [tf.constant(step_size, np.float32) for _ in range(self.total_n_params)]
         paradigm = kwargs.pop('paradigm', self.paradigm)
         
         y = self.data.values
@@ -226,6 +248,21 @@ class BPRF_hier(BPRF):
                     p_out = tf.reduce_sum(calculate_log_prob_gauss(
                         data=p_for_prior, loc=loc_for_prior, scale=scale_for_prior
                     ))
+                elif self.h_prior_to_apply=='gp_weight':
+                    param_values = parameters[:, self.model_labels[h]] # Values of parameter 'h' for vertices being fit
+                    gp_lengthscale = h_parameters[:, self.h_labels[f'{h}_gp_lengthscale']] # Current value of GP lengthscale hyperparameter
+                    gp_variance = h_parameters[:, self.h_labels[f'{h}_gp_variance']] # Current value of GP variance hyperparameter
+                    sigma = self.h_gp_function.return_sigma(
+                        gp_lengthscale=gp_lengthscale, gp_variance=gp_variance                        
+                    )
+
+                    gp_prior_dist = tfd.MultivariateNormalFullCovariance(
+                        loc=tf.zeros(self.n_vx_to_fit, dtype=tf.float32),
+                        covariance_matrix=sigma + tf.eye(self.n_vx_to_fit, dtype=tf.float32) * 1e-6 # Add small diagonal for numerical stability
+                    )
+
+                    p_out += gp_prior_dist.log_prob(param_values) # Log-prior contribution for this parameter
+
                     
             for h in self.h_priors_to_loop:
                 p_out += tf.reduce_sum(self.h_prior[h].prior(h_parameters[:,self.h_labels[h]]))
@@ -326,7 +363,7 @@ class BPRF_hier(BPRF):
                 resid_ln_likelihood = tf.reduce_sum(resid_ln_likelihood, axis=0)       
                 return resid_ln_likelihood              
         
-        elif self.noise_method == 'none': 
+        else: # self.noise_method == 'none': 
             # Do not fit the noise - assume it is normally distributed
             # -> calculate scale based on the standard deviation of the residuals 
             @tf.function
@@ -341,3 +378,34 @@ class BPRF_hier(BPRF):
                 return resid_ln_likelihood     
         
         return residual_ln_likelihood_fn
+    
+
+
+
+class GPWeight():
+    def __init__(self, dmatrix, kernel):
+        # dmatrix = n x n matrix of distances (i.e., cortical distance)
+        self.dmatrix = dmatrix
+        self.kernel = kernel
+    
+    @tf.function
+    def return_sigma(self, gp_lengthscale, gp_variance):
+        ''' Return the correlation matrix 
+        Based on weighting + Gaussian process with the kernel
+        '''                
+        if self.kernel=='RBF':
+            cov_matrix = gp_variance * tf.exp(
+                -0.5 * tf.square(self.dmatrix) / tf.square(gp_lengthscale)
+            )
+        return cov_matrix    
+
+    @tf.function
+    def return_log_prob(self, parameter, gp_lengthscale, gp_variance):
+        cov_matrix = self.return_sigma(gp_lengthscale, gp_variance)
+        nvx = cov_matrix.shape[0]
+        gp_prior_dist = tfd.MultivariateNormalFullCovariance(
+                loc=tf.zeros(nvx, dtype=tf.float32),
+                covariance_matrix=cov_matrix + tf.eye(self.n_vx_to_fit, dtype=tf.float32) * 1e-6 # Add small diagonal for numerical stability
+        )
+        log_prob = gp_prior_dist.log_prob(parameter) # Log-prior contribution for this parameter
+        return log_prob
