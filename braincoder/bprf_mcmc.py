@@ -5,7 +5,7 @@ import tensorflow as tf
 import tensorflow_probability as tfp
 from tensorflow_probability import distributions as tfd
 from tensorflow_probability import bijectors as tfb
-
+from tqdm import tqdm
 
 import copy
 class BPRF(object):
@@ -60,6 +60,8 @@ class BPRF(object):
         # Per voxel (row in data) - save the output of the MCMC sampler 
         self.mcmc_sampler = [None] * self.data.shape[1]
         self.mcmc_stats = [None] * self.data.shape[1]
+        # MAP 
+        self.MAP_parameters = [None] * self.data.shape[1]
         
     def add_prior(self, pid, prior_type, **kwargs):
         ''' 
@@ -200,16 +202,18 @@ class BPRF(object):
     @tf.function
     def _bprf_transform_parameters_forward(self, parameters):
         # Loop through parameters & bijectors (forward)
-        return tf.concat([
-            self.p_bijector_list[i](parameters[:, i][:, tf.newaxis]) for i in range(self.n_params)
-            ], axis=1)
 
+        p_out = [
+            self.p_bijector_list[i](parameters[:,i]) for i in range(self.n_params)
+            ]
+        return tf.stack(p_out, axis=-1)
     @tf.function
     def _bprf_transform_parameters_backward(self, parameters):
         # Loop through parameters & bijectors... (but apply inverse)
-        return tf.concat([
-            self.p_bijector_list[i].inverse(parameters[:, i][:, tf.newaxis]) for i in range(self.n_params)
-            ], axis=1)
+        p_out = [
+            self.p_bijector_list[i].inverse(parameters[:,i]) for i in range(self.n_params)
+            ]
+        return tf.stack(p_out, axis=-1)
 
     def fit_mcmc(self, 
             init_pars=None,
@@ -218,8 +222,7 @@ class BPRF(object):
             fixed_pars={},
             **kwargs):
         '''
-        Experimental - can we fit everything at once?
-        Does that even make sense?
+        Find the distribution of parameters 
         '''
         if idx is None: # all of them?
             idx = np.arange(self.n_voxels).tolist()
@@ -245,20 +248,13 @@ class BPRF(object):
         paradigm_ = self.model.stimulus._clean_paradigm(paradigm)        
         
         # Define the prior in 'tf'
-        @tf.function
-        def log_prior_fn(parameters):
-            # Log-prior function for the model
-            p_out = tf.zeros(parameters.shape[0])  
-            if self.priors_to_loop==[]:
-                return p_out
-            for p in self.priors_to_loop:
-                p_out += self.p_prior[p].prior(parameters[:,self.model_labels[p]])
-            return p_out       
-
+        log_prior_fn = self._create_log_prior_fn()
+        
         # Calculating the likelihood
-        # First lets make the function which returns the likelihood of the residuals
         # -> based on our 'noise_method'
         residual_ln_likelihood_fn = self._create_residual_ln_likelihood_fn()
+
+        # Now create the log_posterior_fn
         # normal_dist = tfd.Normal(loc=0.0, scale=1.0)
         @tf.function
         def log_posterior_fn(parameters):
@@ -266,15 +262,9 @@ class BPRF(object):
             par4pred = parameters[:,:self.n_model_params] # chop out any hyper / noise parameters
             predictions = self.model._predict(
                 paradigm_[tf.newaxis, ...], par4pred[tf.newaxis, ...], None)     # Only include those parameters that are fed to the model
-            residuals = y[:, vx_bool] - predictions[0]                        
-            
-            # -> rescale based on std...
-            # residuals_std  = tf.math.reduce_std(residuals, axis=0)
-            # log_likelihood = normal_dist.log_prob(residuals/residuals_std) - tf.math.log(residuals_std)
-            # log_likelihood = tf.reduce_sum(log_likelihood, axis=0)            # -> rescale based on std...
+            residuals = y[:, vx_bool] - predictions[0]                                    
             log_likelihood = residual_ln_likelihood_fn(parameters, residuals)
             log_prior = log_prior_fn(parameters) 
-            print(f'log prior={log_prior}')           
             # Return vector of length idx (optimize each chain separately)
             return log_prior + log_likelihood
         
@@ -323,7 +313,112 @@ class BPRF(object):
             for p,v in self.fixed_pars.items():
                 estimated_p_dict[p] = estimated_p_dict[p]*0 + v.values
             self.mcmc_sampler[ivx_fit] = pd.DataFrame(estimated_p_dict)
-        self.mcmc_stats = stats            
+        self.mcmc_stats = stats
+
+    def fit_MAP(self,
+                    init_pars=None,
+                    num_steps=100,
+                    idx = None,
+                    fixed_pars={},
+                    **kwargs):
+        '''
+        Maximum a posteriori (MAP) optimization for hierarchical model.
+        Finds the parameter values that maximize the posterior distribution.
+        '''
+        if idx is None: # all of them?
+            idx = np.arange(self.n_voxels).tolist()
+        elif isinstance(idx, int):
+            idx = [idx]
+        vx_bool = np.zeros(self.n_voxels, dtype=bool)
+        vx_bool[idx] = True
+        self.n_vx_to_fit = len(idx)
+        self.fixed_pars = fixed_pars
+        if not isinstance(self.fixed_pars, pd.DataFrame):
+            self.fixed_pars = pd.DataFrame.from_dict(self.fixed_pars, orient='index').T.astype('float32')
+        self.prep_for_fitting(**kwargs)
+        self.n_params = len(self.model_labels)
+        step_size = kwargs.pop('step_size', 0.0001) # rest of the kwargs go to "hmc_sample"                
+        step_size = [tf.constant(step_size, np.float32) for _ in range(self.n_params)]
+        paradigm = kwargs.pop('paradigm', self.paradigm)
+        
+        y = self.data.values
+        init_pars = format_parameters(init_pars)
+        init_pars = init_pars.values.astype(np.float32) 
+
+        # Clean the paradigm 
+        paradigm_ = self.model.stimulus._clean_paradigm(paradigm)  
+
+        # Define the prior in 'tf'
+        log_prior_fn = self._create_log_prior_fn()
+        
+        # Calculating the likelihood
+        # -> based on our 'noise_method'
+        residual_ln_likelihood_fn = self._create_residual_ln_likelihood_fn()
+
+        # Now create the log_posterior_fn
+        # normal_dist = tfd.Normal(loc=0.0, scale=1.0)
+        @tf.function
+        def log_posterior_fn(parameters):
+            parameters = self._bprf_transform_parameters_forward(parameters)
+            parameters = self.fix_update_fn(parameters)            
+            par4pred = parameters[:,:self.n_model_params] # chop out any hyper / noise parameters
+            predictions = self.model._predict(
+                paradigm_[tf.newaxis, ...], par4pred[tf.newaxis, ...], None)     # Only include those parameters that are fed to the model
+            residuals = y[:, vx_bool] - predictions[0]                                    
+            log_likelihood = residual_ln_likelihood_fn(parameters, residuals)
+            log_prior = log_prior_fn(parameters) 
+            # Return vector of length idx (optimize each chain separately)
+            return log_prior + log_likelihood
+
+        # -> make sure we are in the correct dtype 
+        initial_state = [tf.convert_to_tensor(init_pars[vx_bool,i], dtype=tf.float32) for i in range(self.n_params)]                          
+        # Define the target log probability function (for this voxel)
+        
+        print('Starting MAP optimization...')
+
+        # Optimization setup
+        optimizer = tf.optimizers.Adam()
+        # -> transform parameters backwards before fit
+        opt_vars = [
+            tf.Variable(self.p_bijector_list[i].inverse(init_state)) for i,init_state in enumerate(initial_state)]
+
+        @tf.function
+        def neg_log_posterior_fn():
+            return -log_posterior_fn(tf.stack(opt_vars, axis=-1))
+        
+        # Optimization loop with tqdm progress bar
+        for step in tqdm(tf.range(num_steps), desc="MAP Optimization"):
+            optimizer.minimize(neg_log_posterior_fn, opt_vars)
+        # Extract optimized parameters
+        # -> transform parameters forward after fitting
+        opt_vars = [self.p_bijector_list[i](ov) for i,ov in enumerate(opt_vars)]
+        optimized_samples = [var.numpy() for var in opt_vars]
+        self.MAP_parameters = None
+        df_list = []
+        # Save optimized parameters
+        for ivx_loc,ivx_fit in enumerate(idx):
+            estimated_p_dict = {}
+            for i,p in enumerate(self.model_labels):
+                estimated_p_dict[p] = optimized_samples[i][ivx_loc]
+            for p,v in self.fixed_pars.items():
+                estimated_p_dict[p] = estimated_p_dict[p]*0 + v.values
+            
+            df = pd.DataFrame(estimated_p_dict, index=[ivx_fit]) # use map_sampler instead of mcmc_sampler
+            df_list.append(df)
+        self.MAP_parameters = pd.concat(df_list).reindex(idx)
+        print('MAP optimization finished.')    
+
+    def _create_log_prior_fn(self):
+        @tf.function
+        def log_prior_fn(parameters):
+            # Log-prior function for the model
+            p_out = tf.zeros(parameters.shape[0])  
+            if self.priors_to_loop==[]:
+                return p_out
+            for p in self.priors_to_loop:                
+                p_out += self.p_prior[p].prior(parameters[:,self.model_labels[p]])
+            return p_out   
+        return log_prior_fn
 
     def _create_residual_ln_likelihood_fn(self):
         # Calculating the likelihood
@@ -336,7 +431,7 @@ class BPRF(object):
                 resid_ln_likelihood = tf.reduce_sum(resid_ln_likelihood, axis=0)       
                 # Return vector of length idx (optimize each chain separately)
                 return resid_ln_likelihood
-        elif self.noise_method == 'fit_norm':
+        elif self.noise_method == 'fit_normal':
             # Assume residuals are normally distributed (loc=0.0)
             # Add the scale as an extra parameters to be fit             
             @tf.function
