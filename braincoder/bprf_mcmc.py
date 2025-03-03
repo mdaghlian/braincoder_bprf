@@ -60,6 +60,8 @@ class BPRF(object):
         # Per voxel (row in data) - save the output of the MCMC sampler 
         self.mcmc_sampler = [None] * self.data.shape[1]
         self.mcmc_stats = [None] * self.data.shape[1]
+        self.mcmc_summary = None
+        self.mcmc_mean = None
         # MAP 
         self.MAP_parameters = [None] * self.data.shape[1]
         
@@ -315,6 +317,37 @@ class BPRF(object):
             self.mcmc_sampler[ivx_fit] = pd.DataFrame(estimated_p_dict)
         self.mcmc_stats = stats
 
+    def get_mcmc_summary(self, burn_in=100, pc_range=25):
+        burn_in = 100
+        pc_range = 25
+        bpars = {}
+        bpars_m = {}
+        for p in list(self.model_labels.keys()): 
+            m = []
+            q1 = []
+            q2 = []
+            uc = []
+            for idx in range(self.n_voxels):
+                this_p = self.mcmc_sampler[idx][p][burn_in:].to_numpy()
+                m.append(np.percentile(this_p,50))
+                tq1 = np.percentile(this_p, pc_range)
+                tq2 = np.percentile(this_p, 100-pc_range)
+                tuc = tq2 - tq1
+                
+                q1.append(tq1)
+                q2.append(tq2)
+                uc.append(tuc)
+            bpars_m[p] = np.array(m)
+            bpars[f'm_{p}'] = np.array(m)
+            bpars[f'q1_{p}'] = np.array(q1)
+            bpars[f'q2_{p}'] = np.array(q2)
+            bpars[f'uc_{p}'] = np.array(uc)
+            
+        self.mcmc_summary = pd.DataFrame(bpars)
+        self.mcmc_mean = pd.DataFrame(bpars_m)
+
+
+
     def fit_MAP(self,
                     init_pars=None,
                     num_steps=100,
@@ -322,8 +355,7 @@ class BPRF(object):
                     fixed_pars={},
                     **kwargs):
         '''
-        Maximum a posteriori (MAP) optimization for hierarchical model.
-        Finds the parameter values that maximize the posterior distribution.
+        Maximum a posteriori (MAP) optimization 
         '''
         if idx is None: # all of them?
             idx = np.arange(self.n_voxels).tolist()
@@ -337,8 +369,6 @@ class BPRF(object):
             self.fixed_pars = pd.DataFrame.from_dict(self.fixed_pars, orient='index').T.astype('float32')
         self.prep_for_fitting(**kwargs)
         self.n_params = len(self.model_labels)
-        step_size = kwargs.pop('step_size', 0.0001) # rest of the kwargs go to "hmc_sample"                
-        step_size = [tf.constant(step_size, np.float32) for _ in range(self.n_params)]
         paradigm = kwargs.pop('paradigm', self.paradigm)
         
         y = self.data.values
@@ -356,7 +386,6 @@ class BPRF(object):
         residual_ln_likelihood_fn = self._create_residual_ln_likelihood_fn()
 
         # Now create the log_posterior_fn
-        # normal_dist = tfd.Normal(loc=0.0, scale=1.0)
         @tf.function
         def log_posterior_fn(parameters):
             parameters = self._bprf_transform_parameters_forward(parameters)
@@ -393,7 +422,6 @@ class BPRF(object):
         # -> transform parameters forward after fitting
         opt_vars = [self.p_bijector_list[i](ov) for i,ov in enumerate(opt_vars)]
         optimized_samples = [var.numpy() for var in opt_vars]
-        self.MAP_parameters = None
         df_list = []
         # Save optimized parameters
         for ivx_loc,ivx_fit in enumerate(idx):
