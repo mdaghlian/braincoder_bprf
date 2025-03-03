@@ -33,6 +33,8 @@ class BPRF_hier(BPRF):
         self.h_gp_function = {} # Using gaussian process?
         self.h_prior = {}
         self.h_mcmc_sampler = {}
+        # MAP
+        self.h_MAP_parameters = None
 
                 
     def h_add_param(self, pid, h_prior_to_apply='normal', **kwargs):
@@ -62,18 +64,20 @@ class BPRF_hier(BPRF):
             # ... none for now...
             self.h_add_prior(pid=f'{pid}_loc', prior_type='none', **kwargs)
             self.h_add_prior(pid=f'{pid}_scale', prior_type='none', **kwargs)
-        elif h_prior_to_apply=='gp_weight':
-            # Gaussian process with weights
+        elif h_prior_to_apply=='gp_gdists':
+            # Gaussian process based on geodesic distance
             # -> Gaussian process generates a covariance matrix
-            # -> use this to define the 
             self.h_labels[f'{pid}_gp_lengthscale'] = len(self.h_labels) 
             self.h_labels[f'{pid}_gp_variance'] = len(self.h_labels)
-            self.h_gp_function = GPWeight(
-                weights=kwargs.pop('weights'),
+            self.h_gp_function = GPGdists(
+                gdists=kwargs.pop('gdists'),
                 kernel=kwargs.pop('kernel', 'RBF'),
             )
-            self.h_add_bijector(pid=f'{pid}_gp_lengthscale', bijector_type=tfb.Exp())
-            self.h_add_bijector(pid=f'{pid}_gp_variance', bijector_type=tfb.Exp())
+            # self.h_add_bijector(pid=f'{pid}_gp_lengthscale', bijector_type=tfb.Identity())
+            # self.h_add_bijector(pid=f'{pid}_gp_variance', bijector_type=tfb.Identity())
+
+            self.h_add_bijector(pid=f'{pid}_gp_lengthscale', bijector_type=tfb.Softplus())
+            self.h_add_bijector(pid=f'{pid}_gp_variance', bijector_type=tfb.Softplus())
 
             # [3] add the priors for the new parameters
             # ... none for now...
@@ -179,13 +183,29 @@ class BPRF_hier(BPRF):
         for p in self.h_labels.keys():            
             self.h_bijector_list.append(
                 self.h_bijector[p]
-            )      
+            )        
         # Only loop through those parameters with a prior
         self.h_priors_to_loop = [
             p for p,t in self.h_prior_type.items() if t not in ('fixed', 'none')
         ]
 
 
+    @tf.function
+    def _h_bprf_transform_parameters_forward(self, h_parameters):
+        # Loop through parameters & bijectors (forward)
+        h_out = [
+            self.h_bijector_list[i](h_parameters[i]) for i in range(self.h_n_params)
+            ]
+        return tf.stack(h_out, axis=-1)
+
+    @tf.function
+    def _h_bprf_transform_parameters_forward(self, h_parameters):
+        # Loop through parameters & bijectors (forward)
+        h_out = [
+            self.h_bijector_list[i].inverse(h_parameters[i]) for i in range(self.h_n_params)
+            ]
+        return tf.stack(h_out, axis=-1)
+    
     def fit_mcmc_hier(self, 
             init_pars=None,
             h_init_pars=None,
@@ -233,44 +253,12 @@ class BPRF_hier(BPRF):
         paradigm_ = self.model.stimulus._clean_paradigm(paradigm)        
         
         # Define the prior in 'tf'
-        @tf.function
-        def log_prior_fn(parameters, h_parameters):
-            # Log-prior function for the model
-            p_out = 0.0            
-            for p in self.priors_to_loop:
-                p_out += tf.reduce_sum(self.p_prior[p].prior(parameters[:,self.model_labels[p]]))
-            # Also apply the hierarchical priors
-            for h in self.h_prior_to_apply.keys():
-                if self.h_prior_to_apply[h]=='normal':
-                    p_for_prior = parameters[:,self.model_labels[h]]
-                    loc_for_prior = h_parameters[:,self.h_labels[h+'_loc']]
-                    scale_for_prior = h_parameters[:,self.h_labels[h+'_scale']]
-                    p_out = tf.reduce_sum(calculate_log_prob_gauss(
-                        data=p_for_prior, loc=loc_for_prior, scale=scale_for_prior
-                    ))
-                elif self.h_prior_to_apply=='gp_weight':
-                    param_values = parameters[:, self.model_labels[h]] # Values of parameter 'h' for vertices being fit
-                    gp_lengthscale = h_parameters[:, self.h_labels[f'{h}_gp_lengthscale']] # Current value of GP lengthscale hyperparameter
-                    gp_variance = h_parameters[:, self.h_labels[f'{h}_gp_variance']] # Current value of GP variance hyperparameter
-                    sigma = self.h_gp_function.return_sigma(
-                        gp_lengthscale=gp_lengthscale, gp_variance=gp_variance                        
-                    )
-
-                    gp_prior_dist = tfd.MultivariateNormalFullCovariance(
-                        loc=tf.zeros(self.n_vx_to_fit, dtype=tf.float32),
-                        covariance_matrix=sigma + tf.eye(self.n_vx_to_fit, dtype=tf.float32) * 1e-6 # Add small diagonal for numerical stability
-                    )
-
-                    p_out += gp_prior_dist.log_prob(param_values) # Log-prior contribution for this parameter
-
-                    
-            for h in self.h_priors_to_loop:
-                p_out += tf.reduce_sum(self.h_prior[h].prior(h_parameters[:,self.h_labels[h]]))
-            return p_out       
+        log_prior_fn = self._create_log_prior_fn()    
 
         # Calculating the likelihood
         # First lets make the function which returns the likelihood of the residuals
         residual_ln_likelihood_fn = self._create_residual_ln_likelihood_fn()
+        
         @tf.function
         def log_posterior_fn(parameters, h_parameters):
             parameters = self.fix_update_fn(parameters)            
@@ -283,12 +271,11 @@ class BPRF_hier(BPRF):
             # -> rescale based on std...
             log_likelihood = residual_ln_likelihood_fn(parameters, residuals)
             log_prior = log_prior_fn(parameters, h_parameters)            
-            # Return vector of length idx (optimize each chain separately)
             return tf.reduce_sum(log_likelihood + log_prior)
         
         # -> make sure we are in the correct dtype 
-        p_initial_state = [tf.convert_to_tensor(init_pars[vx_bool,i], dtype=tf.float32) for i in range(self.n_params)]                          
-        h_initial_state = [tf.convert_to_tensor(h_init_pars[:,i], dtype=tf.float32) for i in range(self.h_n_params)]        
+        p_initial_state = [tf.convert_to_tensor(init_pars[vx_bool,i], dtype=tf.float32, name=n) for i,n in enumerate(self.model_labels.keys())]                          
+        h_initial_state = [tf.convert_to_tensor(h_init_pars[:,i], dtype=tf.float32, name=n) for i,n in enumerate(self.h_labels)]        
 
         def target_log_prob_fn(*all_parameters):
             parameters = tf.stack(all_parameters[:self.n_params], axis=-1)
@@ -339,7 +326,183 @@ class BPRF_hier(BPRF):
             self.h_mcmc_sampler[h] = h_samples[:,self.h_labels[h]]
         self.h_mcmc_sampler = pd.DataFrame(self.h_mcmc_sampler)
         self.mcmc_stats = stats            
+    
+    def fit_MAP_hier(self,
+                init_pars=None,
+                h_init_pars=None,
+                num_steps=100, 
+                idx = None,
+                fixed_pars={},
+                **kwargs):
+        '''
+        Maximum a posteriori (MAP) optimization for hierarchical model.
+        Finds the parameter values that maximize the posterior distribution.
+        '''
+        optimizer_type = kwargs.get('optimizer', 'adam' )
+        if idx is None: # all of them?
+            idx = np.arange(self.n_voxels).tolist()
+        elif isinstance(idx, int):
+            idx = [idx]
+        vx_bool = np.zeros(self.n_voxels, dtype=bool)
+        vx_bool[idx] = True
+        self.n_vx_to_fit = len(idx)
+        self.fixed_pars = fixed_pars
+        if not isinstance(self.fixed_pars, pd.DataFrame):
+            self.fixed_pars = pd.DataFrame.from_dict(self.fixed_pars, orient='index').T.astype('float32')
+        self.h_fixed_pars = kwargs.pop('h_fixed_pars', {})        
+        if not isinstance(self.h_fixed_pars, pd.DataFrame):
+            self.h_fixed_pars = pd.DataFrame.from_dict(self.h_fixed_pars, orient='index').T.astype('float32')
+        
+        self.prep_for_fitting(**kwargs)
+        self.n_params = len(self.model_labels)
+        self.model_labels_inv = {v:k for k,v in self.model_labels.items()}
+        self.h_prep_for_fitting(**kwargs)
+        self.h_n_params = len(self.h_labels)
+        self.h_labels_inv = {v:k for k,v in self.h_labels.items()}
 
+        self.total_n_params = self.n_params + self.h_n_params
+        paradigm = kwargs.pop('paradigm', self.paradigm)
+        
+        y = self.data.values
+        init_pars = format_parameters(init_pars)
+        init_pars = init_pars.values.astype(np.float32) 
+        h_init_pars = format_parameters(h_init_pars)
+        h_init_pars = h_init_pars.values.astype(np.float32)
+
+        # Clean the paradigm 
+        paradigm_ = self.model.stimulus._clean_paradigm(paradigm)  
+
+        # Define the prior in 'tf'
+        log_prior_fn = self._create_log_prior_fn()
+        
+        # Calculating the likelihood
+        # -> based on our 'noise_method'
+        residual_ln_likelihood_fn = self._create_residual_ln_likelihood_fn()
+
+        # Now create the log_posterior_fn
+        @tf.function
+        def log_posterior_fn(parameters, h_parameters):
+            # parameters = self._bprf_transform_parameters_forward(parameters)
+            parameters = self.fix_update_fn(parameters)            
+            # h_parameters = self._h_bprf_transform_parameters_forward(h_parameters)
+            h_parameters = self.h_fix_update_fn(h_parameters)
+            par4pred = parameters[:,:self.n_model_params] # chop out any hyper / noise parameters
+            predictions = self.model._predict(
+                paradigm_[tf.newaxis, ...], par4pred[tf.newaxis, ...], None)     # Only include those parameters that are fed to the model
+            residuals = y[:, vx_bool] - predictions[0]                        
+            
+            # -> rescale based on std...
+            log_likelihood = residual_ln_likelihood_fn(parameters, residuals)
+            log_prior = log_prior_fn(parameters, h_parameters)            
+            # Return vector of length idx (optimize each chain separately)
+            return tf.reduce_sum(log_prior + log_likelihood)
+
+        # -> make sure we are in the correct dtype
+        # Convert initial parameters to tensors
+        p_state_tensors = [
+            tf.convert_to_tensor(init_pars[vx_bool, i], dtype=tf.float32, name=name) 
+            for i, name in enumerate(self.model_labels.keys())
+        ]
+
+        h_state_tensors = [
+            tf.convert_to_tensor(h_init_pars[:, i], dtype=tf.float32, name=name) 
+            for i, name in enumerate(self.h_labels)
+        ]
+
+        # Transform initial states using bijectors
+        p_unconstrained = [bijector.inverse(state) for bijector, state in zip(self.p_bijector_list, p_state_tensors)]
+        h_unconstrained = [bijector.inverse(state) for bijector, state in zip(self.h_bijector_list, h_state_tensors)]
+
+        print("Starting MAP optimization with bijectors...")
+
+        # Initialize optimization variables
+        p_opt_vars = [tf.Variable(state, name=self.model_labels_inv[i]) for i,state in enumerate(p_unconstrained)]
+        h_opt_vars = [tf.Variable(state, name=self.h_labels_inv[i]) for i,state in enumerate(h_unconstrained)]        
+
+        all_opt_vars = [*p_opt_vars, *h_opt_vars]
+        @tf.function
+        def neg_log_posterior_fn():
+            return -log_posterior_fn(
+                tf.stack(all_opt_vars[:self.n_params], axis=-1), 
+                tf.stack(all_opt_vars[self.n_params:], axis=-1)
+                )
+        
+        @tf.function
+        def neg_log_posterior_fn():
+            return -log_posterior_fn(
+                tf.stack(all_opt_vars[:self.n_params], axis=-1), 
+                tf.stack(all_opt_vars[self.n_params:], axis=-1)
+                )
+        
+        optimizer = tf.optimizers.Adam()
+        # Optimization loop with tqdm progress bar
+        for step in tqdm(tf.range(num_steps), desc="MAP Optimization"):
+            with tf.GradientTape() as tape:
+                loss = neg_log_posterior_fn()
+            gradients = tape.gradient(loss, all_opt_vars)
+            optimizer.apply_gradients(zip(gradients, all_opt_vars))
+        # Extract optimized parameters            
+
+
+        # Extract optimized parameters
+        # -> transform parameters forward after fitting
+        p_opt_vars = all_opt_vars[:self.n_params]
+        p_opt_vars = [self.p_bijector_list[i](ov).numpy() for i,ov in enumerate(p_opt_vars)]
+
+        h_opt_vars = all_opt_vars[self.n_params:]
+        h_opt_vars = [self.h_bijector_list[i](ov).numpy() for i,ov in enumerate(h_opt_vars)]
+        
+        df_list = []
+        # Save optimized parameters
+        for ivx_loc,ivx_fit in enumerate(idx):
+            estimated_p_dict = {}
+            for i,p in enumerate(self.model_labels):
+                estimated_p_dict[p] = p_opt_vars[i][ivx_loc]
+            for p,v in self.fixed_pars.items():
+                estimated_p_dict[p] = estimated_p_dict[p]*0 + v.values
+            
+            df = pd.DataFrame(estimated_p_dict, index=[ivx_fit]) # use map_sampler instead of mcmc_sampler
+            df_list.append(df)
+        self.MAP_parameters = pd.concat(df_list).reindex(idx)
+        
+        hdf = {}
+        for i,h in enumerate(self.h_labels):
+            hdf[h] = h_opt_vars[self.h_labels[h]]
+        self.h_MAP_parameters = pd.DataFrame(hdf)
+        print('MAP optimization finished.')    
+
+    
+    def _create_log_prior_fn(self):
+        @tf.function
+        def log_prior_fn(parameters, h_parameters):
+            # Log-prior function for the model
+            p_out = 0.0            
+            for p in self.priors_to_loop:
+                p_out += tf.reduce_sum(self.p_prior[p].prior(parameters[:,self.model_labels[p]]))
+            # Also apply the hierarchical priors
+            for h in self.h_prior_to_apply.keys():
+                if self.h_prior_to_apply[h]=='normal':
+                    p_for_prior = parameters[:,self.model_labels[h]]                    
+                    loc_for_prior = h_parameters[:,self.h_labels[h+'_loc']]
+                    scale_for_prior = h_parameters[:,self.h_labels[h+'_scale']]
+                    p_out += tf.reduce_sum(calculate_log_prob_gauss(
+                        data=p_for_prior, loc=loc_for_prior, scale=scale_for_prior
+                    ))
+                    
+                elif self.h_prior_to_apply[h]=='gp_gdists':
+                    param_values = parameters[:, self.model_labels[h]] # Values of parameter 'h' for vertices being fit
+                    gp_lengthscale = h_parameters[:, self.h_labels[f'{h}_gp_lengthscale']] # Current value of GP lengthscale hyperparameter
+                    gp_variance = h_parameters[:, self.h_labels[f'{h}_gp_variance']] # Current value of GP variance hyperparameter
+                    p_out += self.h_gp_function.return_log_prob(
+                        gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, parameter=param_values
+                    )
+
+                    
+            for h in self.h_priors_to_loop:
+                p_out += tf.reduce_sum(self.h_prior[h].prior(h_parameters[:,self.h_labels[h]]))
+            return p_out     
+        return log_prior_fn
+    
     def _create_residual_ln_likelihood_fn(self):
         # Calculating the likelihood
         if self.noise_method == 'fit_tdist':
@@ -351,7 +514,7 @@ class BPRF_hier(BPRF):
                 resid_ln_likelihood = tf.reduce_sum(resid_ln_likelihood, axis=0)       
                 # Return vector of length idx (optimize each chain separately)
                 return resid_ln_likelihood
-        elif self.noise_method == 'fit_norm':
+        elif self.noise_method == 'fit_normal':
             # Assume residuals are normally distributed (loc=0.0)
             # Add the scale as an extra parameters to be fit             
             @tf.function
@@ -382,30 +545,65 @@ class BPRF_hier(BPRF):
 
 
 
-class GPWeight():
-    def __init__(self, dmatrix, kernel):
+class GPGdists():
+    def __init__(self, gdists, kernel):
         # dmatrix = n x n matrix of distances (i.e., cortical distance)
-        self.dmatrix = dmatrix
+        self.gdists = tf.convert_to_tensor(gdists, dtype=tf.float32, name='gdists')
+        self.gdists = (self.gdists + tf.transpose(self.gdists)) / 2.0
         self.kernel = kernel
+        self.nvx = self.gdists.shape[0]
     
     @tf.function
     def return_sigma(self, gp_lengthscale, gp_variance):
-        ''' Return the correlation matrix 
-        Based on weighting + Gaussian process with the kernel
+        ''' Return the correlation matrix         
         '''                
         if self.kernel=='RBF':
+            # RBF
+            # K(x,x') = exp ( - abs(x-x')^2 / (2*sigma^2) )
+            # Note we are not squaring self.gdists, because this has already been done...
+            # self.gdists = abs(x-x')^2 
             cov_matrix = gp_variance * tf.exp(
-                -0.5 * tf.square(self.dmatrix) / tf.square(gp_lengthscale)
+                - self.gdists / (2.0*tf.square(gp_lengthscale))
             )
+            # cov_matrix = (cov_matrix + tf.transpose(cov_matrix)) / 2.0  # Keep symmetry enforcement for now
+            cov_matrix += tf.eye(self.nvx, dtype=tf.float32) * 10 #e-2
+
         return cov_matrix    
 
     @tf.function
     def return_log_prob(self, parameter, gp_lengthscale, gp_variance):
         cov_matrix = self.return_sigma(gp_lengthscale, gp_variance)
-        nvx = cov_matrix.shape[0]
-        gp_prior_dist = tfd.MultivariateNormalFullCovariance(
-                loc=tf.zeros(nvx, dtype=tf.float32),
-                covariance_matrix=cov_matrix + tf.eye(self.n_vx_to_fit, dtype=tf.float32) * 1e-6 # Add small diagonal for numerical stability
-        )
+        gp_prior_dist = tfd.MultivariateNormalTriL(
+            loc=tf.zeros(self.nvx, dtype=tf.float32),
+            scale_tril=tf.linalg.cholesky(cov_matrix), 
+            allow_nan_stats=False,
+            )   
         log_prob = gp_prior_dist.log_prob(parameter) # Log-prior contribution for this parameter
         return log_prob
+
+
+def force_symmetric_psd_tf(D_tf):
+    """Forces a square matrix to be symmetric and positive semi-definite using TensorFlow.
+
+    Args:
+        D_tf: A TensorFlow tensor representing the matrix.
+
+    Returns:
+        A TensorFlow tensor that is symmetric and PSD, close to the input D_tf.
+    """
+    # 1. Enforce Symmetry in TensorFlow
+    D_symmetric_tf = (D_tf + tf.transpose(D_tf)) / 2.0
+
+    # 2. Force PSD using Spectral Projection in TensorFlow
+    # Eigenvalue decomposition using eigh for symmetric matrices
+    evals_tf, evecs_tf = tf.linalg.eigh(D_symmetric_tf)
+
+    # Clip negative eigenvalues to zero using ReLU (or tf.clip_by_value)
+    evals_clipped_tf = tf.nn.relu(evals_tf)
+    # Alternatively using tf.clip_by_value:
+    # evals_clipped_tf = tf.clip_by_value(evals_tf, clip_value_min=0, clip_value_max=tf.float32.max)
+
+    # Reconstruct the PSD matrix
+    D_psd_tf = tf.matmul(evecs_tf, tf.matmul(tf.linalg.diag(evals_clipped_tf), tf.transpose(evecs_tf)))
+
+    return D_psd_tf
