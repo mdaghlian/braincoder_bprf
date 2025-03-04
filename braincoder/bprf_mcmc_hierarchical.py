@@ -33,6 +33,8 @@ class BPRF_hier(BPRF):
         self.h_gp_function = {} # Using gaussian process?
         self.h_prior = {}
         self.h_mcmc_sampler = {}
+        self.h_mcmc_summary = None
+        self.h_mcmc_mean = None
         # MAP
         self.h_MAP_parameters = None
 
@@ -326,7 +328,57 @@ class BPRF_hier(BPRF):
             self.h_mcmc_sampler[h] = h_samples[:,self.h_labels[h]]
         self.h_mcmc_sampler = pd.DataFrame(self.h_mcmc_sampler)
         self.mcmc_stats = stats            
-    
+
+    def get_mcmc_summary(self, burnin=100, pc_range=25):
+        burnin = 100
+        pc_range = 25
+        bpars = {}
+        bpars_m = {}
+        for p in list(self.model_labels.keys()): 
+            m = []
+            q1 = []
+            q2 = []
+            uc = []
+            for idx in range(self.n_voxels):
+                this_p = self.mcmc_sampler[idx][p][burnin:].to_numpy()
+                m.append(np.percentile(this_p,50))
+                tq1 = np.percentile(this_p, pc_range)
+                tq2 = np.percentile(this_p, 100-pc_range)
+                tuc = tq2 - tq1
+                
+                q1.append(tq1)
+                q2.append(tq2)
+                uc.append(tuc)
+            bpars_m[p] = np.array(m)
+            bpars[f'm_{p}'] = np.array(m)
+            bpars[f'q1_{p}'] = np.array(q1)
+            bpars[f'q2_{p}'] = np.array(q2)
+            bpars[f'uc_{p}'] = np.array(uc)
+            
+        self.mcmc_summary = pd.DataFrame(bpars)
+        self.mcmc_mean = pd.DataFrame(bpars_m)
+
+        hpars = {}
+        hpars_m = {}
+        for p in list(self.h_labels.keys()): 
+
+            this_p = self.h_mcmc_sampler[p][burnin:].to_numpy()
+            m = np.percentile(this_p,50)
+            tq1 = np.percentile(this_p, pc_range)
+            tq2 = np.percentile(this_p, 100-pc_range)
+            tuc = tq2 - tq1
+            
+            hpars_m[p] = np.array(m)
+            hpars[f'm_{p}'] = np.array(m)
+            hpars[f'q1_{p}'] = np.array(q1)
+            hpars[f'q2_{p}'] = np.array(q2)
+            hpars[f'uc_{p}'] = np.array(uc)
+            
+        self.h_mcmc_summary = pd.DataFrame(hpars)
+        self.h_mcmc_mean = pd.DataFrame.from_dict(hpars_m, orient='index').T.astype('float32')
+
+
+
     def fit_MAP_hier(self,
                 init_pars=None,
                 h_init_pars=None,
@@ -413,37 +465,61 @@ class BPRF_hier(BPRF):
         p_unconstrained = [bijector.inverse(state) for bijector, state in zip(self.p_bijector_list, p_state_tensors)]
         h_unconstrained = [bijector.inverse(state) for bijector, state in zip(self.h_bijector_list, h_state_tensors)]
 
-        print("Starting MAP optimization with bijectors...")
+        print("Starting MAP optimization...")
 
         # Initialize optimization variables
         p_opt_vars = [tf.Variable(state, name=self.model_labels_inv[i]) for i,state in enumerate(p_unconstrained)]
         h_opt_vars = [tf.Variable(state, name=self.h_labels_inv[i]) for i,state in enumerate(h_unconstrained)]        
 
         all_opt_vars = [*p_opt_vars, *h_opt_vars]
-        @tf.function
-        def neg_log_posterior_fn():
-            return -log_posterior_fn(
-                tf.stack(all_opt_vars[:self.n_params], axis=-1), 
-                tf.stack(all_opt_vars[self.n_params:], axis=-1)
-                )
-        
-        @tf.function
-        def neg_log_posterior_fn():
-            return -log_posterior_fn(
-                tf.stack(all_opt_vars[:self.n_params], axis=-1), 
-                tf.stack(all_opt_vars[self.n_params:], axis=-1)
-                )
-        
-        optimizer = tf.optimizers.Adam()
-        # Optimization loop with tqdm progress bar
-        for step in tqdm(tf.range(num_steps), desc="MAP Optimization"):
-            with tf.GradientTape() as tape:
-                loss = neg_log_posterior_fn()
-            gradients = tape.gradient(loss, all_opt_vars)
-            optimizer.apply_gradients(zip(gradients, all_opt_vars))
-        # Extract optimized parameters            
 
+        if optimizer_type.lower()=='adam':
+            @tf.function
+            def neg_log_posterior_fn():
+                return -log_posterior_fn(
+                    tf.stack(all_opt_vars[:self.n_params], axis=-1), 
+                    tf.stack(all_opt_vars[self.n_params:], axis=-1)
+                    )
+            
+            optimizer = tf.optimizers.Adam()
+            # Optimization loop with tqdm progress bar
+            for step in tqdm(tf.range(num_steps), desc="MAP Optimization"):
+                with tf.GradientTape() as tape:
+                    loss = neg_log_posterior_fn()
+                gradients = tape.gradient(loss, all_opt_vars)
+                optimizer.apply_gradients(zip(gradients, all_opt_vars))         
+        elif optimizer_type.lower() == 'lbgfs':
+            # Convert list of tf.Variables to a single tensor for initial position.
+            # Adjust this conversion if your variables are not scalars.
+            initial_position = tf.convert_to_tensor([var.read_value() for var in all_opt_vars], dtype=tf.float32)
 
+            @tf.function
+            def neg_log_posterior_and_gradients_fn(all_pars):
+                # Split the parameters into two groups
+                p_pars = all_pars[:self.n_params]
+                h_pars = all_pars[self.n_params:]
+                with tf.GradientTape() as tape:
+                    tape.watch(all_pars)
+                    # Compute the negative log-posterior using the split parameters.
+                    loss_value = -log_posterior_fn(p_pars, h_pars)
+                gradients = tape.gradient(loss_value, all_pars)
+                return loss_value, gradients
+
+            print("Using L-BFGS Optimizer (TFP)")
+
+            results = tfp.optimizer.lbfgs_minimize(
+                value_and_gradients_function=neg_log_posterior_and_gradients_fn,
+                initial_position=initial_position,
+                max_iterations=num_steps,
+            )
+
+            if not results.converged:
+                print(f"Warning: L-BFGS optimization did not converge. Status: {results.message}")
+
+            # Assign optimized values back to the original variables.
+            optimized_params = results.position
+            for i, var in enumerate(all_opt_vars):
+                var.assign(optimized_params[i])
         # Extract optimized parameters
         # -> transform parameters forward after fitting
         p_opt_vars = all_opt_vars[:self.n_params]

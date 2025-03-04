@@ -317,8 +317,8 @@ class BPRF(object):
             self.mcmc_sampler[ivx_fit] = pd.DataFrame(estimated_p_dict)
         self.mcmc_stats = stats
 
-    def get_mcmc_summary(self, burn_in=100, pc_range=25):
-        burn_in = 100
+    def get_mcmc_summary(self, burnin=100, pc_range=25):
+        burnin = 100
         pc_range = 25
         bpars = {}
         bpars_m = {}
@@ -328,7 +328,7 @@ class BPRF(object):
             q2 = []
             uc = []
             for idx in range(self.n_voxels):
-                this_p = self.mcmc_sampler[idx][p][burn_in:].to_numpy()
+                this_p = self.mcmc_sampler[idx][p][burnin:].to_numpy()
                 m.append(np.percentile(this_p,50))
                 tq1 = np.percentile(this_p, pc_range)
                 tq2 = np.percentile(this_p, 100-pc_range)
@@ -410,7 +410,7 @@ class BPRF(object):
         # -> transform parameters backwards before fit
         opt_vars = [
             tf.Variable(self.p_bijector_list[i].inverse(init_state)) for i,init_state in enumerate(initial_state)]
-
+    
         @tf.function
         def neg_log_posterior_fn():
             return -log_posterior_fn(tf.stack(opt_vars, axis=-1))
