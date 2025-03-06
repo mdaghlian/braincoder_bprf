@@ -74,6 +74,7 @@ class BPRF_hier(BPRF):
             self.h_gp_function = GPGdists(
                 gdists=kwargs.pop('gdists'),
                 kernel=kwargs.pop('kernel', 'RBF'),
+                **kwargs
             )
             # self.h_add_bijector(pid=f'{pid}_gp_lengthscale', bijector_type=tfb.Identity())
             # self.h_add_bijector(pid=f'{pid}_gp_variance', bijector_type=tfb.Identity())
@@ -391,6 +392,7 @@ class BPRF_hier(BPRF):
         Finds the parameter values that maximize the posterior distribution.
         '''
         optimizer_type = kwargs.get('optimizer', 'adam' )
+        adam_kwargs = kwargs.pop('adam_kwargs', {})
         if idx is None: # all of them?
             idx = np.arange(self.n_voxels).tolist()
         elif isinstance(idx, int):
@@ -473,53 +475,20 @@ class BPRF_hier(BPRF):
 
         all_opt_vars = [*p_opt_vars, *h_opt_vars]
 
-        if optimizer_type.lower()=='adam':
-            @tf.function
-            def neg_log_posterior_fn():
-                return -log_posterior_fn(
-                    tf.stack(all_opt_vars[:self.n_params], axis=-1), 
-                    tf.stack(all_opt_vars[self.n_params:], axis=-1)
-                    )
-            
-            optimizer = tf.optimizers.Adam()
-            # Optimization loop with tqdm progress bar
-            for step in tqdm(tf.range(num_steps), desc="MAP Optimization"):
-                with tf.GradientTape() as tape:
-                    loss = neg_log_posterior_fn()
-                gradients = tape.gradient(loss, all_opt_vars)
-                optimizer.apply_gradients(zip(gradients, all_opt_vars))         
-        elif optimizer_type.lower() == 'lbgfs':
-            # Convert list of tf.Variables to a single tensor for initial position.
-            # Adjust this conversion if your variables are not scalars.
-            initial_position = tf.convert_to_tensor([var.read_value() for var in all_opt_vars], dtype=tf.float32)
-
-            @tf.function
-            def neg_log_posterior_and_gradients_fn(all_pars):
-                # Split the parameters into two groups
-                p_pars = all_pars[:self.n_params]
-                h_pars = all_pars[self.n_params:]
-                with tf.GradientTape() as tape:
-                    tape.watch(all_pars)
-                    # Compute the negative log-posterior using the split parameters.
-                    loss_value = -log_posterior_fn(p_pars, h_pars)
-                gradients = tape.gradient(loss_value, all_pars)
-                return loss_value, gradients
-
-            print("Using L-BFGS Optimizer (TFP)")
-
-            results = tfp.optimizer.lbfgs_minimize(
-                value_and_gradients_function=neg_log_posterior_and_gradients_fn,
-                initial_position=initial_position,
-                max_iterations=num_steps,
-            )
-
-            if not results.converged:
-                print(f"Warning: L-BFGS optimization did not converge. Status: {results.message}")
-
-            # Assign optimized values back to the original variables.
-            optimized_params = results.position
-            for i, var in enumerate(all_opt_vars):
-                var.assign(optimized_params[i])
+        @tf.function
+        def neg_log_posterior_fn():
+            return -log_posterior_fn(
+                tf.stack(all_opt_vars[:self.n_params], axis=-1), 
+                tf.stack(all_opt_vars[self.n_params:], axis=-1)
+                )
+        
+        optimizer = tf.optimizers.Adam(**adam_kwargs)
+        # Optimization loop with tqdm progress bar
+        for step in tqdm(tf.range(num_steps), desc="MAP Optimization"):
+            with tf.GradientTape() as tape:
+                loss = neg_log_posterior_fn()
+            gradients = tape.gradient(loss, all_opt_vars)
+            optimizer.apply_gradients(zip(gradients, all_opt_vars))         
         # Extract optimized parameters
         # -> transform parameters forward after fitting
         p_opt_vars = all_opt_vars[:self.n_params]
@@ -622,13 +591,23 @@ class BPRF_hier(BPRF):
 
 
 class GPGdists():
-    def __init__(self, gdists, kernel):
+    def __init__(self, gdists, kernel='rbf', **kwargs):
+        self.psd_control = kwargs.get('psd_control', 'euclidean')
+        self.gdists_dtype = kwargs.get('gdists_dtype', tf.float64)
         # dmatrix = n x n matrix of distances (i.e., cortical distance)
-        self.gdists = tf.convert_to_tensor(gdists, dtype=tf.float32, name='gdists')
-        self.gdists = (self.gdists + tf.transpose(self.gdists)) / 2.0
+        self.gdists_raw = tf.convert_to_tensor(gdists, dtype=self.gdists_dtype, name='gdists')
+        self.gdists_raw = (self.gdists_raw + tf.transpose(self.gdists_raw)) / 2.0
+
+        if self.psd_control == 'euclidean':
+            # Create a euclidean embedding to ensure that the matrix
+            # produced will be positive semidefinite
+            X = mds_embedding(tf.cast(self.gdists_raw, dtype=self.gdists_dtype))
+            self.gdists = compute_euclidean_distance_matrix(X)
+        else:
+            self.gdists = self.gdists_raw            
         self.kernel = kernel
         self.nvx = self.gdists.shape[0]
-    
+
     @tf.function
     def return_sigma(self, gp_lengthscale, gp_variance):
         ''' Return the correlation matrix         
@@ -636,50 +615,92 @@ class GPGdists():
         if self.kernel=='RBF':
             # RBF
             # K(x,x') = exp ( - abs(x-x')^2 / (2*sigma^2) )
-            # Note we are not squaring self.gdists, because this has already been done...
             # self.gdists = abs(x-x')^2 
+            gp_variance = tf.cast(gp_variance, dtype=self.gdists_dtype)
+            gp_lengthscale = tf.cast(gp_lengthscale, dtype=self.gdists_dtype)
             cov_matrix = gp_variance * tf.exp(
-                - self.gdists / (2.0*tf.square(gp_lengthscale))
+                - tf.square(self.gdists) / (2.0*tf.square(gp_lengthscale))
             )
             # cov_matrix = (cov_matrix + tf.transpose(cov_matrix)) / 2.0  # Keep symmetry enforcement for now
-            cov_matrix += tf.eye(self.nvx, dtype=tf.float32) * 10 #e-2
+            cov_matrix += tf.eye(self.nvx, dtype=self.gdists_dtype) * 1e-6
 
         return cov_matrix    
 
     @tf.function
-    def return_log_prob(self, parameter, gp_lengthscale, gp_variance):
+    def return_log_prob(self, parameter, gp_lengthscale, gp_variance):    
         cov_matrix = self.return_sigma(gp_lengthscale, gp_variance)
+        chol = tf.linalg.cholesky(tf.cast(cov_matrix, dtype=self.gdists_dtype))                
         gp_prior_dist = tfd.MultivariateNormalTriL(
             loc=tf.zeros(self.nvx, dtype=tf.float32),
-            scale_tril=tf.linalg.cholesky(cov_matrix), 
+            scale_tril=tf.cast(chol, dtype=tf.float32), 
             allow_nan_stats=False,
             )   
         log_prob = gp_prior_dist.log_prob(parameter) # Log-prior contribution for this parameter
         return log_prob
 
-
-def force_symmetric_psd_tf(D_tf):
-    """Forces a square matrix to be symmetric and positive semi-definite using TensorFlow.
-
-    Args:
-        D_tf: A TensorFlow tensor representing the matrix.
-
-    Returns:
-        A TensorFlow tensor that is symmetric and PSD, close to the input D_tf.
+def mds_embedding(distance_matrix, embedding_dim=10, eps=1e-3):
     """
-    # 1. Enforce Symmetry in TensorFlow
-    D_symmetric_tf = (D_tf + tf.transpose(D_tf)) / 2.0
+    Converts a geodesic distance matrix into a Euclidean embedding using classical MDS.
+    
+    Args:
+        distance_matrix: A [n x n] tensor of geodesic distances.
+        embedding_dim: Optional integer specifying the number of dimensions for the embedding.
+            If None, it uses the number of positive eigenvalues.
+        eps: A threshold to consider eigenvalues as positive.
+        
+    Returns:
+        A [n x d] tensor of embedded coordinates.
+    """
+    # Compute squared distances
+    D2 = tf.square(distance_matrix)
+    
+    # Number of points
+    n = tf.shape(distance_matrix)[0]
+    n_float = tf.cast(n, distance_matrix.dtype)
+    
+    # Create centering matrix: J = I - 1/n * 11^T
+    I = tf.eye(n, dtype=distance_matrix.dtype)
+    ones = tf.ones((n, n), dtype=distance_matrix.dtype)
+    J = I - ones / n_float
+    
+    # Compute the Gram matrix: K = -0.5 * J D2 J
+    K = -0.5 * tf.matmul(J, tf.matmul(D2, J))
+    
+    # Compute eigen decomposition (eigenvalues are in ascending order)
+    eigenvalues, eigenvectors = tf.linalg.eigh(K)
+    
+    # Determine embedding dimension if not provided by counting positive eigenvalues
+    if embedding_dim is None:
+        positive_mask = eigenvalues > eps
+        embedding_dim = tf.reduce_sum(tf.cast(positive_mask, tf.int32))
+        print(embedding_dim)
+        # bloop
+    
+    # Select the largest 'embedding_dim' eigenvalues and corresponding eigenvectors
+    eigenvalues = eigenvalues[-embedding_dim:]
+    eigenvectors = eigenvectors[:, -embedding_dim:]
+    
+    # Form the embedding X = eigenvectors * sqrt(eigenvalues)
+    # Ensure non-negative eigenvalues before taking sqrt
+    eigenvalues = tf.maximum(eigenvalues, 0)
+    X = eigenvectors * tf.sqrt(eigenvalues)
+    return X
 
-    # 2. Force PSD using Spectral Projection in TensorFlow
-    # Eigenvalue decomposition using eigh for symmetric matrices
-    evals_tf, evecs_tf = tf.linalg.eigh(D_symmetric_tf)
-
-    # Clip negative eigenvalues to zero using ReLU (or tf.clip_by_value)
-    evals_clipped_tf = tf.nn.relu(evals_tf)
-    # Alternatively using tf.clip_by_value:
-    # evals_clipped_tf = tf.clip_by_value(evals_tf, clip_value_min=0, clip_value_max=tf.float32.max)
-
-    # Reconstruct the PSD matrix
-    D_psd_tf = tf.matmul(evecs_tf, tf.matmul(tf.linalg.diag(evals_clipped_tf), tf.transpose(evecs_tf)))
-
-    return D_psd_tf
+def compute_euclidean_distance_matrix(X, eps=1e-6):
+    """
+    Computes the pairwise Euclidean distance matrix from the embedding X.
+    
+    Args:
+        X: A [n x d] tensor of embedded coordinates.
+        eps: A small number for numerical stability.
+        
+    Returns:
+        A [n x n] tensor of Euclidean distances.
+    """
+    # Expand dims for broadcasting
+    X_expanded1 = tf.expand_dims(X, axis=1)  # shape: (n, 1, d)
+    X_expanded2 = tf.expand_dims(X, axis=0)  # shape: (1, n, d)
+    diff = X_expanded1 - X_expanded2
+    # Compute the Euclidean distances
+    D_euc = tf.sqrt(tf.reduce_sum(tf.square(diff), axis=-1) + eps)
+    return D_euc

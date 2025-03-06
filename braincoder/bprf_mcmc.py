@@ -370,7 +370,7 @@ class BPRF(object):
         self.prep_for_fitting(**kwargs)
         self.n_params = len(self.model_labels)
         paradigm = kwargs.pop('paradigm', self.paradigm)
-        
+        adam_kwargs = kwargs.pop('adam_kwargs', {})
         y = self.data.values
         init_pars = format_parameters(init_pars)
         init_pars = init_pars.values.astype(np.float32) 
@@ -406,11 +406,11 @@ class BPRF(object):
         print('Starting MAP optimization...')
 
         # Optimization setup
-        optimizer = tf.optimizers.Adam()
+        optimizer = tf.optimizers.Adam(**adam_kwargs)
         # -> transform parameters backwards before fit
         opt_vars = [
             tf.Variable(self.p_bijector_list[i].inverse(init_state)) for i,init_state in enumerate(initial_state)]
-    
+
         @tf.function
         def neg_log_posterior_fn():
             return -log_posterior_fn(tf.stack(opt_vars, axis=-1))
@@ -457,6 +457,7 @@ class BPRF(object):
                     data=residuals, scale=parameters[:,self.model_labels['noise_scale']], dof=parameters[:,self.model_labels['noise_dof']]
                 )
                 resid_ln_likelihood = tf.reduce_sum(resid_ln_likelihood, axis=0)       
+
                 # Return vector of length idx (optimize each chain separately)
                 return resid_ln_likelihood
         elif self.noise_method == 'fit_normal':
@@ -593,8 +594,11 @@ class PriorGeneral(PriorBase):
         self.prior_type = prior_type
         self.distribution = distribution
 
+
 # *** SAMPLER ***
 from timeit import default_timer as timer
+import tensorflow as tf
+import tensorflow_probability as tfp
 
 # Copied from .utils.mcmc
 @tf.function
