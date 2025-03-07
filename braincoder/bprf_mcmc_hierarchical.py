@@ -197,15 +197,15 @@ class BPRF_hier(BPRF):
     def _h_bprf_transform_parameters_forward(self, h_parameters):
         # Loop through parameters & bijectors (forward)
         h_out = [
-            self.h_bijector_list[i](h_parameters[i]) for i in range(self.h_n_params)
+            self.h_bijector_list[i](h_parameters[:,i]) for i in range(self.h_n_params)
             ]
         return tf.stack(h_out, axis=-1)
 
     @tf.function
-    def _h_bprf_transform_parameters_forward(self, h_parameters):
-        # Loop through parameters & bijectors (forward)
+    def _h_bprf_transform_parameters_backward(self, h_parameters):
+        # Loop through parameters & bijectors (backward)
         h_out = [
-            self.h_bijector_list[i].inverse(h_parameters[i]) for i in range(self.h_n_params)
+            self.h_bijector_list[i].inverse(h_parameters[:,i]) for i in range(self.h_n_params)
             ]
         return tf.stack(h_out, axis=-1)
     
@@ -436,9 +436,9 @@ class BPRF_hier(BPRF):
         # Now create the log_posterior_fn
         @tf.function
         def log_posterior_fn(parameters, h_parameters):
-            # parameters = self._bprf_transform_parameters_forward(parameters)
+            parameters = self._bprf_transform_parameters_forward(parameters)
             parameters = self.fix_update_fn(parameters)            
-            # h_parameters = self._h_bprf_transform_parameters_forward(h_parameters)
+            h_parameters = self._h_bprf_transform_parameters_forward(h_parameters)
             h_parameters = self.h_fix_update_fn(h_parameters)
             par4pred = parameters[:,:self.n_model_params] # chop out any hyper / noise parameters
             predictions = self.model._predict(

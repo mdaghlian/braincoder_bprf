@@ -31,6 +31,7 @@ class BPRF(object):
 
         # We can also fit noise -> 
         self.noise_method = kwargs.get('noise_method', 'fit_tdist')  # 'fit_normal' 'none'
+        print(self.noise_method)
         assert self.noise_method in ('fit_tdist', 'fit_normal', 'none') 
         if self.noise_method=='fit_tdist':
             # Fit the t-distribution including dof, scale 
