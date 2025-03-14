@@ -2205,7 +2205,7 @@ class ContrastSensitivity(EncodingModel):
         # csf = tf.where(is_left, L_curve, R_curve) # REMOVE THE "WHERE" - makes unstable gradients
         # Smooth transition instead of hard `tf.where`
         alpha = 50.0  # Adjust to control smoothness
-        blend_factor = sigmoid(alpha * (log_SF_seq - log_SFp))
+        blend_factor = tf.math.sigmoid(alpha * (log_SF_seq - log_SFp))
         csf = blend_factor * R_curve + (1 - blend_factor) * L_curve  
               
         return csf 

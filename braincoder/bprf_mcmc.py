@@ -244,6 +244,7 @@ class BPRF(object):
         paradigm = kwargs.pop('paradigm', self.paradigm)
         
         y = self.data.values
+        init_pars = self.sort_parameters(init_pars)
         init_pars = format_parameters(init_pars)
         init_pars = init_pars.values.astype(np.float32) 
 
@@ -373,6 +374,7 @@ class BPRF(object):
         paradigm = kwargs.pop('paradigm', self.paradigm)
         adam_kwargs = kwargs.pop('adam_kwargs', {})
         y = self.data.values
+        init_pars = self.sort_parameters(init_pars)
         init_pars = format_parameters(init_pars)
         init_pars = init_pars.values.astype(np.float32) 
 
@@ -518,7 +520,10 @@ class BPRF(object):
         this_pred = self.get_predictions(parameters)
         this_rsq = get_rsq(this_data, this_pred)[:-1]
         return this_rsq
-
+    def sort_parameters(self, parameters):
+        # Make sure pd.Dataframe parameters are in order
+        parameters = reorder_dataframe_columns(pd_to_fix=parameters, dict_index=self.model_labels)
+        return parameters
     @property
     def data(self):
         return self._data
@@ -659,3 +664,21 @@ def bprf_sample_NUTS(
     stats['elapsed_time'] = duration
 
     return samples, stats
+
+import operator
+
+def reorder_dataframe_columns(pd_to_fix, dict_index):
+    """
+    Reorders the columns of the given DataFrame based on dict_index.
+    
+    Parameters:
+    - pd_to_fix: pandas DataFrame whose columns will be reordered.
+    - dict_index: Dictionary mapping column names to desired index positions.
+    
+    Returns:
+    - DataFrame with columns reordered according to dict_index.
+    """
+    # Sort the dict_index items by their value using operator.itemgetter
+    sorted_columns = [col for col, _ in sorted(dict_index.items(), key=operator.itemgetter(1))]
+    # Return DataFrame with columns ordered based on sorted_columns
+    return pd_to_fix[sorted_columns]

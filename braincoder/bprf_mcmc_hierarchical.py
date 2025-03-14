@@ -66,13 +66,13 @@ class BPRF_hier(BPRF):
             # ... none for now...
             self.h_add_prior(pid=f'{pid}_loc', prior_type='none', **kwargs)
             self.h_add_prior(pid=f'{pid}_scale', prior_type='none', **kwargs)
-        elif h_prior_to_apply=='gp_gdists':
+        elif h_prior_to_apply=='gp_dists':
             # Gaussian process based on geodesic distance
             # -> Gaussian process generates a covariance matrix
             self.h_labels[f'{pid}_gp_lengthscale'] = len(self.h_labels) 
             self.h_labels[f'{pid}_gp_variance'] = len(self.h_labels)
-            self.h_gp_function = GPGdists(
-                gdists=kwargs.pop('gdists'),
+            self.h_gp_function[pid] = GPdists(
+                dists=kwargs.pop('dists'),
                 kernel=kwargs.pop('kernel', 'RBF'),
                 **kwargs
             )
@@ -89,6 +89,33 @@ class BPRF_hier(BPRF):
                 prior_type='none', 
                 **kwargs)
             self.h_add_prior(pid=f'{pid}_gp_variance', prior_type='none', **kwargs)
+        
+        elif h_prior_to_apply=='gp_dists_full':
+            # Gaussian process based on geodesic distance
+            # include mean + nugget
+            # -> Gaussian process generates a covariance matrix
+            self.h_labels[f'{pid}_gp_lengthscale'] = len(self.h_labels) 
+            self.h_labels[f'{pid}_gp_variance'] = len(self.h_labels)
+            self.h_labels[f'{pid}_gp_mean'] = len(self.h_labels)
+            self.h_labels[f'{pid}_gp_nugget'] = len(self.h_labels)
+            self.h_gp_function[pid] = GPdists(
+                dists=kwargs.pop('dists'),
+                kernel=kwargs.pop('kernel', 'RBF'),
+                **kwargs
+            )
+            self.h_add_bijector(pid=f'{pid}_gp_lengthscale', bijector_type=tfb.Softplus())
+            self.h_add_bijector(pid=f'{pid}_gp_variance', bijector_type=tfb.Softplus())
+            self.h_add_bijector(pid=f'{pid}_gp_mean', bijector_type=tfb.Identity())
+            self.h_add_bijector(pid=f'{pid}_gp_nugget', bijector_type=tfb.Softplus())
+
+            # [3] add the priors for the new parameters
+            # ... none for now...
+            for h_added in ['lengthscale', 'variance', 'mean', 'nugget']:
+                self.h_add_prior(
+                    pid=f'{pid}_gp_{h_added}', 
+                    prior_type='none', 
+                    **kwargs)
+
     
     def h_add_bijector(self, pid, bijector_type, **kwargs):
         ''' add transformations to parameters so that they are fit smoothly        
@@ -247,8 +274,10 @@ class BPRF_hier(BPRF):
         paradigm = kwargs.pop('paradigm', self.paradigm)
         
         y = self.data.values
+        init_pars = self.sort_parameters(init_pars)
         init_pars = format_parameters(init_pars)
         init_pars = init_pars.values.astype(np.float32) 
+        h_init_pars = self.sort_h_parameters(h_init_pars)
         h_init_pars = format_parameters(h_init_pars)
         h_init_pars = h_init_pars.values.astype(np.float32)
 
@@ -418,8 +447,10 @@ class BPRF_hier(BPRF):
         paradigm = kwargs.pop('paradigm', self.paradigm)
         
         y = self.data.values
+        init_pars = self.sort_parameters(init_pars)
         init_pars = format_parameters(init_pars)
         init_pars = init_pars.values.astype(np.float32) 
+        h_init_pars = self.sort_h_parameters(h_init_pars)
         h_init_pars = format_parameters(h_init_pars)
         h_init_pars = h_init_pars.values.astype(np.float32)
 
@@ -534,12 +565,22 @@ class BPRF_hier(BPRF):
                         data=p_for_prior, loc=loc_for_prior, scale=scale_for_prior
                     ))
                     
-                elif self.h_prior_to_apply[h]=='gp_gdists':
+                elif self.h_prior_to_apply[h]=='gp_dists':
                     param_values = parameters[:, self.model_labels[h]] # Values of parameter 'h' for vertices being fit
                     gp_lengthscale = h_parameters[:, self.h_labels[f'{h}_gp_lengthscale']] # Current value of GP lengthscale hyperparameter
                     gp_variance = h_parameters[:, self.h_labels[f'{h}_gp_variance']] # Current value of GP variance hyperparameter
-                    p_out += self.h_gp_function.return_log_prob(
+                    p_out += self.h_gp_function[h].return_log_prob(
                         gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, parameter=param_values
+                    )
+                elif self.h_prior_to_apply[h]=='gp_dists_full':
+                    param_values = parameters[:, self.model_labels[h]] # Values of parameter 'h' for vertices being fit
+                    gp_lengthscale  = h_parameters[:, self.h_labels[f'{h}_gp_lengthscale']] # Current value of GP lengthscale hyperparameter
+                    gp_variance     = h_parameters[:, self.h_labels[f'{h}_gp_variance']] # Current value of GP variance hyperparameter
+                    gp_mean         = h_parameters[:, self.h_labels[f'{h}_gp_mean']] # Current value of GP variance hyperparameter
+                    gp_nugget       = h_parameters[:, self.h_labels[f'{h}_gp_mean']] # Current value of GP variance hyperparameter
+                    p_out += self.h_gp_function[h].return_log_prob(
+                        parameter=param_values, gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, 
+                        gp_mean=gp_mean, gp_nugget=gp_nugget
                     )
 
                     
@@ -587,55 +628,80 @@ class BPRF_hier(BPRF):
         
         return residual_ln_likelihood_fn
     
-
-
-
-class GPGdists():
-    def __init__(self, gdists, kernel='rbf', **kwargs):
+    def sort_h_parameters(self, h_parameters):
+        # Make sure pd.Dataframe parameters are in order
+        h_parameters = reorder_dataframe_columns(pd_to_fix=h_parameters, dict_index=self.h_labels)
+        return h_parameters
+    
+class GPdists():
+    def __init__(self, dists, kernel='rbf', **kwargs):
         self.psd_control = kwargs.get('psd_control', 'euclidean')
-        self.gdists_dtype = kwargs.get('gdists_dtype', tf.float64)
+        self.dists_dtype = kwargs.get('dists_dtype', tf.float64)        
+        # Create the matrix + cholesky once... (faster...)
+        self.fixed_params = kwargs.get('fixed_params', False)        
+        self.f_gp_variance = kwargs.get('gp_variance', None)
+        self.f_gp_scale = kwargs.get('gp_lengthscale', None)
+        self.f_gp_mean = kwargs.get('gp_mean', 0.0)
+        self.f_gp_nugget = kwargs.get('gp_nugget', 0.0)
+
         # dmatrix = n x n matrix of distances (i.e., cortical distance)
-        self.gdists_raw = tf.convert_to_tensor(gdists, dtype=self.gdists_dtype, name='gdists')
-        self.gdists_raw = (self.gdists_raw + tf.transpose(self.gdists_raw)) / 2.0
+        self.dists_raw = tf.convert_to_tensor(dists, dtype=self.dists_dtype, name='dists')
+        self.dists_raw = (self.dists_raw + tf.transpose(self.dists_raw)) / 2.0
 
         if self.psd_control == 'euclidean':
             # Create a euclidean embedding to ensure that the matrix
             # produced will be positive semidefinite
-            X = mds_embedding(tf.cast(self.gdists_raw, dtype=self.gdists_dtype))
-            self.gdists = compute_euclidean_distance_matrix(X)
+            X = mds_embedding(tf.cast(self.dists_raw, dtype=self.dists_dtype))
+            self.dists = compute_euclidean_distance_matrix(X)
         else:
-            self.gdists = self.gdists_raw            
+            self.dists = self.dists_raw            
         self.kernel = kernel
-        self.nvx = self.gdists.shape[0]
+        self.nvx = self.dists.shape[0]
+
+        if self.fixed_params:
+            cov_matrix = self.return_sigma(
+                gp_lengthscale=self.f_gp_lengthscale,
+                gp_variance=self.f_gp_variance,
+                gp_nugget=self.f_gp_nugget,
+            )
+            chol = tf.linalg.cholesky(tf.cast(cov_matrix, dtype=self.dists_dtype))                
+            self.gp_prior_dist = tfd.MultivariateNormalTriL(
+                loc=tf.zeros(self.nvx, dtype=tf.float32) + self.f_gp_mean,
+                scale_tril=tf.cast(chol, dtype=tf.float32), 
+                allow_nan_stats=False,
+                )            
 
     @tf.function
-    def return_sigma(self, gp_lengthscale, gp_variance):
+    def return_sigma(self, gp_lengthscale, gp_variance, gp_nugget=0.0):
         ''' Return the correlation matrix         
         '''                
         if self.kernel=='RBF':
             # RBF
             # K(x,x') = exp ( - abs(x-x')^2 / (2*sigma^2) )
-            # self.gdists = abs(x-x')^2 
-            gp_variance = tf.cast(gp_variance, dtype=self.gdists_dtype)
-            gp_lengthscale = tf.cast(gp_lengthscale, dtype=self.gdists_dtype)
+            # self.dists = abs(x-x')^2 
+            gp_variance = tf.cast(gp_variance, dtype=self.dists_dtype)
+            gp_lengthscale = tf.cast(gp_lengthscale, dtype=self.dists_dtype)
             cov_matrix = gp_variance * tf.exp(
-                - tf.square(self.gdists) / (2.0*tf.square(gp_lengthscale))
+                - tf.square(self.dists) / (2.0*tf.square(gp_lengthscale))
             )
             # cov_matrix = (cov_matrix + tf.transpose(cov_matrix)) / 2.0  # Keep symmetry enforcement for now
-            cov_matrix += tf.eye(self.nvx, dtype=self.gdists_dtype) * 1e-6
+            cov_matrix += tf.eye(self.nvx, dtype=self.dists_dtype) * (1e-6 + gp_nugget)
 
         return cov_matrix    
 
     @tf.function
-    def return_log_prob(self, parameter, gp_lengthscale, gp_variance):    
-        cov_matrix = self.return_sigma(gp_lengthscale, gp_variance)
-        chol = tf.linalg.cholesky(tf.cast(cov_matrix, dtype=self.gdists_dtype))                
-        gp_prior_dist = tfd.MultivariateNormalTriL(
-            loc=tf.zeros(self.nvx, dtype=tf.float32),
-            scale_tril=tf.cast(chol, dtype=tf.float32), 
-            allow_nan_stats=False,
-            )   
-        log_prob = gp_prior_dist.log_prob(parameter) # Log-prior contribution for this parameter
+    def return_log_prob(self, parameter, gp_lengthscale, gp_variance, gp_mean=0.0, gp_nugget=0.0):    
+        if self.fixed_params:
+            log_prob = self.gp_prior_dist.log_prob(parameter) # Log-prior contribution for this parameter    
+        else:
+            cov_matrix = self.return_sigma(gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, gp_nugget=gp_nugget)
+            chol = tf.linalg.cholesky(tf.cast(cov_matrix, dtype=self.dists_dtype))                
+            gp_prior_dist = tfd.MultivariateNormalTriL(
+                loc=tf.zeros(self.nvx, dtype=tf.float32) + gp_mean,
+                scale_tril=tf.cast(chol, dtype=tf.float32), 
+                allow_nan_stats=False,
+                )   
+            log_prob = gp_prior_dist.log_prob(parameter) # Log-prior contribution for this parameter
         return log_prob
 
 def mds_embedding(distance_matrix, embedding_dim=10, eps=1e-3):
