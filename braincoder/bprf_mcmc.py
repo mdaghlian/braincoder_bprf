@@ -390,13 +390,21 @@ class BPRF(object):
 
         # Now create the log_posterior_fn
         @tf.function
-        def log_posterior_fn(parameters):
+        def log_posterior_fn(parameters):                        
             parameters = self._bprf_transform_parameters_forward(parameters)
             parameters = self.fix_update_fn(parameters)            
+            
+            nan_mask = tf.math.is_nan(parameters)            
+            if tf.reduce_any(nan_mask):
+                nan_indices = tf.where(nan_mask)
+                tf.print("NaN values found in parameters at indices:", nan_indices)
+                    
             par4pred = parameters[:,:self.n_model_params] # chop out any hyper / noise parameters
             predictions = self.model._predict(
                 paradigm_[tf.newaxis, ...], par4pred[tf.newaxis, ...], None)     # Only include those parameters that are fed to the model
             residuals = y[:, vx_bool] - predictions[0]                                    
+            tf.debugging.assert_all_finite(predictions, "NaN or Inf found in predictions!")                         
+            tf.debugging.assert_all_finite(residuals, "NaN or Inf found in predictions!")                         
             log_likelihood = residual_ln_likelihood_fn(parameters, residuals)
             log_prior = log_prior_fn(parameters) 
             # Return vector of length idx (optimize each chain separately)
@@ -420,7 +428,10 @@ class BPRF(object):
         
         # Optimization loop with tqdm progress bar
         for step in tqdm(tf.range(num_steps), desc="MAP Optimization"):
-            optimizer.minimize(neg_log_posterior_fn, opt_vars)
+            with tf.GradientTape() as tape:
+                loss = neg_log_posterior_fn()
+            gradients = tape.gradient(loss, opt_vars)
+            optimizer.apply_gradients(zip(gradients, opt_vars))             
         # Extract optimized parameters
         # -> transform parameters forward after fitting
         opt_vars = [self.p_bijector_list[i](ov) for i,ov in enumerate(opt_vars)]
@@ -472,7 +483,7 @@ class BPRF(object):
                 resid_ln_likelihood = calculate_log_prob_gauss_loc0(
                     data=residuals, scale=parameters[:,self.model_labels['noise_scale']],
                 )
-                resid_ln_likelihood = tf.reduce_sum(resid_ln_likelihood, axis=0)       
+                resid_ln_likelihood = tf.reduce_sum(resid_ln_likelihood, axis=0)
                 return resid_ln_likelihood              
         
         elif self.noise_method == 'none': 
@@ -486,7 +497,7 @@ class BPRF(object):
                 resid_ln_likelihood = calculate_log_prob_gauss_loc0(
                     data=residuals, scale=residuals_std,
                 )
-                resid_ln_likelihood = tf.reduce_sum(resid_ln_likelihood, axis=0)       
+                resid_ln_likelihood = tf.reduce_sum(resid_ln_likelihood, axis=0)
                 return resid_ln_likelihood     
         
         return residual_ln_likelihood_fn

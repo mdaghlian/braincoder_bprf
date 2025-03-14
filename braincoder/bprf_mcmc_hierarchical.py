@@ -294,12 +294,19 @@ class BPRF_hier(BPRF):
         @tf.function
         def log_posterior_fn(parameters, h_parameters):
             parameters = self.fix_update_fn(parameters)            
+
+            nan_mask = tf.math.is_nan(parameters)            
+            if tf.reduce_any(nan_mask):
+                nan_indices = tf.where(nan_mask)
+                tf.print("2:NaN values found in parameters at indices:", nan_indices)
+
             h_parameters = self.h_fix_update_fn(h_parameters)
             par4pred = parameters[:,:self.n_model_params] # chop out any hyper / noise parameters
             predictions = self.model._predict(
                 paradigm_[tf.newaxis, ...], par4pred[tf.newaxis, ...], None)     # Only include those parameters that are fed to the model
             residuals = y[:, vx_bool] - predictions[0]                        
-            
+            tf.debugging.assert_all_finite(predictions, "NaN or Inf found in predictions!")                         
+            tf.debugging.assert_all_finite(residuals, "NaN or Inf found in predictions!")                                     
             # -> rescale based on std...
             log_likelihood = residual_ln_likelihood_fn(parameters, residuals)
             log_prior = log_prior_fn(parameters, h_parameters)            
@@ -518,7 +525,9 @@ class BPRF_hier(BPRF):
         for step in tqdm(tf.range(num_steps), desc="MAP Optimization"):
             with tf.GradientTape() as tape:
                 loss = neg_log_posterior_fn()
+            print(f"Step {step.numpy()} Loss = {loss.numpy()}")
             gradients = tape.gradient(loss, all_opt_vars)
+            # gradients, _ = tf.clip_by_global_norm(gradients, clip_norm=1.0)
             optimizer.apply_gradients(zip(gradients, all_opt_vars))         
         # Extract optimized parameters
         # -> transform parameters forward after fitting
@@ -640,7 +649,7 @@ class GPdists():
         # Create the matrix + cholesky once... (faster...)
         self.fixed_params = kwargs.get('fixed_params', False)        
         self.f_gp_variance = kwargs.get('gp_variance', None)
-        self.f_gp_scale = kwargs.get('gp_lengthscale', None)
+        self.f_gp_lengthscale = kwargs.get('gp_lengthscale', None)
         self.f_gp_mean = kwargs.get('gp_mean', 0.0)
         self.f_gp_nugget = kwargs.get('gp_nugget', 0.0)
 
@@ -670,7 +679,8 @@ class GPdists():
                 scale_tril=tf.cast(chol, dtype=tf.float32), 
                 allow_nan_stats=False,
                 )            
-
+        else:
+            self.gp_prior_dist = []
     @tf.function
     def return_sigma(self, gp_lengthscale, gp_variance, gp_nugget=0.0):
         ''' Return the correlation matrix         
