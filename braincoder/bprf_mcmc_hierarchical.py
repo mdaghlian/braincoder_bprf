@@ -73,7 +73,6 @@ class BPRF_hier(BPRF):
             self.h_labels[f'{pid}_gp_variance'] = len(self.h_labels)
             self.h_gp_function[pid] = GPdists(
                 dists=kwargs.pop('dists'),
-                kernel=kwargs.pop('kernel', 'RBF'),
                 **kwargs
             )
             # self.h_add_bijector(pid=f'{pid}_gp_lengthscale', bijector_type=tfb.Identity())
@@ -100,7 +99,6 @@ class BPRF_hier(BPRF):
             self.h_labels[f'{pid}_gp_nugget'] = len(self.h_labels)
             self.h_gp_function[pid] = GPdists(
                 dists=kwargs.pop('dists'),
-                kernel=kwargs.pop('kernel', 'RBF'),
                 **kwargs
             )
             self.h_add_bijector(pid=f'{pid}_gp_lengthscale', bijector_type=tfb.Softplus())
@@ -643,7 +641,7 @@ class BPRF_hier(BPRF):
         return h_parameters
     
 class GPdists():
-    def __init__(self, dists, kernel='rbf', **kwargs):
+    def __init__(self, dists, **kwargs):
         self.psd_control = kwargs.get('psd_control', 'euclidean')
         self.dists_dtype = kwargs.get('dists_dtype', tf.float64)        
         # Create the matrix + cholesky once... (faster...)
@@ -664,7 +662,7 @@ class GPdists():
             self.dists = compute_euclidean_distance_matrix(X)
         else:
             self.dists = self.dists_raw            
-        self.kernel = kernel
+        self.kernel = kwargs.get('kernel', 'RBF')
         self.nvx = self.dists.shape[0]
 
         if self.fixed_params:
@@ -685,18 +683,27 @@ class GPdists():
     def return_sigma(self, gp_lengthscale, gp_variance, gp_nugget=0.0):
         ''' Return the correlation matrix         
         '''                
+        gp_nugget = tf.cast(gp_nugget, dtype=self.dists_dtype)
+        gp_variance = tf.cast(gp_variance, dtype=self.dists_dtype)
+        gp_lengthscale = tf.cast(gp_lengthscale, dtype=self.dists_dtype)
         if self.kernel=='RBF':
             # RBF
             # K(x,x') = exp ( - abs(x-x')^2 / (2*sigma^2) )
             # self.dists = abs(x-x')^2 
-            gp_variance = tf.cast(gp_variance, dtype=self.dists_dtype)
-            gp_lengthscale = tf.cast(gp_lengthscale, dtype=self.dists_dtype)
-            cov_matrix = gp_variance * tf.exp(
+            cov_matrix = tf.square(gp_variance) * tf.exp(
                 - tf.square(self.dists) / (2.0*tf.square(gp_lengthscale))
             )
             # cov_matrix = (cov_matrix + tf.transpose(cov_matrix)) / 2.0  # Keep symmetry enforcement for now
+        
+        elif self.kernel=='matern52':
+            frac1 = (np.sqrt(5.0) * self.dists) / gp_lengthscale
+            frac2 = (5.0*tf.square(self.dists)) / (3.0*tf.square(gp_lengthscale))
+            cov_matrix = tf.square(gp_variance) * \
+                (1 + frac1 + frac2) * \
+                tf.exp(-frac1)
             cov_matrix += tf.eye(self.nvx, dtype=self.dists_dtype) * (1e-6 + gp_nugget)
 
+        cov_matrix += tf.eye(self.nvx, dtype=self.dists_dtype) * (1e-6 + gp_nugget)
         return cov_matrix    
 
     @tf.function
