@@ -2218,7 +2218,7 @@ class ContrastSensitivity(EncodingModel):
         crf_exp = parameters[:, :, 4, tf.newaxis]
         amplitude = parameters[:, :, 5, tf.newaxis]        
         # Contrast sensitivity
-        cthresh = 100 / tf.clip_by_value(csf, 1e-8, 1e8) # Prevent extremes
+        cthresh = 100 / tf.clip_by_value(csf, 1e-1, 1e6) # Prevent extremes prev 1e-6...
         ncsf_resp = ((CON_seq ** crf_exp) / (CON_seq ** crf_exp + cthresh ** crf_exp)) * amplitude
         return ncsf_resp    
     
