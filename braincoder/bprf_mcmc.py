@@ -94,6 +94,10 @@ class BPRF(object):
         elif prior_type=='fixed':
             fixed_val = kwargs.get('fixed_val')
             self.p_prior[pid] = PriorFixed(fixed_val)
+        elif prior_type == 'gp_dists':
+            dists = kwargs.pop('dists')
+            fixed_params = kwargs.pop('fixed_params', True)
+            self.p_prior[pid] = GPdists(dists, fixed_params=fixed_params, **kwargs)
         else:
             self.p_prior[pid] = PriorGeneral(prior_type=prior_type, distribution=kwargs.get('distribution'))
     
@@ -158,9 +162,12 @@ class BPRF(object):
         # Ok lets map everything so we can fix some parameters
         # Are there any parameters to fix? 
         if (len(self.fixed_pars) != 0):
-            # Build the indices and update values lists.
+            if not isinstance(self.fixed_pars, pd.DataFrame):
+                self.fixed_pars = pd.DataFrame.from_dict(self.fixed_pars, orient='index').T.astype('float32')        
             indices_list = []
             updates_list = []
+            if len(self.fixed_pars) == 1:
+                self.fixed_pars = pd.concat([self.fixed_pars] * self.n_vx_to_fit, ignore_index=True)
 
             # Create a tensor for row indices: (number of vx being fit)
             rows = tf.range(self.n_vx_to_fit)
@@ -175,8 +182,7 @@ class BPRF(object):
                 indices_list.append(param_indices)
                 
                 # Create the update values: a vector of length n_vx_to_fit with the fixed value.
-                param_updates = tf.fill(tf.shape(rows), fix_value)
-                updates_list.append(param_updates)
+                updates_list.append(tf.convert_to_tensor(fix_value, dtype=tf.float32))
             # Concatenate all the indices and updates from each parameter fix.
             self.fix_update_index = tf.concat(indices_list, axis=0)  # shape: [num_updates, 2]
             self.fix_update_value = tf.concat(updates_list, axis=0)    # shape: [num_updates]            
@@ -201,13 +207,13 @@ class BPRF(object):
         self.priors_to_loop = [
             p for p,t in self.p_prior_type.items() if t not in ('fixed', 'none')
         ]
-    
+        self.model_labels_inv = {v:k for k,v in self.model_labels.items()}
+        
     @tf.function
     def _bprf_transform_parameters_forward(self, parameters):
         # Loop through parameters & bijectors (forward)
-
         p_out = [
-            self.p_bijector_list[i](parameters[:,i]) for i in range(self.n_params)
+            self.p_bijector_list[i].forward(parameters[:,i]) for i in range(self.n_params)
             ]
         return tf.stack(p_out, axis=-1)
     @tf.function
@@ -235,8 +241,6 @@ class BPRF(object):
         vx_bool[idx] = True
         self.n_vx_to_fit = len(idx)
         self.fixed_pars = fixed_pars
-        if not isinstance(self.fixed_pars, pd.DataFrame):
-            self.fixed_pars = pd.DataFrame.from_dict(self.fixed_pars, orient='index').T.astype('float32')        
         self.prep_for_fitting(**kwargs)
         self.n_params = len(self.model_labels)
         step_size = kwargs.pop('step_size', 0.0001) # rest of the kwargs go to "hmc_sample"                
@@ -315,7 +319,7 @@ class BPRF(object):
             for i,p in enumerate(self.model_labels):
                 estimated_p_dict[p] = all_samples[:,ivx_loc,i]
             for p,v in self.fixed_pars.items():
-                estimated_p_dict[p] = estimated_p_dict[p]*0 + v.values
+                estimated_p_dict[p] = estimated_p_dict[p]*0 + v[ivx_fit]
             self.mcmc_sampler[ivx_fit] = pd.DataFrame(estimated_p_dict)
         self.mcmc_stats = stats
 
@@ -367,8 +371,6 @@ class BPRF(object):
         vx_bool[idx] = True
         self.n_vx_to_fit = len(idx)
         self.fixed_pars = fixed_pars
-        if not isinstance(self.fixed_pars, pd.DataFrame):
-            self.fixed_pars = pd.DataFrame.from_dict(self.fixed_pars, orient='index').T.astype('float32')
         self.prep_for_fitting(**kwargs)
         self.n_params = len(self.model_labels)
         paradigm = kwargs.pop('paradigm', self.paradigm)
@@ -393,18 +395,26 @@ class BPRF(object):
         def log_posterior_fn(parameters):                        
             parameters = self._bprf_transform_parameters_forward(parameters)
             parameters = self.fix_update_fn(parameters)            
-            
-            nan_mask = tf.math.is_nan(parameters)            
-            if tf.reduce_any(nan_mask):
-                nan_indices = tf.where(nan_mask)
-                tf.print("NaN values found in parameters at indices:", nan_indices)
-                    
+
+            # *** NAN DEBUGGING ***            
+            # nan_mask = tf.math.is_nan(parameters)            
+            # if tf.reduce_any(nan_mask):
+            #     nan_indices = tf.where(nan_mask)
+            #     tf.print("NaN values found in parameters at indices:", nan_indices)
+
             par4pred = parameters[:,:self.n_model_params] # chop out any hyper / noise parameters
             predictions = self.model._predict(
                 paradigm_[tf.newaxis, ...], par4pred[tf.newaxis, ...], None)     # Only include those parameters that are fed to the model
             residuals = y[:, vx_bool] - predictions[0]                                    
-            tf.debugging.assert_all_finite(predictions, "NaN or Inf found in predictions!")                         
-            tf.debugging.assert_all_finite(residuals, "NaN or Inf found in predictions!")                         
+            
+            # *** NAN DEBUGGING ***
+            # nan_mask = tf.math.is_nan(predictions)   
+            # if tf.reduce_any(nan_mask):
+            #     nan_indices = tf.where(nan_mask)
+            #     tf.print("NaN values found in parameters at indices:", nan_indices[0])            
+            # tf.debugging.assert_all_finite(predictions, f"NaN or Inf found in predictions!")                         
+            # tf.debugging.assert_all_finite(residuals, f"NaN or Inf found in residuals!")                         
+
             log_likelihood = residual_ln_likelihood_fn(parameters, residuals)
             log_prior = log_prior_fn(parameters) 
             # Return vector of length idx (optimize each chain separately)
@@ -417,7 +427,6 @@ class BPRF(object):
         print('Starting MAP optimization...')
 
         # Optimization setup
-        optimizer = tf.optimizers.Adam(**adam_kwargs)
         # -> transform parameters backwards before fit
         opt_vars = [
             tf.Variable(self.p_bijector_list[i].inverse(init_state)) for i,init_state in enumerate(initial_state)]
@@ -426,12 +435,32 @@ class BPRF(object):
         def neg_log_posterior_fn():
             return -log_posterior_fn(tf.stack(opt_vars, axis=-1))
         
+        # **** quick test **** 
+        initial_ll = neg_log_posterior_fn()
+        print(f'initial neg ll={initial_ll}')                    
+        # Check the gradient with respect to each parameter
+        with tf.GradientTape() as tape:
+            loss = neg_log_posterior_fn()
+        gradients = tape.gradient(loss, opt_vars)
+        print('Using tape.gradient to check gradients w/respect to each parameter')
+        for i, grad in enumerate(gradients):
+            print(f' Gradient for {self.model_labels_inv[i]}: {grad.numpy()}')
+        # **** **** **** **** 
+        optimizer = tf.optimizers.Adam(**adam_kwargs)
         # Optimization loop with tqdm progress bar
-        for step in tqdm(tf.range(num_steps), desc="MAP Optimization"):
+        progress_bar = tqdm(tf.range(num_steps), desc="MAP Optimization")
+        for step in progress_bar:
             with tf.GradientTape() as tape:
                 loss = neg_log_posterior_fn()
             gradients = tape.gradient(loss, opt_vars)
-            optimizer.apply_gradients(zip(gradients, opt_vars))             
+            optimizer.apply_gradients(zip(gradients, opt_vars))
+            progress_bar.set_description(f"MAP Optimization, Mean loss: {loss.numpy().mean():.4f}")        
+
+        # for step in tqdm(tf.range(num_steps), desc="MAP Optimization"):
+        #     with tf.GradientTape() as tape:
+        #         loss = neg_log_posterior_fn()
+        #     gradients = tape.gradient(loss, opt_vars)
+        #     optimizer.apply_gradients(zip(gradients, opt_vars))             
         # Extract optimized parameters
         # -> transform parameters forward after fitting
         opt_vars = [self.p_bijector_list[i](ov) for i,ov in enumerate(opt_vars)]
@@ -443,7 +472,7 @@ class BPRF(object):
             for i,p in enumerate(self.model_labels):
                 estimated_p_dict[p] = optimized_samples[i][ivx_loc]
             for p,v in self.fixed_pars.items():
-                estimated_p_dict[p] = estimated_p_dict[p]*0 + v.values
+                estimated_p_dict[p] = estimated_p_dict[p]*0 + v[ivx_fit]
             
             df = pd.DataFrame(estimated_p_dict, index=[ivx_fit]) # use map_sampler instead of mcmc_sampler
             df_list.append(df)
@@ -693,3 +722,324 @@ def reorder_dataframe_columns(pd_to_fix, dict_index):
     sorted_columns = [col for col, _ in sorted(dict_index.items(), key=operator.itemgetter(1))]
     # Return DataFrame with columns ordered based on sorted_columns
     return pd_to_fix[sorted_columns]
+
+
+
+# *************
+
+    
+class GPdists():
+    def __init__(self, dists, **kwargs):
+        """
+        Initialize the GPdists class.
+
+        Args:
+            dists (array-like): The input distance matrix.
+            **kwargs: Optional parameters for controlling behavior, such as:
+                - psd_control: Method for ensuring positive semidefiniteness.
+                - dists_dtype: Data type for tensor conversion.
+                - fixed_params: If True, precomputes covariance for efficiency.
+                - gp_variance, gp_lengthscale, gp_mean, gp_nugget: GP hyperparameters.
+                - kernel: Choice of covariance function (default: 'RBF').
+
+        - Avoids unnecessary operations when `fixed_params` is `True`
+        """
+
+        # Using sparse method?         
+        self.sparse = kwargs.get('sparse', False)
+        self.sparse_method = kwargs.get('sparse_method', 'threshold') # If using sparse method, which one? (threshold, knn)
+        self.sparse_value  = kwargs.get('sparse_value', 0.1) # If using sparse method, what value to use?
+        self.sparse_normalization = kwargs.get('sparse_normalization', False) # If using sparse method, include normalization?
+        # Which kernel (covariance function) to use?
+        self.kernel = kwargs.get('kernel', 'RBF')
+
+        # If fixing the hyperparameters, precompute the covariance matrix
+        # -> using these values
+        self.fixed_params = kwargs.get('fixed_params', False)        
+        self.f_gp_variance = kwargs.get('gp_variance', None)
+        self.f_gp_lengthscale = kwargs.get('gp_lengthscale', None)
+        self.f_gp_mean = kwargs.get('gp_mean', 0.0)
+        self.f_gp_nugget = kwargs.get('gp_nugget', 0.0)
+
+
+        # **** CREATE THE DISTANCE MATRIX ****        
+        # Embedding in euclidean space? (to ensure positive semi definite) 
+        self.psd_control    = kwargs.get('psd_control', 'euclidean')   # 'euclidean' or 'none'
+        self.embedding_dim  = kwargs.get('embedding_dim', 10)        # Dimensionality of the embedding space 
+        self.dists_dtype    = kwargs.get('dists_dtype', tf.float64)    # Data type for distance matrix (tf.float64, to make sure cholesky works)
+        # Convert distance matrix **only once** to TensorFlow tensor
+        self.dists_raw = tf.convert_to_tensor(dists, dtype=self.dists_dtype)
+        # Ensure symmetry (important for Euclidean distance calculations)
+        self.dists_raw = (self.dists_raw + tf.transpose(self.dists_raw)) / 2.0  
+
+        if self.psd_control == 'euclidean':
+            # Ensures the matrix is positive semidefinite by embedding in Euclidean space
+            print('Embedding in Euclidean space...')
+            X = mds_embedding(self.dists_raw,self.embedding_dim )  
+            self.dists = compute_euclidean_distance_matrix(X)
+        else:
+            self.dists = self.dists_raw  
+        self.n_vx = self.dists.shape[0]
+
+
+        # **** CREATE THE COVARIANCE MATRIX ****
+        if self.fixed_params:
+            print('Precomputing covariance matrix...')
+            # Precompute the covariance matrix and Cholesky decomposition for efficiency
+            cov_matrix = self.return_sigma(self.f_gp_lengthscale, self.f_gp_variance, self.f_gp_nugget)
+            print('Precomputing Cholesky decomposition...')
+            chol = tf.linalg.cholesky(tf.cast(cov_matrix, dtype=self.dists_dtype))            
+            # Define the prior Gaussian process distribution using Cholesky decomposition
+            self.gp_prior_dist = tfd.MultivariateNormalTriL(
+                loc=tf.fill([self.n_vx], self.f_gp_mean),
+                scale_tril=tf.cast(chol, dtype=tf.float32),
+                allow_nan_stats=False,
+            )            
+        else:
+            self.gp_prior_dist = []
+        # Set the log_prob function
+        self.set_log_prob()
+
+    @tf.function
+    def prior(self, param):
+        return self.gp_prior_dist.log_prob(param)/param.shape[0]
+    
+    @tf.function
+    def return_sigma(self, gp_lengthscale, gp_variance, gp_nugget=0.0):
+        """
+        Computes the covariance matrix using the chosen kernel.
+
+        Args:
+            gp_lengthscale (float): Lengthscale parameter.
+            gp_variance (float): Variance parameter.
+            gp_nugget (float): Nugget (noise) term.
+
+        Returns:
+            tf.Tensor: Covariance matrix.        
+        """
+        gp_nugget = tf.cast(gp_nugget, dtype=self.dists_dtype)
+        gp_variance = tf.cast(gp_variance, dtype=self.dists_dtype)
+        gp_lengthscale = tf.cast(gp_lengthscale, dtype=self.dists_dtype)
+
+        if self.kernel == 'RBF':
+            # Radial Basis Function (RBF) kernel
+            cov_matrix = tf.square(gp_variance) * tf.exp(
+                -tf.square(self.dists) / (2.0 * tf.square(gp_lengthscale))
+            )
+        elif self.kernel == 'matern52':
+            # Matérn 5/2 kernel (more flexible than RBF)
+            frac1 = (tf.sqrt(5.0) * self.dists) / gp_lengthscale
+            frac2 = (5.0 * tf.square(self.dists)) / (3.0 * tf.square(gp_lengthscale))
+            cov_matrix = tf.square(gp_variance) * (1 + frac1 + frac2) * tf.exp(-frac1)
+
+        # Add nugget term to ensure numerical stability
+        return cov_matrix + tf.eye(self.n_vx, dtype=self.dists_dtype) * (1e-6 + gp_nugget)
+
+    def return_sparse_precision_matrix(self, cov_matrix):
+        # 2. Sparsify the Kernel Matrix to get Precision Matrix (Lambda)
+        if self.sparse_method == 'threshold':
+            threshold = self.sparse_value
+            sparse_indices_list = []
+            sparse_values_list = []
+            for i in range(self.n_vx):
+                for j in range(self.n_vx):
+                    if cov_matrix[i, j] > threshold:
+                        sparse_indices_list.append([i, j])
+                        sparse_values_list.append(cov_matrix[i, j].numpy())
+            self.precision_matrix_sparse = tf.sparse.SparseTensor(
+                indices=tf.constant(sparse_indices_list, dtype=tf.int64),
+                values=tf.constant(sparse_values_list, dtype=tf.float32),
+                dense_shape=cov_matrix.shape
+            )
+
+        if self.sparse_method ==  'knn':
+            knn = int(self.sparse_value)  # Ensure knn is integer
+            if knn >= self.n_vx:
+                raise ValueError("k-NN value must be less than the number of vertices for sparsification.")
+
+            sparse_indices_list = []
+            sparse_values_list = []
+
+            for i in range(self.n_vx):
+                row_kernel_values = cov_matrix[i, :]
+                # Get top k indices (highest similarity values)
+                _, top_indices = tf.nn.top_k(row_kernel_values, k=knn)
+                for j_index in top_indices.numpy():
+                    sparse_indices_list.append([i, j_index])
+                    sparse_values_list.append(cov_matrix[i, j_index].numpy())
+
+            sparse_indices_knn = tf.constant(sparse_indices_list, dtype=tf.int64)
+            sparse_values_knn = tf.constant(sparse_values_list, dtype=tf.float32)
+
+            # Ensure symmetry for KNN by adding reverse pairs if not already present.
+            symmetric_indices_list = []
+            symmetric_values_list = []
+            added_pairs = set()
+
+            for idx, indices in enumerate(sparse_indices_knn.numpy()):
+                i, j = indices
+                value = sparse_values_knn[idx].numpy()
+                if (i, j) not in added_pairs:
+                    symmetric_indices_list.append([i, j])
+                    symmetric_values_list.append(value)
+                    added_pairs.add((i, j))
+                if i != j and (j, i) not in added_pairs:
+                    symmetric_indices_list.append([j, i])
+                    symmetric_values_list.append(value)
+                    added_pairs.add((j, i))
+
+            self.precision_matrix_sparse = tf.sparse.SparseTensor(
+                indices=tf.constant(symmetric_indices_list, dtype=tf.int64),
+                values=tf.constant(symmetric_values_list, dtype=tf.float32),
+                dense_shape=cov_matrix.shape
+            )
+        else:
+            raise ValueError("Invalid sparsification_method. Choose 'threshold' or 'knn'.")
+
+        # Make sure it is symmetric (helps ensure correct logdet computation later).
+        self.precision_matrix_sparse = tf.sparse.reorder(tf.sparse.SparseTensor(
+            indices=self.precision_matrix_sparse.indices,
+            values=self.precision_matrix_sparse.values,
+            dense_shape=self.precision_matrix_sparse.dense_shape
+        ))
+
+
+    def set_log_prob(self):
+        if self.fixed_params:
+            if self.sparse:
+                self.return_log_prob = self._return_log_prob_fixed_sparse
+            else:
+                self.return_log_prob = self._return_log_prob_fixed_dense
+        else:
+            if self.sparse:
+                self.return_log_prob = self._return_log_prob_unfixed_sparse
+            else:
+                self.return_log_prob = self._return_log_prob_unfixed_dense
+    
+    @tf.function
+    def _return_log_prob_fixed_dense(self, parameter, gp_lengthscale, gp_variance, gp_mean=0.0, gp_nugget=0.0):    
+        # solve the no gradient problem...
+        return self.gp_prior_dist.log_prob(parameter) + gp_lengthscale*0.0 + gp_variance*0.0 + gp_mean*0.0 + gp_nugget*0.0 
+
+    
+    @tf.function
+    def _return_log_prob_unfixed_dense(self, parameter, gp_lengthscale, gp_variance, gp_mean=0.0, gp_nugget=0.0):
+        """"""
+        cov_matrix = self.return_sigma(gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, gp_nugget=gp_nugget)
+        chol = tf.linalg.cholesky(tf.cast(cov_matrix, dtype=self.dists_dtype))                
+        gp_prior_dist = tfd.MultivariateNormalTriL(
+            loc=tf.zeros(self.n_vx, dtype=tf.float32) + gp_mean,
+            scale_tril=tf.cast(chol, dtype=tf.float32), 
+            allow_nan_stats=False,
+            )   
+        return gp_prior_dist.log_prob(parameter) # Log-prior contribution for this parameter
+
+    @tf.function
+    def _return_log_prob_fixed_sparse(self, parameter, gp_lengthscale, gp_variance, gp_mean=0.0, gp_nugget=0.0):
+        """"""
+        
+        return 
+    
+    @tf.function
+    def _return_log_prob_unfixed_sparse(self, parameter, gp_lengthscale, gp_variance, gp_mean=0.0, gp_nugget=0.0):
+        """"""        
+        raise NotImplementedError('Sparse method not yet implemented.')
+
+# ****************************
+# **************************** 
+@tf.function
+def mds_embedding(distance_matrix, embedding_dim=10, eps=1e-3):
+    """
+    Converts a geodesic distance matrix into a Euclidean embedding using classical MDS.
+    
+    This transformation is necessary because I want to use geodesic distances to generate 
+    covariance matrices, which must be positive definite. Directly using geodesic distances 
+    may not yield a positive definite covariance matrix. By applying classical multidimensional 
+    scaling (MDS), we recover a Gram matrix (an inner product matrix) from the squared distances 
+    that is positive semi-definite. Then, by selecting only the positive eigenvalues and 
+    corresponding eigenvectors, we obtain an embedding whose reconstructed covariance matrix 
+    (X X^T) is guaranteed to be positive semi-definite, thus suitable for use as a covariance matrix.
+    
+    Args:
+        distance_matrix: A [n x n] tensor of geodesic distances.
+        embedding_dim: Optional integer specifying the number of dimensions for the embedding.
+            If None, it uses the number of positive eigenvalues.
+        eps: A threshold to consider eigenvalues as positive.
+        
+    Returns:
+        A [n x d] tensor of embedded coordinates.
+    """
+    # 1. Compute squared distances:
+    #    Classical MDS begins with the squared distance matrix D^2, where each element is (d_ij)^2.
+    D2 = tf.square(distance_matrix)
+    
+    # 2. Determine the number of points:
+    #    'n' is the number of data points. We also cast it to the same type as distance_matrix.
+    n = tf.shape(distance_matrix)[0]
+    n_float = tf.cast(n, distance_matrix.dtype)
+    
+    # 3. Create the centering matrix J:
+    #    J = I - (1/n) * 11^T, where I is the identity matrix and 1 is a vector of ones.
+    #    This matrix centers the data by subtracting the mean from each coordinate.
+    I = tf.eye(n, dtype=distance_matrix.dtype)
+    ones = tf.ones((n, n), dtype=distance_matrix.dtype)
+    J = I - ones / n_float
+    
+    # 4. Compute the Gram matrix (inner product matrix):
+    #    K = -0.5 * J * D2 * J. This operation is known as double centering, which recovers the inner products
+    #    from the squared distances. The Gram matrix can be written as K = X X^T, where X are the embedded coordinates.
+    K = -0.5 * tf.matmul(J, tf.matmul(D2, J))
+    
+    # 5. Compute the eigen decomposition of K:
+    #    Since K is symmetric, we can decompose it into its eigenvalues and eigenvectors.
+    #    tf.linalg.eigh returns eigenvalues in ascending order.
+    eigenvalues, eigenvectors = tf.linalg.eigh(K)
+    
+    # 6. Determine the embedding dimension if not provided:
+    #    If embedding_dim is None, count how many eigenvalues are greater than the threshold eps.
+    #    Only positive eigenvalues indicate meaningful dimensions; near-zero or negative values may be due to numerical errors.
+    if embedding_dim is None:
+        positive_mask = eigenvalues > eps
+        embedding_dim = tf.reduce_sum(tf.cast(positive_mask, tf.int32))
+    
+    # 7. Select the largest 'embedding_dim' eigenvalues and corresponding eigenvectors:
+    #    Since the eigenvalues are in ascending order, we slice from the end to get the largest ones.
+    eigenvalues = eigenvalues[-embedding_dim:]
+    eigenvectors = eigenvectors[:, -embedding_dim:]
+    
+    # 8. Form the final embedding:
+    #    Multiply the eigenvectors by the square root of the eigenvalues.
+    #    This is derived from the factorization K = UΛU^T, so setting X = U * sqrt(Λ) gives X X^T = K.
+    #    Use tf.maximum to ensure numerical stability by avoiding the square root of negative numbers.
+    eigenvalues = tf.maximum(eigenvalues, 0)
+    X = eigenvectors * tf.sqrt(eigenvalues)
+    return X
+
+
+@tf.function
+def compute_euclidean_distance_matrix(X, eps=1e-6):
+    """
+    Computes the pairwise Euclidean distance matrix from the embedding X.
+    
+    Args:
+        X: A [n x d] tensor of embedded coordinates.
+        eps: A small number for numerical stability.
+        
+    Returns:
+        A [n x n] tensor of Euclidean distances.
+    """
+    # 1. Expand dimensions of X for broadcasting:
+    #    X_expanded1 will have shape (n, 1, d) and X_expanded2 will have shape (1, n, d).
+    #    This setup allows us to compute the difference between every pair of points.
+    X_expanded1 = tf.expand_dims(X, axis=1)
+    X_expanded2 = tf.expand_dims(X, axis=0)
+    
+    # 2. Compute pairwise differences:
+    #    For each pair of points i and j, this computes (X_i - X_j).
+    diff = X_expanded1 - X_expanded2
+    
+    # 3. Compute the Euclidean distance matrix:
+    #    For each pair (i, j), calculate the square root of the sum of squared differences across dimensions.
+    #    Adding eps inside the square root ensures numerical stability (avoiding sqrt(0) issues).
+    D_euc = tf.sqrt(tf.reduce_sum(tf.square(diff), axis=-1) + eps)
+    return D_euc

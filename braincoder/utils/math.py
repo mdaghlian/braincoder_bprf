@@ -83,6 +83,7 @@ def calculate_log_prob_gauss_loc0(data, scale):
     # scale = tf.maximum(scale, 1e-10)  # Avoid division by zero
     # To have mu; do data-mu
     log_pdf = -0.5 * (tf.math.log(2 * np.pi) + tf.math.log(scale**2) + (data / scale)**2)
+    # tf.debugging.assert_all_finite(log_pdf, f'NaN or Inf found with calculate_log_prob_gauss_loc0')    
     return log_pdf
 
 @tf.function
@@ -97,6 +98,7 @@ def calculate_log_prob_gauss(data, loc, scale):
     # scale = tf.maximum(scale, 1e-10)  # Avoid division by zero
     # To have mu; do data-mu
     log_pdf = -0.5 * (tf.math.log(2 * np.pi) + tf.math.log(scale**2) + ((data - loc) / scale)**2)
+    # tf.debugging.assert_all_finite(log_pdf, f'NaN or Inf found with calculate_log_prob_gauss')
     return log_pdf
 
 
@@ -108,8 +110,6 @@ def calculate_log_prob_t(data, scale, dof):
     scale   shape n x 1
     dof     shape n x 1    
     '''
-    # scale = tf.maximum(scale, 1e-8)
-    # dof = tf.maximum(dof, 1e-8)
     log_pdf = (
         tf.math.lgamma((dof + 1) / 2)
         - tf.math.lgamma(dof / 2)
@@ -117,4 +117,5 @@ def calculate_log_prob_t(data, scale, dof):
         - tf.math.log(scale)
         - (dof + 1) / 2 * tf.math.log(1 + (data / scale) ** 2 / dof)
     )
+    # tf.debugging.assert_all_finite(log_pdf, f'NaN or Inf found with calculate_log_prob_t')
     return log_pdf
