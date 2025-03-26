@@ -6,6 +6,7 @@ import tensorflow_probability as tfp
 from tensorflow_probability import distributions as tfd
 from tensorflow_probability import bijectors as tfb
 from tqdm import tqdm
+import math
 
 import copy
 class BPRF(object):
@@ -162,6 +163,10 @@ class BPRF(object):
         # Ok lets map everything so we can fix some parameters
         # Are there any parameters to fix? 
         if (len(self.fixed_pars) != 0):
+            k_check = list(self.fixed_pars.keys())
+            for k in k_check:
+                if k not in self.model_labels.keys():
+                    self.fixed_pars.pop(k)                        
             if not isinstance(self.fixed_pars, pd.DataFrame):
                 self.fixed_pars = pd.DataFrame.from_dict(self.fixed_pars, orient='index').T.astype('float32')        
             indices_list = []
@@ -208,7 +213,7 @@ class BPRF(object):
             p for p,t in self.p_prior_type.items() if t not in ('fixed', 'none')
         ]
         self.model_labels_inv = {v:k for k,v in self.model_labels.items()}
-        
+
     @tf.function
     def _bprf_transform_parameters_forward(self, parameters):
         # Loop through parameters & bijectors (forward)
@@ -249,7 +254,7 @@ class BPRF(object):
         
         y = self.data.values
         init_pars = self.sort_parameters(init_pars)
-        init_pars = format_parameters(init_pars)
+        # init_pars = format_parameters(init_pars)
         init_pars = init_pars.values.astype(np.float32) 
 
         # Clean the paradigm 
@@ -377,7 +382,7 @@ class BPRF(object):
         adam_kwargs = kwargs.pop('adam_kwargs', {})
         y = self.data.values
         init_pars = self.sort_parameters(init_pars)
-        init_pars = format_parameters(init_pars)
+        # init_pars = format_parameters(init_pars)
         init_pars = init_pars.values.astype(np.float32) 
 
         # Clean the paradigm 
@@ -564,6 +569,7 @@ class BPRF(object):
         # Make sure pd.Dataframe parameters are in order
         parameters = reorder_dataframe_columns(pd_to_fix=parameters, dict_index=self.model_labels)
         return parameters
+        
     @property
     def data(self):
         return self._data
@@ -727,11 +733,13 @@ def reorder_dataframe_columns(pd_to_fix, dict_index):
 
 # *************
 
-    
 class GPdists():
     def __init__(self, dists, **kwargs):
         """
         Initialize the GPdists class.
+        Objective: take geodesic distances (dists) per vertex on the cortex
+        Use this to construct a covariance matrix 
+        which we can use as a prior for smoothness during encoding model fitting
 
         Args:
             dists (array-like): The input distance matrix.
@@ -741,69 +749,57 @@ class GPdists():
                 - fixed_params: If True, precomputes covariance for efficiency.
                 - gp_variance, gp_lengthscale, gp_mean, gp_nugget: GP hyperparameters.
                 - kernel: Choice of covariance function (default: 'RBF').
-
-        - Avoids unnecessary operations when `fixed_params` is `True`
         """
-
-        # Using sparse method?         
-        self.sparse = kwargs.get('sparse', False)
-        self.sparse_method = kwargs.get('sparse_method', 'threshold') # If using sparse method, which one? (threshold, knn)
-        self.sparse_value  = kwargs.get('sparse_value', 0.1) # If using sparse method, what value to use?
-        self.sparse_normalization = kwargs.get('sparse_normalization', False) # If using sparse method, include normalization?
-        # Which kernel (covariance function) to use?
+        self.log_prob_method = kwargs.get('log_prob_method', 'tf')  # 'tf' or 'precision'
+        self.full_norm = kwargs.get('full_norm', False) # Use full normalization in precision method
         self.kernel = kwargs.get('kernel', 'RBF')
+        self.fixed_params = kwargs.get('fixed_params', False)
 
-        # If fixing the hyperparameters, precompute the covariance matrix
-        # -> using these values
-        self.fixed_params = kwargs.get('fixed_params', False)        
+        # Fixed GP hyperparameters (when fixed_params is True)
         self.f_gp_variance = kwargs.get('gp_variance', None)
         self.f_gp_lengthscale = kwargs.get('gp_lengthscale', None)
         self.f_gp_mean = kwargs.get('gp_mean', 0.0)
         self.f_gp_nugget = kwargs.get('gp_nugget', 0.0)
 
-
-        # **** CREATE THE DISTANCE MATRIX ****        
-        # Embedding in euclidean space? (to ensure positive semi definite) 
-        self.psd_control    = kwargs.get('psd_control', 'euclidean')   # 'euclidean' or 'none'
-        self.embedding_dim  = kwargs.get('embedding_dim', 10)        # Dimensionality of the embedding space 
-        self.dists_dtype    = kwargs.get('dists_dtype', tf.float64)    # Data type for distance matrix (tf.float64, to make sure cholesky works)
-        # Convert distance matrix **only once** to TensorFlow tensor
+        # Setup distance matrix and positive semidefinite control
+        self.psd_control   = kwargs.get('psd_control', 'euclidean')  # 'euclidean' or 'none'
+        self.embedding_dim = kwargs.get('embedding_dim', 10)
+        self.dists_dtype   = kwargs.get('dists_dtype', tf.float64)
         self.dists_raw = tf.convert_to_tensor(dists, dtype=self.dists_dtype)
-        # Ensure symmetry (important for Euclidean distance calculations)
-        self.dists_raw = (self.dists_raw + tf.transpose(self.dists_raw)) / 2.0  
+        self.dists_raw = (self.dists_raw + tf.transpose(self.dists_raw)) / 2.0
 
         if self.psd_control == 'euclidean':
-            # Ensures the matrix is positive semidefinite by embedding in Euclidean space
             print('Embedding in Euclidean space...')
-            X = mds_embedding(self.dists_raw,self.embedding_dim )  
+            X = mds_embedding(self.dists_raw, self.embedding_dim)
             self.dists = compute_euclidean_distance_matrix(X)
         else:
-            self.dists = self.dists_raw  
+            self.dists = self.dists_raw
+
         self.n_vx = self.dists.shape[0]
 
-
-        # **** CREATE THE COVARIANCE MATRIX ****
+        # Precompute covariance related matrices if parameters are fixed
         if self.fixed_params:
             print('Precomputing covariance matrix...')
-            # Precompute the covariance matrix and Cholesky decomposition for efficiency
-            cov_matrix = self.return_sigma(self.f_gp_lengthscale, self.f_gp_variance, self.f_gp_nugget)
+            self.cov_matrix = self.return_sigma(
+                gp_lengthscale=self.f_gp_lengthscale,
+                gp_variance=self.f_gp_variance,
+                gp_nugget=self.f_gp_nugget,
+            )
+            # Compute precision matrix once
+            self.prec_matrix = tf.cast(tf.linalg.inv(self.cov_matrix), dtype=tf.float32)
             print('Precomputing Cholesky decomposition...')
-            chol = tf.linalg.cholesky(tf.cast(cov_matrix, dtype=self.dists_dtype))            
-            # Define the prior Gaussian process distribution using Cholesky decomposition
+            self.chol = tf.linalg.cholesky(tf.cast(self.cov_matrix, dtype=self.dists_dtype))
+            # Create the fixed prior distribution
             self.gp_prior_dist = tfd.MultivariateNormalTriL(
-                loc=tf.fill([self.n_vx], self.f_gp_mean),
-                scale_tril=tf.cast(chol, dtype=tf.float32),
+                loc=tf.cast(tf.fill([self.n_vx], self.f_gp_mean), dtype=tf.float32),
+                scale_tril=tf.cast(self.chol, dtype=tf.float32),
                 allow_nan_stats=False,
-            )            
+            )
         else:
-            self.gp_prior_dist = []
-        # Set the log_prob function
+            self.gp_prior_dist = None
+
         self.set_log_prob()
 
-    @tf.function
-    def prior(self, param):
-        return self.gp_prior_dist.log_prob(param)/param.shape[0]
-    
     @tf.function
     def return_sigma(self, gp_lengthscale, gp_variance, gp_nugget=0.0):
         """
@@ -815,135 +811,105 @@ class GPdists():
             gp_nugget (float): Nugget (noise) term.
 
         Returns:
-            tf.Tensor: Covariance matrix.        
+            tf.Tensor: Covariance matrix.
         """
         gp_nugget = tf.cast(gp_nugget, dtype=self.dists_dtype)
         gp_variance = tf.cast(gp_variance, dtype=self.dists_dtype)
         gp_lengthscale = tf.cast(gp_lengthscale, dtype=self.dists_dtype)
 
         if self.kernel == 'RBF':
-            # Radial Basis Function (RBF) kernel
             cov_matrix = tf.square(gp_variance) * tf.exp(
                 -tf.square(self.dists) / (2.0 * tf.square(gp_lengthscale))
             )
         elif self.kernel == 'matern52':
-            # Matérn 5/2 kernel (more flexible than RBF)
-            frac1 = (tf.sqrt(5.0) * self.dists) / gp_lengthscale
+            sqrt5 = tf.cast(tf.sqrt(5.0), dtype=self.dists_dtype)
+            frac1 = (sqrt5 * self.dists) / gp_lengthscale
             frac2 = (5.0 * tf.square(self.dists)) / (3.0 * tf.square(gp_lengthscale))
             cov_matrix = tf.square(gp_variance) * (1 + frac1 + frac2) * tf.exp(-frac1)
-
-        # Add nugget term to ensure numerical stability
-        return cov_matrix + tf.eye(self.n_vx, dtype=self.dists_dtype) * (1e-6 + gp_nugget)
-
-    def return_sparse_precision_matrix(self, cov_matrix):
-        # 2. Sparsify the Kernel Matrix to get Precision Matrix (Lambda)
-        if self.sparse_method == 'threshold':
-            threshold = self.sparse_value
-            sparse_indices_list = []
-            sparse_values_list = []
-            for i in range(self.n_vx):
-                for j in range(self.n_vx):
-                    if cov_matrix[i, j] > threshold:
-                        sparse_indices_list.append([i, j])
-                        sparse_values_list.append(cov_matrix[i, j].numpy())
-            self.precision_matrix_sparse = tf.sparse.SparseTensor(
-                indices=tf.constant(sparse_indices_list, dtype=tf.int64),
-                values=tf.constant(sparse_values_list, dtype=tf.float32),
-                dense_shape=cov_matrix.shape
-            )
-
-        if self.sparse_method ==  'knn':
-            knn = int(self.sparse_value)  # Ensure knn is integer
-            if knn >= self.n_vx:
-                raise ValueError("k-NN value must be less than the number of vertices for sparsification.")
-
-            sparse_indices_list = []
-            sparse_values_list = []
-
-            for i in range(self.n_vx):
-                row_kernel_values = cov_matrix[i, :]
-                # Get top k indices (highest similarity values)
-                _, top_indices = tf.nn.top_k(row_kernel_values, k=knn)
-                for j_index in top_indices.numpy():
-                    sparse_indices_list.append([i, j_index])
-                    sparse_values_list.append(cov_matrix[i, j_index].numpy())
-
-            sparse_indices_knn = tf.constant(sparse_indices_list, dtype=tf.int64)
-            sparse_values_knn = tf.constant(sparse_values_list, dtype=tf.float32)
-
-            # Ensure symmetry for KNN by adding reverse pairs if not already present.
-            symmetric_indices_list = []
-            symmetric_values_list = []
-            added_pairs = set()
-
-            for idx, indices in enumerate(sparse_indices_knn.numpy()):
-                i, j = indices
-                value = sparse_values_knn[idx].numpy()
-                if (i, j) not in added_pairs:
-                    symmetric_indices_list.append([i, j])
-                    symmetric_values_list.append(value)
-                    added_pairs.add((i, j))
-                if i != j and (j, i) not in added_pairs:
-                    symmetric_indices_list.append([j, i])
-                    symmetric_values_list.append(value)
-                    added_pairs.add((j, i))
-
-            self.precision_matrix_sparse = tf.sparse.SparseTensor(
-                indices=tf.constant(symmetric_indices_list, dtype=tf.int64),
-                values=tf.constant(symmetric_values_list, dtype=tf.float32),
-                dense_shape=cov_matrix.shape
-            )
+        elif self.kernel == 'laplace':
+            cov_matrix = tf.square(gp_variance) * tf.exp(-self.dists / gp_lengthscale)
         else:
-            raise ValueError("Invalid sparsification_method. Choose 'threshold' or 'knn'.")
-
-        # Make sure it is symmetric (helps ensure correct logdet computation later).
-        self.precision_matrix_sparse = tf.sparse.reorder(tf.sparse.SparseTensor(
-            indices=self.precision_matrix_sparse.indices,
-            values=self.precision_matrix_sparse.values,
-            dense_shape=self.precision_matrix_sparse.dense_shape
-        ))
-
+            raise ValueError("Unsupported kernel: {}".format(self.kernel))
+        # Add nugget term for numerical stability
+        return cov_matrix + tf.eye(self.n_vx, dtype=self.dists_dtype) * (1e-6 + gp_nugget)
+    
+    @tf.function
+    def _compute_precision_and_conditional_log_prob(self, parameter, prec_matrix, gp_mean, full_norm):
+        if full_norm:
+            # Full normalization version:
+            diff = parameter - gp_mean
+            log_det_prec = tf.linalg.logdet(prec_matrix)
+            quad_form = tf.tensordot(diff, tf.linalg.matvec(prec_matrix, diff), axes=1)
+            n = tf.cast(tf.shape(parameter)[0], diff.dtype)
+            two_pi = tf.constant(2 * math.pi, dtype=diff.dtype)
+            return 0.5 * log_det_prec - 0.5 * quad_form - 0.5 * n * tf.math.log(two_pi)
+        else:
+            # Original element-wise (conditional) formulation:
+            diff = parameter - gp_mean
+            Qp = tf.linalg.matvec(prec_matrix, diff)
+            diag_Q = tf.linalg.diag_part(prec_matrix)
+            log_probs = 0.5 * tf.math.log(diag_Q) - 0.5 * tf.math.log(2 * math.pi) - 0.5 * (Qp ** 2) / diag_Q
+            return tf.reduce_sum(log_probs)
 
     def set_log_prob(self):
+        """
+        Set the log probability method based on whether parameters are fixed and the chosen method.
+        """
         if self.fixed_params:
-            if self.sparse:
-                self.return_log_prob = self._return_log_prob_fixed_sparse
+            # When hyperparameters are fixed, use the precomputed distribution or precision
+            if self.log_prob_method == 'tf':
+                self.return_log_prob = self._return_log_prob_fixed_tf
             else:
-                self.return_log_prob = self._return_log_prob_fixed_dense
+                self.return_log_prob = self._return_log_prob_fixed_prec
         else:
-            if self.sparse:
-                self.return_log_prob = self._return_log_prob_unfixed_sparse
+            if self.log_prob_method == 'tf':
+                self.return_log_prob = self._return_log_prob_unfixed_tf
             else:
-                self.return_log_prob = self._return_log_prob_unfixed_dense
-    
-    @tf.function
-    def _return_log_prob_fixed_dense(self, parameter, gp_lengthscale, gp_variance, gp_mean=0.0, gp_nugget=0.0):    
-        # solve the no gradient problem...
-        return self.gp_prior_dist.log_prob(parameter) + gp_lengthscale*0.0 + gp_variance*0.0 + gp_mean*0.0 + gp_nugget*0.0 
-
-    
-    @tf.function
-    def _return_log_prob_unfixed_dense(self, parameter, gp_lengthscale, gp_variance, gp_mean=0.0, gp_nugget=0.0):
-        """"""
-        cov_matrix = self.return_sigma(gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, gp_nugget=gp_nugget)
-        chol = tf.linalg.cholesky(tf.cast(cov_matrix, dtype=self.dists_dtype))                
-        gp_prior_dist = tfd.MultivariateNormalTriL(
-            loc=tf.zeros(self.n_vx, dtype=tf.float32) + gp_mean,
-            scale_tril=tf.cast(chol, dtype=tf.float32), 
-            allow_nan_stats=False,
-            )   
-        return gp_prior_dist.log_prob(parameter) # Log-prior contribution for this parameter
+                self.return_log_prob = self._return_log_prob_unfixed_prec
 
     @tf.function
-    def _return_log_prob_fixed_sparse(self, parameter, gp_lengthscale, gp_variance, gp_mean=0.0, gp_nugget=0.0):
-        """"""
+    def _return_log_prob_fixed_tf(self, parameter, gp_lengthscale, gp_variance, gp_mean=0.0, gp_nugget=0.0):
+        """
+        Fixed parameters using TensorFlow distribution.
+        The extra hyperparameter inputs are included to maintain the gradient graph,
+        even though they are not used.
+        """
+        # Note: The extra terms are added via tf.stop_gradient to keep gradients flowing
+        extra = tf.stop_gradient(gp_lengthscale + gp_variance + gp_mean + gp_nugget) * 0.0
+        return self.gp_prior_dist.log_prob(parameter) + extra
+
+    @tf.function
+    def _return_log_prob_unfixed_tf(self, parameter, gp_lengthscale, gp_variance, gp_mean=0.0, gp_nugget=0.0):
+        """
+        Unfixed parameters using TensorFlow distribution.
+        Recompute covariance and Cholesky decomposition on the fly.
+        """
+        cov_matrix = self.return_sigma(gp_lengthscale, gp_variance, gp_nugget)
+        chol = tf.linalg.cholesky(tf.cast(cov_matrix, dtype=self.dists_dtype))
         
-        return 
-    
+        gp_prior_dist = tfd.MultivariateNormalTriL(
+            loc=tf.fill([self.n_vx], tf.squeeze(gp_mean)),
+            scale_tril=tf.cast(chol, dtype=tf.float32),
+            allow_nan_stats=False,
+        )
+        return gp_prior_dist.log_prob(parameter)
+
     @tf.function
-    def _return_log_prob_unfixed_sparse(self, parameter, gp_lengthscale, gp_variance, gp_mean=0.0, gp_nugget=0.0):
-        """"""        
-        raise NotImplementedError('Sparse method not yet implemented.')
+    def _return_log_prob_fixed_prec(self, parameter, gp_lengthscale, gp_variance, gp_mean=0.0, gp_nugget=0.0):
+        """
+        Fixed parameters using precomputed precision matrix.
+        """
+        extra = tf.stop_gradient(gp_lengthscale + gp_variance + gp_mean + gp_nugget) * 0.0
+        return self._compute_precision_and_conditional_log_prob(parameter, self.prec_matrix, gp_mean, self.full_norm) + extra
+
+    @tf.function
+    def _return_log_prob_unfixed_prec(self, parameter, gp_lengthscale, gp_variance, gp_mean=0.0, gp_nugget=0.0):
+        """
+        Unfixed parameters using precision matrix. Recompute the covariance and precision matrices on the fly.
+        """
+        cov_matrix = self.return_sigma(gp_lengthscale, gp_variance, gp_nugget)
+        prec_matrix = tf.cast(tf.linalg.inv(cov_matrix), dtype=tf.float32)
+        return self._compute_precision_and_conditional_log_prob(parameter, prec_matrix, gp_mean, self.full_norm)
 
 # ****************************
 # **************************** 

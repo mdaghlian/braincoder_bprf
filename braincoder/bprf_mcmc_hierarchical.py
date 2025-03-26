@@ -172,8 +172,14 @@ class BPRF_hier(BPRF):
         # Ok lets map everything so we can fix some parameters
         # Are there any parameters to fix? 
         if (len(self.h_fixed_pars) != 0):
+            # Remove any entry of h_fixed pars which is not in h_labels
+            k_check = list(self.h_fixed_pars.keys())
+            for k in k_check:
+                if k not in self.h_labels.keys():
+                    self.h_fixed_pars.pop(k)
             if not isinstance(self.h_fixed_pars, pd.DataFrame):
                 self.h_fixed_pars = pd.DataFrame.from_dict(self.h_fixed_pars, orient='index').T.astype('float32')        
+
             # Build the indices and update values lists.
             indices_list = []
             updates_list = []
@@ -473,11 +479,8 @@ class BPRF_hier(BPRF):
             predictions = self.model._predict(
                 paradigm_[tf.newaxis, ...], par4pred[tf.newaxis, ...], None)     # Only include those parameters that are fed to the model
             residuals = y[:, vx_bool] - predictions[0]                        
-            
-            # -> rescale based on std...
-            log_likelihood = residual_ln_likelihood_fn(parameters, residuals)
+            log_likelihood = residual_ln_likelihood_fn(parameters, residuals)            
             log_prior = log_prior_fn(parameters, h_parameters)            
-            # Return vector of length idx (optimize each chain separately)
             return tf.reduce_sum(log_prior + log_likelihood)
 
         # -> make sure we are in the correct dtype
