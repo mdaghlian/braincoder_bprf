@@ -460,12 +460,7 @@ class BPRF(object):
             gradients = tape.gradient(loss, opt_vars)
             optimizer.apply_gradients(zip(gradients, opt_vars))
             progress_bar.set_description(f"MAP Optimization, Mean loss: {loss.numpy().mean():.4f}")        
-
-        # for step in tqdm(tf.range(num_steps), desc="MAP Optimization"):
-        #     with tf.GradientTape() as tape:
-        #         loss = neg_log_posterior_fn()
-        #     gradients = tape.gradient(loss, opt_vars)
-        #     optimizer.apply_gradients(zip(gradients, opt_vars))             
+          
         # Extract optimized parameters
         # -> transform parameters forward after fitting
         opt_vars = [self.p_bijector_list[i](ov) for i,ov in enumerate(opt_vars)]
@@ -746,14 +741,17 @@ class GPdists():
             **kwargs: Optional parameters for controlling behavior, such as:
                 - psd_control: Method for ensuring positive semidefiniteness.
                 - dists_dtype: Data type for tensor conversion.
-                - fixed_params: If True, precomputes covariance for efficiency.
+                - fixed_params: Fixing (some) of the GP parameters? Precomputes what is possible for efficiency
+                    'unfixed'       Everything can change
+                    'fixed_vl'      variance, lengthscale are fixed, others can change
+                    'fixed_all'     Everything is fixed
                 - gp_variance, gp_lengthscale, gp_mean, gp_nugget: GP hyperparameters.
                 - kernel: Choice of covariance function (default: 'RBF').
         """
         self.log_prob_method = kwargs.get('log_prob_method', 'tf')  # 'tf' or 'precision'
         self.full_norm = kwargs.get('full_norm', False) # Use full normalization in precision method
         self.kernel = kwargs.get('kernel', 'RBF')
-        self.fixed_params = kwargs.get('fixed_params', False)
+        self.fixed_params = kwargs.get('fixed_params', 'unfixed') # fixed_vl, fixed_all
 
         # Fixed GP hyperparameters (when fixed_params is True)
         self.f_gp_variance = kwargs.get('gp_variance', None)
@@ -778,7 +776,13 @@ class GPdists():
         self.n_vx = self.dists.shape[0]
 
         # Precompute covariance related matrices if parameters are fixed
-        if self.fixed_params:
+        if self.fixed_params == 'unfixed':
+            # Nothing is fixed...
+            self.cov_matrix = None
+            self.prec_matrix = None
+            self.chol = None
+            self.gp_prior_dist = None
+        elif self.fixed_params == 'fixed_all':
             print('Precomputing covariance matrix...')
             self.cov_matrix = self.return_sigma(
                 gp_lengthscale=self.f_gp_lengthscale,
@@ -795,9 +799,10 @@ class GPdists():
                 scale_tril=tf.cast(self.chol, dtype=tf.float32),
                 allow_nan_stats=False,
             )
+        elif self.fixed_params == 'fixed_vl':
+            raise NotImplementedError("Fixed parameters with 'fixed_vl' option is not implemented yet.")
         else:
-            self.gp_prior_dist = None
-
+            raise ValueError(f"Invalid fixed_params option: {self.fixed_params}. Choose from 'unfixed', 'fixed_vl', or 'fixed_all'.")
         self.set_log_prob()
 
     @tf.function
@@ -855,17 +860,22 @@ class GPdists():
         """
         Set the log probability method based on whether parameters are fixed and the chosen method.
         """
-        if self.fixed_params:
+        if self.fixed_params == 'fixed_all':
             # When hyperparameters are fixed, use the precomputed distribution or precision
             if self.log_prob_method == 'tf':
                 self.return_log_prob = self._return_log_prob_fixed_tf
             else:
                 self.return_log_prob = self._return_log_prob_fixed_prec
-        else:
+        elif self.fixed_params == 'fixed_vl':
+            raise NotImplementedError("Fixed parameters with 'fixed_vl' option is not implemented yet.")
+        elif self.fixed_params == 'unfixed':
             if self.log_prob_method == 'tf':
                 self.return_log_prob = self._return_log_prob_unfixed_tf
             else:
                 self.return_log_prob = self._return_log_prob_unfixed_prec
+        else:
+            raise ValueError(f"Invalid fixed_params option: {self.fixed_params}. Choose from 'unfixed', 'fixed_vl', or 'fixed_all'.")
+
 
     @tf.function
     def _return_log_prob_fixed_tf(self, parameter, gp_lengthscale, gp_variance, gp_mean=0.0, gp_nugget=0.0):
@@ -910,6 +920,7 @@ class GPdists():
         cov_matrix = self.return_sigma(gp_lengthscale, gp_variance, gp_nugget)
         prec_matrix = tf.cast(tf.linalg.inv(cov_matrix), dtype=tf.float32)
         return self._compute_precision_and_conditional_log_prob(parameter, prec_matrix, gp_mean, self.full_norm)
+
 
 # ****************************
 # **************************** 

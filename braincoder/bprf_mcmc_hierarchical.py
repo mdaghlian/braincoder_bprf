@@ -418,8 +418,6 @@ class BPRF_hier(BPRF):
         self.h_mcmc_summary = pd.DataFrame(hpars)
         self.h_mcmc_mean = pd.DataFrame.from_dict(hpars_m, orient='index').T.astype('float32')
 
-
-
     def fit_MAP_hier(self,
                 init_pars=None,
                 h_init_pars=None,
@@ -567,7 +565,6 @@ class BPRF_hier(BPRF):
             hdf[h] = h_opt_vars[self.h_labels[h]]
         self.h_MAP_parameters = pd.DataFrame(hdf)
         print('MAP optimization finished.')    
-
     
     def _create_log_prior_fn(self):
         @tf.function
