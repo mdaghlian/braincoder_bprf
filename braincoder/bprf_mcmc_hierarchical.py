@@ -650,3 +650,152 @@ class BPRF_hier(BPRF):
         # Make sure pd.Dataframe parameters are in order
         h_parameters = reorder_dataframe_columns(pd_to_fix=h_parameters, dict_index=self.h_labels)
         return h_parameters
+    
+
+    def fit_MAP_hier_GP_only(self,
+                pid,            # Which parameter is this GP associated with 
+                pid_pars,       # The values of these parameters (e.g., obtained with a basic grid fit)
+                h_init_pars,    
+                num_steps=100, 
+                idx = None,
+                **kwargs):
+        '''
+        Maximum a posteriori (MAP) optimization for hierarchical model. Fitting the GP only
+        The idea is to:
+        [1] Do some basic traditional parameter fitting on the data (e.g., pRF, nCSF)
+        [2] You expect that some of these parameters vary spatially
+        - so you want to apply a GP prior
+        - But you don't know how to set the hyperparameters (lengthscale, variance, etc)
+        - So you fit these on the output of [1] 
+        - There is no interaction with the data
+        [3] You fit your hyperparameters **here** and then fix them for subsequent fitting
+        - now using your "informed" prior
+
+        A sort of "empirical bayesian approach
+
+        This is an alternative to fitting everything at the same time. Which is also an option in 
+        '''
+        optimizer_type = kwargs.get('optimizer', 'adam' )
+        adam_kwargs = kwargs.pop('adam_kwargs', {})
+        if idx is None: # all of them?
+            idx = np.arange(self.n_voxels).tolist()
+        elif isinstance(idx, int):
+            idx = [idx]
+        vx_bool = np.zeros(self.n_voxels, dtype=bool)
+        vx_bool[idx] = True
+        self.n_vx_to_fit = len(idx)
+        self.h_fixed_pars = kwargs.pop('h_fixed_pars', {})                
+        self.n_params = len(self.model_labels)
+        self.h_prep_for_fitting(**kwargs)
+        self.h_n_params = len(self.h_labels)
+        
+        pid_pars = pid_pars.values.astype(np.float32) # These stay the same...
+        pid_pars = tf.convert_to_tensor(pid_pars[vx_bool], dtype=tf.float32, name=pid) 
+        h_init_pars = self.sort_h_parameters(h_init_pars)
+        h_init_pars = format_parameters(h_init_pars)
+        h_init_pars = h_init_pars.values.astype(np.float32)
+
+        # Define the log prior function
+        @tf.function
+        def log_prior_fn(h_parameters):
+            p_out = 0.0
+            for h in self.h_priors_to_loop:
+                p_out += tf.reduce_sum(self.h_prior[h].prior(h_parameters[:,self.h_labels[h]]))            
+            return p_out 
+        print(self.h_prior_to_apply[pid])
+
+        # Now create the log_posterior_fn
+        @tf.function
+        def log_posterior_fn(h_parameters):
+            h_parameters = self._h_bprf_transform_parameters_forward(h_parameters)
+            h_parameters = self.h_fix_update_fn(h_parameters)
+            log_prior = log_prior_fn(h_parameters)            
+            # Apply gp to parameters
+            if self.h_prior_to_apply[pid]=='gp_dists':
+                gp_lengthscale = h_parameters[:, self.h_labels[f'{pid}_gp_lengthscale']] # Current value of GP lengthscale hyperparameter
+                gp_variance = h_parameters[:, self.h_labels[f'{pid}_gp_variance']] # Current value of GP variance hyperparameter
+                gp_likelihood = self.h_gp_function[pid].return_log_prob(
+                    parameter=pid_pars, gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, 
+                )
+            elif self.h_prior_to_apply[pid]=='gp_dists_full':
+                gp_lengthscale  = h_parameters[:, self.h_labels[f'{pid}_gp_lengthscale']] # Current value of GP lengthscale hyperparameter
+                gp_variance     = h_parameters[:, self.h_labels[f'{pid}_gp_variance']] # Current value of GP variance hyperparameter
+                gp_mean         = h_parameters[:, self.h_labels[f'{pid}_gp_mean']] # Current value of GP variance hyperparameter
+                gp_nugget       = h_parameters[:, self.h_labels[f'{pid}_gp_nugget']] # Current value of GP variance hyperparameter
+                gp_likelihood = self.h_gp_function[pid].return_log_prob(
+                    parameter=pid_pars, gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, 
+                    gp_mean=gp_mean, gp_nugget=gp_nugget
+                )
+            else:
+                raise AssertionError
+            return tf.reduce_sum(log_prior + gp_likelihood)
+
+        # -> make sure we are in the correct dtype
+        h_state_tensors = [
+            tf.convert_to_tensor(h_init_pars[:, i], dtype=tf.float32, name=name) 
+            for i, name in enumerate(self.h_labels)
+        ]
+
+        # Transform initial states using bijectors
+        h_unconstrained = [bijector.inverse(state) for bijector, state in zip(self.h_bijector_list, h_state_tensors)]
+        print("Starting MAP optimization...")
+        # Initialize optimization variables
+        h_opt_vars = [tf.Variable(state, name=self.h_labels_inv[i]) for i,state in enumerate(h_unconstrained)]        
+
+        @tf.function
+        def neg_log_posterior_fn():
+            return -log_posterior_fn(tf.stack(h_opt_vars, axis=-1))
+        
+        # **** quick test **** 
+        initial_ll = neg_log_posterior_fn()
+        print(f'initial neg ll={initial_ll}')                    
+        # Check the gradient with respect to each parameter
+        with tf.GradientTape() as tape:
+            loss = neg_log_posterior_fn()
+        gradients = tape.gradient(loss, h_opt_vars)
+        print('Using tape.gradient to check gradients w/respect to each parameter')
+        for i, grad in enumerate(gradients):
+            try: 
+                print(f' Hierarchical {self.h_labels_inv[i]}: {grad.numpy()}')            
+            except:
+                print(f'No gradient for {self.h_labels_inv[i]}')            
+    
+        # **** **** **** **** 
+        # Define early stopping parameters
+        patience = 10  # Number of steps with no improvement before stopping
+        min_delta = 1e-4  # Minimum change in loss to be considered an improvement
+        best_loss = float("inf")
+        patience_counter = 0
+
+        optimizer = tf.optimizers.Adam(**adam_kwargs)
+        progress_bar = tqdm(tf.range(num_steps), desc="MAP Optimization")
+
+        for step in progress_bar:
+            with tf.GradientTape() as tape:
+                loss = neg_log_posterior_fn()
+            gradients = tape.gradient(loss, h_opt_vars)
+            optimizer.apply_gradients(zip(gradients, h_opt_vars))
+
+            # Early stopping check
+            if loss.numpy() < best_loss - min_delta:
+                best_loss = loss.numpy()
+                patience_counter = 0  # Reset patience if improvement is found
+            else:
+                patience_counter += 1  # Increment patience counter
+
+            if patience_counter >= patience:
+                print(f"Early stopping at step {step}, Loss: {best_loss:.4f}")
+                break
+
+            progress_bar.set_description(f"MAP Optimization, Loss: {loss.numpy():.4f}")
+
+
+        # Extract optimized parameters
+        # -> transform parameters forward after fitting
+        h_opt_vars = [self.h_bijector_list[i](ov).numpy() for i,ov in enumerate(h_opt_vars)]
+        
+        hdf = {}
+        for i,h in enumerate(self.h_labels):
+            hdf[h] = h_opt_vars[self.h_labels[h]]
+        self.h_MAP_parameters = pd.DataFrame(hdf)
+        print('MAP optimization finished.')    
