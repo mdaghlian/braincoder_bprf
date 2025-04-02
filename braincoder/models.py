@@ -1,5 +1,6 @@
 import tensorflow as tf
 import tensorflow_probability as tfp
+from tensorflow_probability import bijectors as tfb
 import logging
 import pandas as pd
 import numpy as np
@@ -2084,6 +2085,16 @@ class ContrastSensitivity(EncodingModel):
 
         if omega is not None:
             self.omega_chol = np.linalg.cholesky(omega)
+        self.n_params = len(self.parameter_labels)
+        self.p_bijector = {
+            'width_r' : tfb.Softplus(),
+            'SFp'     : tfb.Softplus(),
+            'CSp'     : tfb.Softplus(),
+            'width_l' : tfb.Softplus(),
+            'crf_exp'     : tfb.Softplus(),
+            'amplitude'     : tfb.Softplus(),
+            'baseline'     : tfb.Identity(),
+        }
 
     def get_csf_for_plot(self, SF_grid, CON_grid=np.array([1,1]), parameters=None):
         ''' Get the csf for a grid of SF and CON values '''
@@ -2228,36 +2239,57 @@ class ContrastSensitivity(EncodingModel):
         ncsf_resp = self._apply_crf(stim_sequence, parameters, csf)
 
         return ncsf_resp
-
     @tf.function
     def _transform_parameters_forward(self, parameters):
-        ''' Force amplidute to be positive '''
-        # Force them all to be positive (apart from baseline)
-        par_out = tf.concat([
-            tf.math.softplus(parameters[:, 0][:, tf.newaxis]),                # width_r
-            tf.math.softplus(parameters[:, 1][:, tf.newaxis]),                # SFp
-            tf.math.softplus(parameters[:, 2][:, tf.newaxis]),                # CSp
-            tf.math.softplus(parameters[:, 3][:, tf.newaxis]),                # width_l
-            tf.math.softplus(parameters[:, 4][:, tf.newaxis]),                # crf_exp
-            tf.math.softplus(parameters[:, 5][:, tf.newaxis]),                # amplitude
-            parameters[:, 6][:, tf.newaxis]],               # baseline
-            axis=1)        
-        return par_out
-    
+        # Loop through parameters & bijectors (forward)
+        p_out = []
+        for i,p in enumerate(self.parameter_labels):
+            p_out.append(
+                self.p_bijector[p].forward(
+                    parameters[:, i][:, tf.newaxis]
+                )
+            )
+        return tf.concat(p_out, axis=1)
     @tf.function
     def _transform_parameters_backward(self, parameters):
-        # Force them all to be positive (apart from baseline)
-        par_out = tf.concat([
-            tfp.math.softplus_inverse(parameters[:, 0][:, tf.newaxis]),                # width_r
-            tfp.math.softplus_inverse(parameters[:, 1][:, tf.newaxis]),                # SFp
-            tfp.math.softplus_inverse(parameters[:, 2][:, tf.newaxis]),                # CSp
-            tfp.math.softplus_inverse(parameters[:, 3][:, tf.newaxis]),                # width_l
-            tfp.math.softplus_inverse(parameters[:, 4][:, tf.newaxis]),                # crf_exp
-            tfp.math.softplus_inverse(parameters[:, 5][:, tf.newaxis]),                # amplitude
-            parameters[:, 6][:, tf.newaxis]],               # baseline
-            axis=1)
-        return par_out
+        # Loop through parameters & bijectors (forward)
+        p_out = []
+        for i,p in enumerate(self.parameter_labels):
+            p_out.append(
+                self.p_bijector[p].inverse(
+                    parameters[:, i][:, tf.newaxis]
+                    )             
+            )
+        return tf.concat(p_out, axis=1)        
+
+    # @tf.function
+    # def _transform_parameters_forward(self, parameters):
+    #     ''' Force amplidute to be positive '''
+    #     # Force them all to be positive (apart from baseline)
+    #     par_out = tf.concat([
+    #         tf.math.softplus(parameters[:, 0][:, tf.newaxis]),                # width_r
+    #         tf.math.softplus(parameters[:, 1][:, tf.newaxis]),                # SFp
+    #         tf.math.softplus(parameters[:, 2][:, tf.newaxis]),                # CSp
+    #         tf.math.softplus(parameters[:, 3][:, tf.newaxis]),                # width_l
+    #         tf.math.softplus(parameters[:, 4][:, tf.newaxis]),                # crf_exp
+    #         tf.math.softplus(parameters[:, 5][:, tf.newaxis]),                # amplitude
+    #         parameters[:, 6][:, tf.newaxis]],               # baseline
+    #         axis=1)        
+    #     return par_out
     
+    # @tf.function
+    # def _transform_parameters_backward(self, parameters):
+    #     # Force them all to be positive (apart from baseline)
+    #     par_out = tf.concat([
+    #         tfp.math.softplus_inverse(parameters[:, 0][:, tf.newaxis]),                # width_r
+    #         tfp.math.softplus_inverse(parameters[:, 1][:, tf.newaxis]),                # SFp
+    #         tfp.math.softplus_inverse(parameters[:, 2][:, tf.newaxis]),                # CSp
+    #         tfp.math.softplus_inverse(parameters[:, 3][:, tf.newaxis]),                # width_l
+    #         tfp.math.softplus_inverse(parameters[:, 4][:, tf.newaxis]),                # crf_exp
+    #         tfp.math.softplus_inverse(parameters[:, 5][:, tf.newaxis]),                # amplitude
+    #         parameters[:, 6][:, tf.newaxis]],               # baseline
+    #         axis=1)
+    #     return par_out
     # def get_pseudoWWT(self, remove_baseline=True):
 
     #     parameters = self._get_parameters().copy()

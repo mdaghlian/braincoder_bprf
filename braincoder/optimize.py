@@ -91,10 +91,8 @@ class ParameterFitter(object):
             init_pars = self.model.get_init_pars(
                 data=y, paradigm=self.paradigm, confounds=confounds)
             print('using get_init_pars')
-
         init_pars = self.model._get_parameters(init_pars)
         init_pars = self.model._transform_parameters_backward(init_pars.values.astype(np.float32))
-
         ssq_data = tf.reduce_sum(
             (y - tf.reduce_mean(y, 0)[tf.newaxis, :])**2, 0)
 

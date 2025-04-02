@@ -75,19 +75,21 @@ class BPRF_hier(BPRF):
                 dists=kwargs.pop('dists'),
                 **kwargs
             )
-            # self.h_add_bijector(pid=f'{pid}_gp_lengthscale', bijector_type=tfb.Identity())
-            # self.h_add_bijector(pid=f'{pid}_gp_variance', bijector_type=tfb.Identity())
 
             self.h_add_bijector(pid=f'{pid}_gp_lengthscale', bijector_type=tfb.Softplus())
             self.h_add_bijector(pid=f'{pid}_gp_variance', bijector_type=tfb.Softplus())
 
-            # [3] add the priors for the new parameters
-            # ... none for now...
+            # [3] add the priors for the new parameters - make them very broad...
             self.h_add_prior(
                 pid=f'{pid}_gp_lengthscale', 
-                prior_type='none', 
-                **kwargs)
-            self.h_add_prior(pid=f'{pid}_gp_variance', prior_type='none', **kwargs)
+                prior_type='HalfNormal', 
+                distribution=tfd.HalfNormal(scale=100)
+                )
+            self.h_add_prior(
+                pid=f'{pid}_gp_variance', 
+                prior_type='HalfNormal', 
+                distribution=tfd.HalfNormal(scale=100)
+                )
         
         elif h_prior_to_apply=='gp_dists_full':
             # Gaussian process based on geodesic distance
@@ -107,12 +109,25 @@ class BPRF_hier(BPRF):
             self.h_add_bijector(pid=f'{pid}_gp_nugget', bijector_type=tfb.Softplus())
 
             # [3] add the priors for the new parameters
-            # ... none for now...
-            for h_added in ['lengthscale', 'variance', 'mean', 'nugget']:
-                self.h_add_prior(
-                    pid=f'{pid}_gp_{h_added}', 
-                    prior_type='none', 
-                    **kwargs)
+            self.h_add_prior(
+                pid=f'{pid}_gp_lengthscale', 
+                prior_type='HalfNormal', 
+                distribution=tfd.HalfNormal(scale=10)
+                )
+            self.h_add_prior(
+                pid=f'{pid}_gp_variance', 
+                prior_type='HalfNormal', 
+                distribution=tfd.HalfNormal(scale=10)
+                )
+            self.h_add_prior(
+                pid=f'{pid}_gp_nugget', 
+                prior_type='HalfNormal', 
+                distribution=tfd.HalfNormal(scale=5)
+                )
+            self.h_add_prior(
+                pid=f'{pid}_gp_mean', 
+                prior_type='none', 
+                )                
 
     
     def h_add_bijector(self, pid, bijector_type, **kwargs):
@@ -253,6 +268,7 @@ class BPRF_hier(BPRF):
         Experimental - can we fit everything at once?
         Does that even make sense?
         '''
+        self.n_inducers = kwargs.get('n_inducers', None)
         if idx is None: # all of them?
             idx = np.arange(self.n_voxels).tolist()
         elif isinstance(idx, int):
@@ -430,6 +446,7 @@ class BPRF_hier(BPRF):
         Finds the parameter values that maximize the posterior distribution.
         '''
         optimizer_type = kwargs.get('optimizer', 'adam' )
+        self.n_inducers = kwargs.get('n_inducers', None)
         adam_kwargs = kwargs.pop('adam_kwargs', {})
         if idx is None: # all of them?
             idx = np.arange(self.n_voxels).tolist()
@@ -588,7 +605,10 @@ class BPRF_hier(BPRF):
                     gp_lengthscale = h_parameters[:, self.h_labels[f'{h}_gp_lengthscale']] # Current value of GP lengthscale hyperparameter
                     gp_variance = h_parameters[:, self.h_labels[f'{h}_gp_variance']] # Current value of GP variance hyperparameter
                     p_out += self.h_gp_function[h].return_log_prob(
-                        gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, parameter=param_values
+                        gp_lengthscale=gp_lengthscale, 
+                        gp_variance=gp_variance, 
+                        parameter=param_values, 
+                        n_inducers=self.n_inducers,
                     )
                 elif self.h_prior_to_apply[h]=='gp_dists_full':
                     param_values = parameters[:, self.model_labels[h]] # Values of parameter 'h' for vertices being fit
@@ -598,7 +618,8 @@ class BPRF_hier(BPRF):
                     gp_nugget       = h_parameters[:, self.h_labels[f'{h}_gp_nugget']] # Current value of GP variance hyperparameter
                     p_out += self.h_gp_function[h].return_log_prob(
                         parameter=param_values, gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, 
-                        gp_mean=gp_mean, gp_nugget=gp_nugget
+                        gp_mean=gp_mean, gp_nugget=gp_nugget,
+                        n_inducers=self.n_inducers,
                     )
 
                     
@@ -650,7 +671,131 @@ class BPRF_hier(BPRF):
         # Make sure pd.Dataframe parameters are in order
         h_parameters = reorder_dataframe_columns(pd_to_fix=h_parameters, dict_index=self.h_labels)
         return h_parameters
+
+    def fit_mcmc_hier_GP_only(self,
+                pid,            # Which parameter is this GP associated with 
+                pid_pars,       # The values of these parameters (e.g., obtained with a basic grid fit)
+                h_init_pars,    
+                num_steps=100, 
+                idx = None,
+                **kwargs):
+        '''
+        Maximum a posteriori (MAP) optimization for hierarchical model. Fitting the GP only
+        The idea is to:
+        [1] Do some basic traditional parameter fitting on the data (e.g., pRF, nCSF)
+        [2] You expect that some of these parameters vary spatially
+        - so you want to apply a GP prior
+        - But you don't know how to set the hyperparameters (lengthscale, variance, etc)
+        - So you fit these on the output of [1] 
+        - There is no interaction with the data
+        [3] You fit your hyperparameters **here** and then fix them for subsequent fitting
+        - now using your "informed" prior
+
+        A sort of "empirical bayesian approach
+
+        This is an alternative to fitting everything at the same time. Which is also an option in 
+        '''
+        n_inducers = kwargs.pop('n_inducers', None)
+        if idx is None: # all of them?
+            idx = np.arange(self.n_voxels).tolist()
+        elif isinstance(idx, int):
+            idx = [idx]
+        vx_bool = np.zeros(self.n_voxels, dtype=bool)
+        vx_bool[idx] = True
+        self.n_vx_to_fit = len(idx)
+        self.h_fixed_pars = kwargs.pop('h_fixed_pars', {})                
+        self.n_params = len(self.model_labels)
+        self.h_prep_for_fitting(**kwargs)
+        self.h_n_params = len(self.h_labels)
+        step_size = kwargs.pop('step_size', 0.0001) # rest of the kwargs go to "hmc_sample"                
+        step_size = [tf.constant(step_size, np.float32) for _ in range(self.h_n_params)]        
+        
+        pid_pars = pid_pars.values.astype(np.float32) # These stay the same...
+        pid_pars = tf.convert_to_tensor(pid_pars[vx_bool], dtype=tf.float32, name=pid) 
+        h_init_pars = self.sort_h_parameters(h_init_pars)
+        h_init_pars = format_parameters(h_init_pars)
+        h_init_pars = h_init_pars.values.astype(np.float32)
+
+        # Define the log prior function
+        @tf.function
+        def log_prior_fn(h_parameters):
+            p_out = 0.0
+            for h in self.h_priors_to_loop:
+                p_out += tf.reduce_sum(self.h_prior[h].prior(h_parameters[:,self.h_labels[h]]))            
+            return p_out 
+
+        # Now create the log_posterior_fn
+        @tf.function
+        def log_posterior_fn(h_parameters):
+            h_parameters = self._h_bprf_transform_parameters_forward(h_parameters)
+            h_parameters = self.h_fix_update_fn(h_parameters)
+            log_prior = log_prior_fn(h_parameters)            
+            # Apply gp to parameters
+            if self.h_prior_to_apply[pid]=='gp_dists':
+                gp_lengthscale = h_parameters[:, self.h_labels[f'{pid}_gp_lengthscale']] # Current value of GP lengthscale hyperparameter
+                gp_variance = h_parameters[:, self.h_labels[f'{pid}_gp_variance']] # Current value of GP variance hyperparameter
+                gp_likelihood = self.h_gp_function[pid].return_log_prob(
+                    parameter=pid_pars, gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, 
+                    n_inducers=n_inducers,
+                )
+            elif self.h_prior_to_apply[pid]=='gp_dists_full':
+                gp_lengthscale  = h_parameters[:, self.h_labels[f'{pid}_gp_lengthscale']] # Current value of GP lengthscale hyperparameter
+                gp_variance     = h_parameters[:, self.h_labels[f'{pid}_gp_variance']] # Current value of GP variance hyperparameter
+                gp_mean         = h_parameters[:, self.h_labels[f'{pid}_gp_mean']] # Current value of GP variance hyperparameter
+                gp_nugget       = h_parameters[:, self.h_labels[f'{pid}_gp_nugget']] # Current value of GP variance hyperparameter
+                gp_likelihood = self.h_gp_function[pid].return_log_prob(
+                    parameter=pid_pars, gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, 
+                    gp_mean=gp_mean, gp_nugget=gp_nugget, n_inducers=n_inducers,
+                )
+            else:
+                raise AssertionError
+            return tf.reduce_sum(log_prior + gp_likelihood)
+
+        # -> make sure we are in the correct dtype
+        h_initial_state = [
+            tf.convert_to_tensor(h_init_pars[:,i], dtype=tf.float32, name=n) for i,n in enumerate(self.h_labels)]        
+        
+        def target_log_prob_fn(*h_parameters):
+            return log_posterior_fn(tf.stack(h_parameters, axis=-1))
+
+        # **** quick test **** 
+
+        print('Lets run some checks with everything...')
+        # quick test - does it work?
+        initial_ll = target_log_prob_fn(*h_initial_state)
+        print(f'initial_ll={initial_ll}')                    
+        # Check the gradient with respect to each parameter
+        with tf.GradientTape() as tape:
+            tape.watch(h_initial_state)
+            log_prob = target_log_prob_fn(*h_initial_state)
+        gradients = tape.gradient(log_prob, h_initial_state)
+        print('Using tape.gradient to check gradients w/respect to each parameter')
+        for i, grad in enumerate(gradients):
+            try: 
+                print(f' Hierarchical {self.h_labels_inv[i]}: {grad.numpy()}')            
+            except:
+                print(f'No gradient for {self.h_labels_inv[i]}')            
     
+        # **** **** **** **** 
+
+        # CALLING GILLES' "sample_hmc" from .utils.mcmc
+        print(f"Starting NUTS sampling...")
+        samples, stats = bprf_sample_NUTS(
+            init_state = h_initial_state, 
+            target_log_prob_fn=target_log_prob_fn, 
+            unconstraining_bijectors=self.h_bijector_list, 
+            num_steps=num_steps, 
+            # OTHER STUFF TO OPTIMIZE
+            step_size=step_size, 
+            **kwargs
+            )                
+        # stuff to save...        
+        
+        h_samples = tf.stack(samples, axis=-1).numpy().squeeze()
+        for h in self.h_labels:
+            self.h_mcmc_sampler[h] = h_samples[:,self.h_labels[h]]
+        self.h_mcmc_sampler = pd.DataFrame(self.h_mcmc_sampler)
+        self.mcmc_stats = stats                
 
     def fit_MAP_hier_GP_only(self,
                 pid,            # Which parameter is this GP associated with 
@@ -677,6 +822,7 @@ class BPRF_hier(BPRF):
         '''
         optimizer_type = kwargs.get('optimizer', 'adam' )
         adam_kwargs = kwargs.pop('adam_kwargs', {})
+        n_inducers = kwargs.pop('n_inducers', None)
         if idx is None: # all of them?
             idx = np.arange(self.n_voxels).tolist()
         elif isinstance(idx, int):
@@ -716,6 +862,7 @@ class BPRF_hier(BPRF):
                 gp_variance = h_parameters[:, self.h_labels[f'{pid}_gp_variance']] # Current value of GP variance hyperparameter
                 gp_likelihood = self.h_gp_function[pid].return_log_prob(
                     parameter=pid_pars, gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, 
+                    n_inducers=n_inducers,
                 )
             elif self.h_prior_to_apply[pid]=='gp_dists_full':
                 gp_lengthscale  = h_parameters[:, self.h_labels[f'{pid}_gp_lengthscale']] # Current value of GP lengthscale hyperparameter
@@ -724,7 +871,7 @@ class BPRF_hier(BPRF):
                 gp_nugget       = h_parameters[:, self.h_labels[f'{pid}_gp_nugget']] # Current value of GP variance hyperparameter
                 gp_likelihood = self.h_gp_function[pid].return_log_prob(
                     parameter=pid_pars, gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, 
-                    gp_mean=gp_mean, gp_nugget=gp_nugget
+                    gp_mean=gp_mean, gp_nugget=gp_nugget, n_inducers=n_inducers,
                 )
             else:
                 raise AssertionError
@@ -763,7 +910,7 @@ class BPRF_hier(BPRF):
         # **** **** **** **** 
         # Define early stopping parameters
         patience = 10  # Number of steps with no improvement before stopping
-        min_delta = 1e-4  # Minimum change in loss to be considered an improvement
+        min_delta = 1e-9  # Minimum change in loss to be considered an improvement
         best_loss = float("inf")
         patience_counter = 0
 
@@ -776,16 +923,16 @@ class BPRF_hier(BPRF):
             gradients = tape.gradient(loss, h_opt_vars)
             optimizer.apply_gradients(zip(gradients, h_opt_vars))
 
-            # Early stopping check
-            if loss.numpy() < best_loss - min_delta:
-                best_loss = loss.numpy()
-                patience_counter = 0  # Reset patience if improvement is found
-            else:
-                patience_counter += 1  # Increment patience counter
+            # # Early stopping check
+            # if loss.numpy() < best_loss - min_delta:
+            #     best_loss = loss.numpy()
+            #     patience_counter = 0  # Reset patience if improvement is found
+            # else:
+            #     patience_counter += 1  # Increment patience counter
 
-            if patience_counter >= patience:
-                print(f"Early stopping at step {step}, Loss: {best_loss:.4f}")
-                break
+            # if patience_counter >= patience:
+            #     print(f"Early stopping at step {step}, Loss: {best_loss:.4f}")
+            #     break
 
             progress_bar.set_description(f"MAP Optimization, Loss: {loss.numpy():.4f}")
 

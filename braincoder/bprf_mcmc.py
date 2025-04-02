@@ -806,7 +806,7 @@ class GPdists():
         self.set_log_prob()
 
     @tf.function
-    def return_sigma(self, gp_lengthscale, gp_variance, gp_nugget=0.0):
+    def return_sigma(self, gp_lengthscale, gp_variance, gp_nugget=0.0, dists=None):
         """
         Computes the covariance matrix using the chosen kernel.
 
@@ -818,25 +818,27 @@ class GPdists():
         Returns:
             tf.Tensor: Covariance matrix.
         """
+        if dists is None: 
+            dists = self.dists
         gp_nugget = tf.cast(gp_nugget, dtype=self.dists_dtype)
         gp_variance = tf.cast(gp_variance, dtype=self.dists_dtype)
         gp_lengthscale = tf.cast(gp_lengthscale, dtype=self.dists_dtype)
 
         if self.kernel == 'RBF':
             cov_matrix = tf.square(gp_variance) * tf.exp(
-                -tf.square(self.dists) / (2.0 * tf.square(gp_lengthscale))
+                -tf.square(dists) / (2.0 * tf.square(gp_lengthscale))
             )
         elif self.kernel == 'matern52':
             sqrt5 = tf.cast(tf.sqrt(5.0), dtype=self.dists_dtype)
-            frac1 = (sqrt5 * self.dists) / gp_lengthscale
-            frac2 = (5.0 * tf.square(self.dists)) / (3.0 * tf.square(gp_lengthscale))
+            frac1 = (sqrt5 * dists) / gp_lengthscale
+            frac2 = (5.0 * tf.square(dists)) / (3.0 * tf.square(gp_lengthscale))
             cov_matrix = tf.square(gp_variance) * (1 + frac1 + frac2) * tf.exp(-frac1)
         elif self.kernel == 'laplace':
-            cov_matrix = tf.square(gp_variance) * tf.exp(-self.dists / gp_lengthscale)
+            cov_matrix = tf.square(gp_variance) * tf.exp(-dists / gp_lengthscale)
         else:
             raise ValueError("Unsupported kernel: {}".format(self.kernel))
         # Add nugget term for numerical stability
-        return cov_matrix + tf.eye(self.n_vx, dtype=self.dists_dtype) * (1e-6 + gp_nugget)
+        return cov_matrix + tf.eye(cov_matrix.shape[0], dtype=self.dists_dtype) * (1e-6 + gp_nugget)
     
     @tf.function
     def _compute_precision_and_conditional_log_prob(self, parameter, prec_matrix, gp_mean, full_norm):
@@ -878,7 +880,7 @@ class GPdists():
 
 
     @tf.function
-    def _return_log_prob_fixed_tf(self, parameter, gp_lengthscale, gp_variance, gp_mean=0.0, gp_nugget=0.0):
+    def _return_log_prob_fixed_tf(self, parameter, gp_lengthscale, gp_variance, gp_mean=0.0, gp_nugget=0.0, n_inducers=None):
         """
         Fixed parameters using TensorFlow distribution.
         The extra hyperparameter inputs are included to maintain the gradient graph,
@@ -889,23 +891,51 @@ class GPdists():
         return self.gp_prior_dist.log_prob(parameter) + extra
 
     @tf.function
-    def _return_log_prob_unfixed_tf(self, parameter, gp_lengthscale, gp_variance, gp_mean=0.0, gp_nugget=0.0):
+    def _return_log_prob_unfixed_tf(self, parameter, gp_lengthscale, gp_variance, gp_mean=0.0, gp_nugget=0.0, n_inducers=None):
         """
         Unfixed parameters using TensorFlow distribution.
         Recompute covariance and Cholesky decomposition on the fly.
+        Optionally uses random selection of n_inducers for sparse GP approximation.
         """
-        cov_matrix = self.return_sigma(gp_lengthscale, gp_variance, gp_nugget)
-        chol = tf.linalg.cholesky(tf.cast(cov_matrix, dtype=self.dists_dtype))
-        
-        gp_prior_dist = tfd.MultivariateNormalTriL(
-            loc=tf.fill([self.n_vx], tf.squeeze(gp_mean)),
-            scale_tril=tf.cast(chol, dtype=tf.float32),
-            allow_nan_stats=False,
-        )
-        return gp_prior_dist.log_prob(parameter)
+        if n_inducers is None or n_inducers >= self.n_vx:
+            # Full GP
+            cov_matrix = self.return_sigma(gp_lengthscale, gp_variance, gp_nugget)
+            chol = tf.linalg.cholesky(tf.cast(cov_matrix, dtype=self.dists_dtype))
+
+            gp_prior_dist = tfd.MultivariateNormalTriL(
+                loc=tf.fill([self.n_vx], tf.squeeze(gp_mean)),
+                scale_tril=tf.cast(chol, dtype=tf.float32),
+                allow_nan_stats=False,
+            )
+            return gp_prior_dist.log_prob(parameter)
+        else:
+            # Sparse GP approximation using inducing points
+            if n_inducers <= 0:
+                raise ValueError("n_inducers must be a positive integer.")
+
+            # Randomly select indices for inducing points
+            inducing_indices = tf.random.shuffle(tf.range(self.n_vx))[:n_inducers]
+            inducing_indices = tf.sort(inducing_indices) # Keep them sorted for easier indexing
+
+            # Get the parameter values at the inducing points
+            inducing_parameter = tf.gather(parameter, inducing_indices)
+
+            # Get the distances between the inducing points
+            inducing_dists = tf.gather(tf.gather(self.dists, inducing_indices, axis=0), inducing_indices, axis=1)
+
+            # Calculate the covariance matrix for the inducing points
+            inducing_cov_matrix = self.return_sigma(gp_lengthscale, gp_variance, gp_nugget, dists=inducing_dists)
+            inducing_chol = tf.linalg.cholesky(tf.cast(inducing_cov_matrix, dtype=self.dists_dtype))
+
+            inducing_gp_prior_dist = tfd.MultivariateNormalTriL(
+                loc=tf.fill([n_inducers], tf.squeeze(gp_mean)),
+                scale_tril=tf.cast(inducing_chol, dtype=tf.float32),
+                allow_nan_stats=False,
+            )
+            return inducing_gp_prior_dist.log_prob(inducing_parameter)
 
     @tf.function
-    def _return_log_prob_fixed_prec(self, parameter, gp_lengthscale, gp_variance, gp_mean=0.0, gp_nugget=0.0):
+    def _return_log_prob_fixed_prec(self, parameter, gp_lengthscale, gp_variance, gp_mean=0.0, gp_nugget=0.0, n_inducers=None):
         """
         Fixed parameters using precomputed precision matrix.
         """
@@ -913,14 +943,33 @@ class GPdists():
         return self._compute_precision_and_conditional_log_prob(parameter, self.prec_matrix, gp_mean, self.full_norm) + extra
 
     @tf.function
-    def _return_log_prob_unfixed_prec(self, parameter, gp_lengthscale, gp_variance, gp_mean=0.0, gp_nugget=0.0):
+    def _return_log_prob_unfixed_prec(self, parameter, gp_lengthscale, gp_variance, gp_mean=0.0, gp_nugget=0.0, n_inducers=None):
         """
         Unfixed parameters using precision matrix. Recompute the covariance and precision matrices on the fly.
         """
-        cov_matrix = self.return_sigma(gp_lengthscale, gp_variance, gp_nugget)
-        prec_matrix = tf.cast(tf.linalg.inv(cov_matrix), dtype=tf.float32)
-        return self._compute_precision_and_conditional_log_prob(parameter, prec_matrix, gp_mean, self.full_norm)
+        if n_inducers is None or n_inducers >= self.n_vx:        
+            cov_matrix = self.return_sigma(gp_lengthscale, gp_variance, gp_nugget, n_inducers)
+            prec_matrix = tf.cast(tf.linalg.inv(cov_matrix), dtype=tf.float32)
+            return self._compute_precision_and_conditional_log_prob(parameter, prec_matrix, gp_mean, self.full_norm)
+        else:
+            # Sparse GP approximation using inducing points
+            if n_inducers <= 0:
+                raise ValueError("n_inducers must be a positive integer.")
 
+            # Randomly select indices for inducing points
+            inducing_indices = tf.random.shuffle(tf.range(self.n_vx))[:n_inducers]
+            inducing_indices = tf.sort(inducing_indices) # Keep them sorted for easier indexing
+
+            # Get the parameter values at the inducing points
+            inducing_parameter = tf.gather(parameter, inducing_indices)
+
+            # Get the distances between the inducing points
+            inducing_dists = tf.gather(tf.gather(self.dists, inducing_indices, axis=0), inducing_indices, axis=1)
+
+            # Calculate the covariance matrix for the inducing points
+            inducing_cov_matrix = self.return_sigma(gp_lengthscale, gp_variance, gp_nugget, dists=inducing_dists)
+            prec_matrix = tf.cast(tf.linalg.inv(inducing_cov_matrix), dtype=tf.float32)
+            return self._compute_precision_and_conditional_log_prob(inducing_parameter, prec_matrix, gp_mean, self.full_norm)
 
 # ****************************
 # **************************** 
