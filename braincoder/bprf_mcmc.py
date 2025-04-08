@@ -752,6 +752,7 @@ class GPdists():
         self.full_norm = kwargs.get('full_norm', False) # Use full normalization in precision method
         self.kernel = kwargs.get('kernel', 'RBF')
         self.fixed_params = kwargs.get('fixed_params', 'unfixed') # fixed_vl, fixed_all
+        self.inducer_selection = kwargs.get('inducer_selection', 'random')
 
         # Fixed GP hyperparameters (when fixed_params is True)
         self.f_gp_variance = kwargs.get('gp_variance', None)
@@ -912,16 +913,9 @@ class GPdists():
             # Sparse GP approximation using inducing points
             if n_inducers <= 0:
                 raise ValueError("n_inducers must be a positive integer.")
-
-            # Randomly select indices for inducing points
-            inducing_indices = tf.random.shuffle(tf.range(self.n_vx))[:n_inducers]
-            inducing_indices = tf.sort(inducing_indices) # Keep them sorted for easier indexing
-
+            inducing_indices, inducing_dists = self._return_inducing_idx_and_dists(n_inducers=n_inducers)
             # Get the parameter values at the inducing points
             inducing_parameter = tf.gather(parameter, inducing_indices)
-
-            # Get the distances between the inducing points
-            inducing_dists = tf.gather(tf.gather(self.dists, inducing_indices, axis=0), inducing_indices, axis=1)
 
             # Calculate the covariance matrix for the inducing points
             inducing_cov_matrix = self.return_sigma(gp_lengthscale, gp_variance, gp_nugget, dists=inducing_dists)
@@ -955,22 +949,34 @@ class GPdists():
             # Sparse GP approximation using inducing points
             if n_inducers <= 0:
                 raise ValueError("n_inducers must be a positive integer.")
-
-            # Randomly select indices for inducing points
-            inducing_indices = tf.random.shuffle(tf.range(self.n_vx))[:n_inducers]
-            inducing_indices = tf.sort(inducing_indices) # Keep them sorted for easier indexing
-
+            inducing_indices, inducing_dists = self._return_inducing_idx_and_dists(n_inducers=n_inducers)
             # Get the parameter values at the inducing points
             inducing_parameter = tf.gather(parameter, inducing_indices)
-
-            # Get the distances between the inducing points
-            inducing_dists = tf.gather(tf.gather(self.dists, inducing_indices, axis=0), inducing_indices, axis=1)
 
             # Calculate the covariance matrix for the inducing points
             inducing_cov_matrix = self.return_sigma(gp_lengthscale, gp_variance, gp_nugget, dists=inducing_dists)
             prec_matrix = tf.cast(tf.linalg.inv(inducing_cov_matrix), dtype=tf.float32)
             return self._compute_precision_and_conditional_log_prob(inducing_parameter, prec_matrix, gp_mean, self.full_norm)
+    
+    def _return_inducing_idx_and_dists(self, n_inducers):
+        if self.inducer_selection == 'random':
+            # Randomly select indices for inducing points
+            inducing_indices = tf.random.shuffle(tf.range(self.n_vx))[:n_inducers]
+            inducing_indices = tf.sort(inducing_indices)  # Keep them sorted for easier indexing
 
+        elif self.inducer_selection == 'close':
+            centre_idx = np.random.randint(0, self.n_vx)
+            # Get the indices of the closest n_inducers points
+            _, inducing_indices = tf.math.top_k(-self.dists[centre_idx, :], k=n_inducers)
+            inducing_indices = tf.sort(inducing_indices)  # Keep sorted
+
+        else:
+            raise ValueError(f"Unknown inducer selection method: {self.inducer_selection}")
+
+        # Gather distances for the selected inducing points
+        inducing_dists = tf.gather(tf.gather(self.dists, inducing_indices, axis=0), inducing_indices, axis=1)
+        
+        return inducing_indices, inducing_dists
 # ****************************
 # **************************** 
 @tf.function

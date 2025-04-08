@@ -76,8 +76,11 @@ class BPRF_hier(BPRF):
                 **kwargs
             )
 
-            self.h_add_bijector(pid=f'{pid}_gp_lengthscale', bijector_type=tfb.Softplus())
-            self.h_add_bijector(pid=f'{pid}_gp_variance', bijector_type=tfb.Softplus())
+            # self.h_add_bijector(pid=f'{pid}_gp_lengthscale', bijector_type=tfb.Softplus())
+            # self.h_add_bijector(pid=f'{pid}_gp_variance', bijector_type=tfb.Softplus())
+
+            self.h_add_bijector(pid=f'{pid}_gp_lengthscale', bijector_type=tfb.Exp())
+            self.h_add_bijector(pid=f'{pid}_gp_variance', bijector_type=tfb.Exp())
 
             # [3] add the priors for the new parameters - make them very broad...
             self.h_add_prior(
@@ -946,3 +949,99 @@ class BPRF_hier(BPRF):
             hdf[h] = h_opt_vars[self.h_labels[h]]
         self.h_MAP_parameters = pd.DataFrame(hdf)
         print('MAP optimization finished.')    
+
+    def fit_grid_hier_GP_only(self,
+                pid,            # Which parameter is this GP associated with 
+                pid_pars,       # The values of these parameters (e.g., obtained with a basic grid fit)
+                grids={},
+                idx = None,
+                **kwargs):
+        '''
+        Maximum a posteriori (MAP) optimization for hierarchical model using a grid search over
+        specified hyperparameters (e.g., GP lengthscale, variance, etc.). Instead of continuously
+        optimizing these hyperparameters with gradient descent, we instead evaluate the objective
+        over a grid of candidate values and select the combination that minimizes the negative log
+        posterior. The remaining parts of the hierarchical model parameters are left at their
+        initial (or previously computed) values.
+        '''
+        # Setup voxel indices
+        if idx is None:  # Use all voxels
+            idx = np.arange(self.n_voxels).tolist()
+        elif isinstance(idx, int):
+            idx = [idx]
+        vx_bool = np.zeros(self.n_voxels, dtype=bool)
+        vx_bool[idx] = True
+        self.n_vx_to_fit = len(idx)
+        self.h_fixed_pars = kwargs.pop('h_fixed_pars', {})
+        self.n_params = len(self.model_labels)
+        self.h_prep_for_fitting(**kwargs)
+        self.h_n_params = len(self.h_labels)
+
+        # Prepare parameter tensors
+        pid_pars = pid_pars.values.astype(np.float32)
+        pid_pars = tf.convert_to_tensor(pid_pars[vx_bool], dtype=tf.float32, name=pid)
+        
+        
+        g_list = [grids[i] for i in grids.keys()]
+        # Meshgrid 
+        mg_list = np.meshgrid(*g_list)
+        g_list = [i.flatten() for i in mg_list]
+        g_list = np.vstack(g_list).T
+
+        # Define the log prior function (same as in MAP fit)
+        @tf.function
+        def log_prior_fn(h_parameters):
+            p_out = 0.0
+            for h in self.h_priors_to_loop:
+                p_out += tf.reduce_sum(self.h_prior[h].prior(h_parameters[:, self.h_labels[h]]))
+            return p_out
+
+        # Define the log posterior function (including GP likelihood)
+        @tf.function
+        def log_posterior_fn(h_parameters):
+            # h_parameters = self._h_bprf_transform_parameters_forward(h_parameters)
+            h_parameters = self.h_fix_update_fn(h_parameters)
+            log_prior = log_prior_fn(h_parameters)
+            # Apply GP to parameters based on the type specified
+            if self.h_prior_to_apply[pid] == 'gp_dists':
+                gp_lengthscale = h_parameters[:, self.h_labels[f'{pid}_gp_lengthscale']]
+                gp_variance = h_parameters[:, self.h_labels[f'{pid}_gp_variance']]
+                gp_likelihood = self.h_gp_function[pid].return_log_prob(
+                    parameter=pid_pars, gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, 
+                    n_inducers=kwargs.pop('n_inducers', None),
+                )
+            elif self.h_prior_to_apply[pid] == 'gp_dists_full':
+                gp_lengthscale  = h_parameters[:, self.h_labels[f'{pid}_gp_lengthscale']]
+                gp_variance     = h_parameters[:, self.h_labels[f'{pid}_gp_variance']]
+                gp_mean         = h_parameters[:, self.h_labels[f'{pid}_gp_mean']]
+                gp_nugget       = h_parameters[:, self.h_labels[f'{pid}_gp_nugget']]
+                gp_likelihood = self.h_gp_function[pid].return_log_prob(
+                    parameter=pid_pars, gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, 
+                    gp_mean=gp_mean, gp_nugget=gp_nugget, n_inducers=kwargs.pop('n_inducers', None),
+                )
+            else:
+                raise AssertionError("Unrecognized GP prior type")
+            return tf.reduce_sum(log_prior + gp_likelihood)
+
+        best_loss = np.inf
+        best_candidate = None
+        loss_list = []
+        # Grid search: iterate over all combinations of candidate values
+        for i,g in enumerate(g_list):# Convert the current grid point to a TensorFlow tensor
+            candidate = tf.constant(g, dtype=tf.float32)
+            candidate = tf.expand_dims(candidate, axis=0) # Add a batch dimension
+            loss = -log_posterior_fn(candidate).numpy()
+            loss_list.append(loss)
+            # Update the best candidate if the current loss is lower
+            if loss < best_loss:
+                best_loss = loss
+                best_candidate = candidate.numpy()
+
+        if best_candidate is None:
+            raise ValueError("Grid search did not yield a valid candidate.")
+        # Organize parameters into a DataFrame for storage
+        hdf = {}
+        for h, idx_h in self.h_labels.items():
+            hdf[h] = best_candidate[:,idx_h]
+        self.h_MAP_parameters = pd.DataFrame(hdf)
+        return g_list, loss_list
