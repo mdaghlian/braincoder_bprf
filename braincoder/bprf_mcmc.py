@@ -806,6 +806,18 @@ class GPdists():
             raise ValueError(f"Invalid fixed_params option: {self.fixed_params}. Choose from 'unfixed', 'fixed_vl', or 'fixed_all'.")
         self.set_log_prob()
 
+
+    def prior(self, param):
+        # Compute the log-probability of the parameter under the GP prior
+        # separate - per vertex 
+        # (for none hierarchical priors)
+        diff = param - self.f_gp_mean        
+        Qp = tf.linalg.matvec(self.prec_matrix, diff)
+        diag_Q = tf.linalg.diag_part(self.prec_matrix)
+        log_probs = 0.5 * tf.math.log(diag_Q) - 0.5 * tf.math.log(2 * math.pi) - 0.5 * (Qp ** 2) / diag_Q
+        return log_probs
+        
+        
     @tf.function
     def return_sigma(self, gp_lengthscale, gp_variance, gp_nugget=0.0, dists=None):
         """

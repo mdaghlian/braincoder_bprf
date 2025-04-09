@@ -271,7 +271,7 @@ class BPRF_hier(BPRF):
         Experimental - can we fit everything at once?
         Does that even make sense?
         '''
-        self.n_inducers = kwargs.get('n_inducers', None)
+        self.n_inducers = kwargs.pop('n_inducers', None)
         if idx is None: # all of them?
             idx = np.arange(self.n_voxels).tolist()
         elif isinstance(idx, int):
@@ -313,24 +313,18 @@ class BPRF_hier(BPRF):
         
         @tf.function
         def log_posterior_fn(parameters, h_parameters):
+            # Not needed - it does this under the hood with HMC
+            # parameters = self._bprf_transform_parameters_forward(parameters)
+            # h_parameters = self._h_bprf_transform_parameters_forward(h_parameters)
             parameters = self.fix_update_fn(parameters)            
-
-            nan_mask = tf.math.is_nan(parameters)            
-            if tf.reduce_any(nan_mask):
-                nan_indices = tf.where(nan_mask)
-                tf.print("2:NaN values found in parameters at indices:", nan_indices)
-
             h_parameters = self.h_fix_update_fn(h_parameters)
             par4pred = parameters[:,:self.n_model_params] # chop out any hyper / noise parameters
             predictions = self.model._predict(
                 paradigm_[tf.newaxis, ...], par4pred[tf.newaxis, ...], None)     # Only include those parameters that are fed to the model
             residuals = y[:, vx_bool] - predictions[0]                        
-            tf.debugging.assert_all_finite(predictions, "NaN or Inf found in predictions!")                         
-            tf.debugging.assert_all_finite(residuals, "NaN or Inf found in predictions!")                                     
-            # -> rescale based on std...
-            log_likelihood = residual_ln_likelihood_fn(parameters, residuals)
+            log_likelihood = residual_ln_likelihood_fn(parameters, residuals)            
             log_prior = log_prior_fn(parameters, h_parameters)            
-            return tf.reduce_sum(log_likelihood + log_prior)
+            return tf.reduce_sum(log_prior + log_likelihood)        
         
         # -> make sure we are in the correct dtype 
         p_initial_state = [tf.convert_to_tensor(init_pars[vx_bool,i], dtype=tf.float32, name=n) for i,n in enumerate(self.model_labels.keys())]                          
@@ -449,7 +443,7 @@ class BPRF_hier(BPRF):
         Finds the parameter values that maximize the posterior distribution.
         '''
         optimizer_type = kwargs.get('optimizer', 'adam' )
-        self.n_inducers = kwargs.get('n_inducers', None)
+        self.n_inducers = kwargs.pop('n_inducers', None)
         adam_kwargs = kwargs.pop('adam_kwargs', {})
         if idx is None: # all of them?
             idx = np.arange(self.n_voxels).tolist()
