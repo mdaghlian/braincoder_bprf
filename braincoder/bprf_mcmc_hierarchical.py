@@ -76,11 +76,11 @@ class BPRF_hier(BPRF):
                 **kwargs
             )
 
-            # self.h_add_bijector(pid=f'{pid}_gp_lengthscale', bijector_type=tfb.Softplus())
-            # self.h_add_bijector(pid=f'{pid}_gp_variance', bijector_type=tfb.Softplus())
+            self.h_add_bijector(pid=f'{pid}_gp_lengthscale', bijector_type=tfb.Softplus())
+            self.h_add_bijector(pid=f'{pid}_gp_variance', bijector_type=tfb.Softplus())
 
-            self.h_add_bijector(pid=f'{pid}_gp_lengthscale', bijector_type=tfb.Exp())
-            self.h_add_bijector(pid=f'{pid}_gp_variance', bijector_type=tfb.Exp())
+            # self.h_add_bijector(pid=f'{pid}_gp_lengthscale', bijector_type=tfb.Exp())
+            # self.h_add_bijector(pid=f'{pid}_gp_variance', bijector_type=tfb.Exp())
 
             # [3] add the priors for the new parameters - make them very broad...
             self.h_add_prior(

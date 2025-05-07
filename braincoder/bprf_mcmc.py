@@ -705,7 +705,37 @@ def bprf_sample_NUTS(
     stats['elapsed_time'] = duration
 
     return samples, stats
+# Summarize MCMC
 
+def get_mcmc_summary(sampler, burnin=100, pc_range=25):
+    keys = sampler[0].keys()
+    n_voxels = len(sampler)
+    bpars = {}
+    bpars_m = {}
+    for p in list(keys): 
+        m = []
+        q1 = []
+        q2 = []
+        uc = []
+        std = []
+        for idx in range(n_voxels):
+            this_p = sampler[idx][p][burnin:].to_numpy()
+            m.append(np.percentile(this_p,50))
+            tq1 = np.percentile(this_p, pc_range)
+            tq2 = np.percentile(this_p, 100-pc_range)
+            tuc = tq2 - tq1
+            
+            q1.append(tq1)
+            q2.append(tq2)
+            uc.append(tuc)
+            std.append(np.std(this_p))
+        bpars_m[p] = np.array(m)
+        bpars[f'm_{p}'] = np.array(m)
+        bpars[f'q1_{p}'] = np.array(q1)
+        bpars[f'q2_{p}'] = np.array(q2)
+        bpars[f'uc_{p}'] = np.array(uc)
+        bpars[f'std_{p}'] = np.array(std)
+    return pd.DataFrame(bpars) #, pd.DataFrame(bpars_m)
 import operator
 
 def reorder_dataframe_columns(pd_to_fix, dict_index):
@@ -808,13 +838,13 @@ class GPdists():
 
 
     def prior(self, param):
-        # Compute the log-probability of the parameter under the GP prior
-        # separate - per vertex 
-        # (for none hierarchical priors)
-        diff = param - self.f_gp_mean        
-        Qp = tf.linalg.matvec(self.prec_matrix, diff)
-        diag_Q = tf.linalg.diag_part(self.prec_matrix)
-        log_probs = 0.5 * tf.math.log(diag_Q) - 0.5 * tf.math.log(2 * math.pi) - 0.5 * (Qp ** 2) / diag_Q
+        # Compute the conditional log-probability of the parameter under the GP prior
+        diff = param - self.f_gp_mean
+        raw_score = tf.linalg.matvec(self.prec_matrix, diff)
+        prec_ii = tf.linalg.diag_part(self.prec_matrix)
+        logZ = 0.5 * (tf.math.log(prec_ii) - tf.math.log(2 * math.pi))
+        quadratic = -0.5 * tf.square(raw_score) / prec_ii
+        log_probs = logZ + quadratic
         return log_probs
         
         
@@ -864,12 +894,41 @@ class GPdists():
             two_pi = tf.constant(2 * math.pi, dtype=diff.dtype)
             return 0.5 * log_det_prec - 0.5 * quad_form - 0.5 * n * tf.math.log(two_pi)
         else:
-            # Original element-wise (conditional) formulation:
+            # Compute the conditional log-probability of the parameter under the GP prior
+            # i.e.
+            # > Compute [ log p(x_i | x_{-i}) ] for each entry i
+            # > under N(μ, Λ⁻¹).             
+                    
+            # 1) Centre the parameters
+            #    diff[i] = x_i - μ_i
             diff = parameter - gp_mean
-            Qp = tf.linalg.matvec(prec_matrix, diff)
-            diag_Q = tf.linalg.diag_part(prec_matrix)
-            log_probs = 0.5 * tf.math.log(diag_Q) - 0.5 * tf.math.log(2 * math.pi) - 0.5 * (Qp ** 2) / diag_Q
-            return tf.reduce_sum(log_probs)
+
+            # 2) Influence of other parameters (x_{-i}) on x_i
+            #    raw_score[i] = sum_j Λ[i,j] * diff[j]
+            raw_score = tf.linalg.matvec(prec_matrix, diff)
+
+            # 3) Precision matrix diagonal 
+            #    prec_ii = Λ[i,i], the scalar precision for x_i | x_-i
+            prec_ii = tf.linalg.diag_part(prec_matrix)
+
+            # 4) Normalization per Gaussian bell curve
+            #    logZ[i] = ½ (log prec_ii – log(2π))
+            #    → padds the height of the curve so it integrates to 1
+            logZ = 0.5 * (tf.math.log(prec_ii) - tf.math.log(2 * math.pi))
+
+            # 5) Quadratic term - penalty for deviation from the mean
+            #    Algebra shows that
+            #      (x_i – E[x_i|x_-i]) = raw_score[i] / prec_ii
+            #    So the penalty is
+            #      –½ · prec_ii · (x_i – E[·])²
+            #    which rearranges to:
+            #      –½ · (raw_score[i])² / prec_ii
+            quadratic = -0.5 * tf.square(raw_score) / prec_ii
+
+            # 6) Combine them: each entry is
+            #      log p(x_i|x_-i) = logZ[i] + quadratic[i]
+            log_probs = logZ + quadratic
+            return log_probs   # shape [n]
 
     def set_log_prob(self):
         """
