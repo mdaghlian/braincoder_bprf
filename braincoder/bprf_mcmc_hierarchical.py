@@ -115,7 +115,7 @@ class BPRF_hier(BPRF):
             self.h_add_prior(
                 pid=f'{pid}_gp_lengthscale', 
                 prior_type='HalfNormal', 
-                distribution=tfd.HalfNormal(scale=10)
+                distribution=tfd.HalfNormal(scale=20)
                 )
             self.h_add_prior(
                 pid=f'{pid}_gp_variance', 
@@ -131,6 +131,33 @@ class BPRF_hier(BPRF):
                 pid=f'{pid}_gp_mean', 
                 prior_type='none', 
                 )                
+        elif h_prior_to_apply=='gp_dists_m':
+            # Gaussian process based on geodesic distance
+            # include... everything
+            # Need to have premade the GPDistsM object 
+            self.h_gp_function[pid] = kwargs.pop('gp_obj')
+            current_n_labels = len(self.h_labels)
+            new_h_labels = []
+            for k in self.h_gp_function[pid].pids_inv.keys():
+                # Add the keys + index
+                self.h_labels[f'{pid}_{k}'] = self.h_gp_function[pid].pids_inv[k]+current_n_labels
+                new_h_labels.append(f'{pid}_{k}')
+            # Bijectors
+            for k in new_h_labels:
+                if any([substr in k for substr in ['_l', '_v', '_nugget']]):
+                    self.h_add_bijector(pid=k, bijector_type=tfb.Softplus())        
+                else:
+                    self.h_add_bijector(pid=k, bijector_type=tfb.Identity())        
+
+            for k in new_h_labels:
+                if any([substr in k for substr in ['_l', '_v', '_nugget']]):
+                    self.h_add_prior(
+                        pid=k, 
+                        prior_type='HalfNormal', 
+                        distribution=tfd.HalfNormal(scale=20)
+                        )
+                else:
+                    self.h_add_prior(pid=k, prior_type='none')
 
     
     def h_add_bijector(self, pid, bijector_type, **kwargs):
@@ -378,7 +405,9 @@ class BPRF_hier(BPRF):
             self.mcmc_sampler[ivx_fit] = pd.DataFrame(estimated_p_dict)
         
         h_samples = tf.stack(samples[self.n_params:], axis=-1).numpy().squeeze()
+        print(h_samples.shape)
         for h in self.h_labels:
+            print(self.h_labels[h])
             self.h_mcmc_sampler[h] = h_samples[:,self.h_labels[h]]
         self.h_mcmc_sampler = pd.DataFrame(self.h_mcmc_sampler)
         self.mcmc_stats = stats            
@@ -618,6 +647,16 @@ class BPRF_hier(BPRF):
                         gp_mean=gp_mean, gp_nugget=gp_nugget,
                         n_inducers=self.n_inducers,
                     )
+                elif self.h_prior_to_apply[h]=='gp_dists_m':
+                    param_values = parameters[:, self.model_labels[h]] # Values of parameter 'h' for vertices being fit
+                    gpkwargs = {}
+                    for k in self.h_labels:
+                        if h in k:
+                            gpkwargs[k.split(f'{h}_')[-1]] = h_parameters[:, self.h_labels[k]]
+                    p_out += self.h_gp_function[h].return_log_prob(
+                        parameter=param_values, n_inducers=self.n_inducers,
+                        **gpkwargs,
+                    )
 
                     
             for h in self.h_priors_to_loop:
@@ -744,6 +783,15 @@ class BPRF_hier(BPRF):
                     parameter=pid_pars, gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, 
                     gp_mean=gp_mean, gp_nugget=gp_nugget, n_inducers=n_inducers,
                 )
+            elif self.h_prior_to_apply[pid]=='gp_dists_m':
+                gpkwargs = {}
+                for k in self.h_labels:
+                    if pid in k:
+                        gpkwargs[k.split(f'{pid}_')[-1]] = h_parameters[:, self.h_labels[k]]
+                gp_likelihood = self.h_gp_function[pid].return_log_prob(
+                    parameter=pid_pars, n_inducers=self.n_inducers,
+                    **gpkwargs,
+                )                
             else:
                 raise AssertionError
             return tf.reduce_sum(log_prior + gp_likelihood)
@@ -819,7 +867,7 @@ class BPRF_hier(BPRF):
         '''
         optimizer_type = kwargs.get('optimizer', 'adam' )
         adam_kwargs = kwargs.pop('adam_kwargs', {})
-        n_inducers = kwargs.pop('n_inducers', None)
+        self.n_inducers = kwargs.pop('n_inducers', None)
         if idx is None: # all of them?
             idx = np.arange(self.n_voxels).tolist()
         elif isinstance(idx, int):
@@ -859,7 +907,7 @@ class BPRF_hier(BPRF):
                 gp_variance = h_parameters[:, self.h_labels[f'{pid}_gp_variance']] # Current value of GP variance hyperparameter
                 gp_likelihood = self.h_gp_function[pid].return_log_prob(
                     parameter=pid_pars, gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, 
-                    n_inducers=n_inducers,
+                    n_inducers=self.n_inducers,
                 )
             elif self.h_prior_to_apply[pid]=='gp_dists_full':
                 gp_lengthscale  = h_parameters[:, self.h_labels[f'{pid}_gp_lengthscale']] # Current value of GP lengthscale hyperparameter
@@ -868,8 +916,17 @@ class BPRF_hier(BPRF):
                 gp_nugget       = h_parameters[:, self.h_labels[f'{pid}_gp_nugget']] # Current value of GP variance hyperparameter
                 gp_likelihood = self.h_gp_function[pid].return_log_prob(
                     parameter=pid_pars, gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, 
-                    gp_mean=gp_mean, gp_nugget=gp_nugget, n_inducers=n_inducers,
+                    gp_mean=gp_mean, gp_nugget=gp_nugget, n_inducers=self.n_inducers,
                 )
+            elif self.h_prior_to_apply[pid]=='gp_dists_m':
+                gpkwargs = {}
+                for k in self.h_labels:
+                    if pid in k:
+                        gpkwargs[k.split(f'{pid}_')[-1]] = h_parameters[:, self.h_labels[k]]
+                gp_likelihood = self.h_gp_function[pid].return_log_prob(
+                    parameter=pid_pars, n_inducers=self.n_inducers,
+                    **gpkwargs,
+                )                     
             else:
                 raise AssertionError
             return tf.reduce_sum(log_prior + gp_likelihood)

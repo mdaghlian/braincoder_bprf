@@ -795,8 +795,11 @@ class GPdists():
         self.embedding_dim = kwargs.get('embedding_dim', 10)
         self.dists_dtype   = kwargs.get('dists_dtype', tf.float64)
         self.dists_raw = tf.convert_to_tensor(dists, dtype=self.dists_dtype)
-        self.dists_raw = (self.dists_raw + tf.transpose(self.dists_raw)) / 2.0
-
+        self.dists_raw = (self.dists_raw + tf.transpose(self.dists_raw)) / 2.0        
+        
+        # 2-element seed for stateless RNG; will be incremented each call
+        self._seed = tf.Variable([0, 0], dtype=tf.int32, trainable=False)
+        
         if self.psd_control == 'euclidean':
             print('Embedding in Euclidean space...')
             X = mds_embedding(self.dists_raw, self.embedding_dim)
@@ -836,7 +839,7 @@ class GPdists():
             raise ValueError(f"Invalid fixed_params option: {self.fixed_params}. Choose from 'unfixed', 'fixed_vl', or 'fixed_all'.")
         self.set_log_prob()
 
-
+    @tf.function
     def prior(self, param):
         # Compute the conditional log-probability of the parameter under the GP prior
         diff = param - self.f_gp_mean
@@ -1029,14 +1032,29 @@ class GPdists():
             prec_matrix = tf.cast(tf.linalg.inv(inducing_cov_matrix), dtype=tf.float32)
             return self._compute_precision_and_conditional_log_prob(inducing_parameter, prec_matrix, gp_mean, self.full_norm)
     
+    @tf.function
     def _return_inducing_idx_and_dists(self, n_inducers):
+        # increment the seed each call - necessary because otherwise when graph is drawn it doesn't change...
+        new_seed = self._seed.assign_add([1, 1])
+        # FOR DEBUGGING -> PRINT IT
+        # 2) print it for debugging
+        # tf.print("debug — new_seed:", new_seed)        
         if self.inducer_selection == 'random':
             # Randomly select indices for inducing points
-            inducing_indices = tf.random.shuffle(tf.range(self.n_vx))[:n_inducers]
+            inducing_indices = tf.random.experimental.stateless_shuffle(
+                tf.range(self.n_vx),
+                seed=new_seed)[:n_inducers]
             inducing_indices = tf.sort(inducing_indices)  # Keep them sorted for easier indexing
 
         elif self.inducer_selection == 'close':
-            centre_idx = np.random.randint(0, self.n_vx)
+            # centre_idx = np.random.randint(0, self.n_vx)
+            centre_idx = tf.random.stateless_uniform(
+                shape=[],
+                minval=0,
+                maxval=self.n_vx,
+                dtype=tf.int32,
+                seed=new_seed
+            )            
             # Get the indices of the closest n_inducers points
             _, inducing_indices = tf.math.top_k(-self.dists[centre_idx, :], k=n_inducers)
             inducing_indices = tf.sort(inducing_indices)  # Keep sorted
@@ -1049,6 +1067,298 @@ class GPdists():
         
         return inducing_indices, inducing_dists
 # ****************************
+class GPdistsM():
+    def __init__(self, n_vx, **kwargs):
+        """
+        More complex GPdists class -> 
+        
+        Objective: contruct a multivariate normal distribution to obtain the 
+        log probability of a list of values
+
+        N(m,K+nugget)
+        -> we construct m, the mean function
+        -> we construct K, the covariance function
+        -> with a nugget, for stability        
+
+        Args:
+            dists (dict of dists) : The input distance matrix.
+            **kwargs: Optional parameters for controlling behavior, such as:
+                - psd_control: Method for ensuring positive semidefiniteness.
+                - dists_dtype: Data type for tensor conversion.
+                - kernel: Choice of covariance function (default: 'RBF').
+        """
+        self.n_vx = n_vx
+        self.inducer_selection = kwargs.get('inducer_selection', 'random')
+        # 2-element seed for stateless RNG; will be incremented each call
+        self._seed = tf.Variable([0, 0], dtype=tf.int32, trainable=False)
+
+        # Setup distance matrix and positive semidefinite control
+        self.psd_control   = kwargs.get('psd_control', 'euclidean')  # 'euclidean' or 'none'
+        self.embedding_dim = kwargs.get('embedding_dim', 10)
+        self.dists_dtype   = kwargs.get('dists_dtype', tf.float64)
+
+        self.stat_kernel_list = []
+        self.lin_kernel_list = []
+        self.mfunc_list = []
+        self.mfunc_bijector = tfb.Identity()
+        self.Xs = {}
+        self.dXs = {}
+        self.kernel_type = {}
+        self.pids = {}
+        # Index of parameters to be passed...
+        self.pids[0] = 'gpk_nugget' # Global nugget term
+        self.pids[1] = 'mfunc_mean' # Global mean term 
+        self.pids_inv = {}
+        self._update_pids_inv()
+        self.return_log_prob = self._return_log_prob_unfixed # by default, return log prob unfixed...
+        self.gp_prior_dist = []
+
+    def _update_pids_inv(self):
+        self.pids_inv = {}
+        self.pids_inv = {v:k for k,v in self.pids.items()}
+
+    def add_xid_stationary_kernel(self, xid, **kwargs):
+        ''' add a kernel 
+        '''
+        Xs = kwargs.get('Xs', None)
+        dXs = kwargs.get('dXs', None)
+        psd_control = kwargs.get('psd_control', self.psd_control)
+        embedding_dim = kwargs.get('embedding_dim', self.embedding_dim)
+        self.kernel_type[xid] = kwargs.get('kernel_type', 'RBF')                
+        self.stat_kernel_list.append(xid)
+
+        if dXs is None:
+            # Get distances from 
+            dXs = compute_euclidean_distance_matrix(Xs[...,np.newaxis])        
+        if psd_control == 'euclidean':
+            print('Embedding in Euclidean space...')
+            dXs = mds_embedding(dXs, embedding_dim)
+            dXs = compute_euclidean_distance_matrix(dXs)
+        self.dXs[xid] = tf.convert_to_tensor(dXs, dtype=self.dists_dtype)
+        self.dXs[xid] = (self.dXs[xid] + tf.transpose(self.dXs[xid])) / 2.0        
+        # Add a lengthscale & a variance
+        self.pids[len(self.pids)] = f'gpk{xid}_l'
+        self.pids[len(self.pids)] = f'gpk{xid}_v'
+
+        # Update the inverse dictionary
+        self._update_pids_inv()        
+
+    def add_xid_linear_kernel(self, xid, **kwargs):
+        ''' add a kernel
+        '''
+        Xs = kwargs.get('Xs', None)
+        self.kernel_type[xid] = 'linear'
+        self.lin_kernel_list.append(xid)
+        
+        self.Xs[xid] = tf.expand_dims(tf.convert_to_tensor(Xs, dtype=self.dists_dtype), axis=1)
+        # Add a lengthscale & a variance
+        self.pids[len(self.pids)] = f'gpk{xid}_slope'
+        self.pids[len(self.pids)] = f'gpk{xid}_const'
+
+        # Update the inverse dictionary
+        self._update_pids_inv()        
+    
+    def add_xid_linear_mfunc(self, xid, **kwargs):
+        ''' add a kernel
+        '''
+        Xs = kwargs.get('Xs', None)
+        self.mfunc_list.append(xid)        
+        self.Xs[xid] = tf.expand_dims(tf.convert_to_tensor(Xs, dtype=self.dists_dtype), axis=1)
+        # Add a lengthscale & a variance
+        self.pids[len(self.pids)] = f'mfunc{xid}_slope'
+        self.pids[len(self.pids)] = f'mfunc{xid}_const'
+
+        # Update the inverse dictionary
+        self._update_pids_inv()
+    
+    @tf.function
+    def _return_mfunc(self, inducing_indices=None, **kwargs):
+        '''Return the mean function
+        '''
+        if inducing_indices is None:
+            inducing_indices = tf.range(self.n_vx)        
+        # Start of with zero then add any regressors...
+        m_out = tf.zeros(len(inducing_indices), dtype=self.dists_dtype) + tf.cast(kwargs['mfunc_mean'], self.dists_dtype) # global mean...
+        for m in self.mfunc_list:
+            m_out += tf.squeeze(self._return_mfunc_xid_linear(
+                mfunc_slope=kwargs[f'mfunc{m}_slope'],
+                mfunc_const=kwargs[f'mfunc{m}_const'],
+                Xs=tf.gather(self.Xs[m], inducing_indices, axis=0)
+            ))
+        return self.mfunc_bijector(tf.cast(m_out, dtype=tf.float32))
+
+    @tf.function 
+    def _return_mfunc_xid_linear(self, mfunc_slope, mfunc_const, Xs):
+        '''linear kernel
+        '''
+        mfunc_slope = tf.cast(mfunc_slope, dtype=self.dists_dtype)
+        mfunc_const = tf.cast(mfunc_const, dtype=self.dists_dtype)        
+        m_out = mfunc_slope * Xs + mfunc_const 
+        return m_out
+    
+    @tf.function
+    def _return_sigma(self, inducing_indices=None, **kwargs):
+        ''' Putting all the kernels together - > return the covariance matrix
+        '''
+        if inducing_indices is None:
+            inducing_indices = tf.range(self.n_vx)
+        # Start covariance matrix from zero...
+        s_out = tf.zeros((len(inducing_indices),len(inducing_indices)), dtype=self.dists_dtype)
+        
+        # Add in any linear kernels
+        for s in self.lin_kernel_list:
+            s_out += self._return_sigma_xid_linear(
+                gpk_slope=kwargs[f'gpk{s}_slope'],
+                gpk_const=kwargs[f'gpk{s}_const'],
+                Xs=tf.gather(self.Xs[s], inducing_indices, axis=0)
+            )
+        
+        # Add in any stationary kernels (e.g., RBF)
+        for s in self.stat_kernel_list:
+            s_out += self._return_sigma_xid_stationary(
+                gpk_l=kwargs[f'gpk{s}_l'],
+                gpk_v=kwargs[f'gpk{s}_v'],
+                dXs=tf.gather(tf.gather(self.dXs[s], inducing_indices, axis=0), inducing_indices, axis=1),
+                kernel_type=self.kernel_type[s]
+            )
+        
+        # Add the nugget term
+        s_out += tf.eye(s_out.shape[0], dtype=self.dists_dtype) * tf.cast(1e-3 + kwargs[f'gpk_nugget'], dtype=self.dists_dtype)
+        return s_out        
+
+        
+
+    @tf.function
+    def _return_sigma_xid_stationary(self, gpk_l, gpk_v, dXs, kernel_type):
+        """
+        Computes the covariance matrix using the chosen kernel.
+
+        Args:
+            gp_l (float): Lengthscale parameter.
+            gp_v (float): Variance parameter.
+
+        Returns:
+            tf.Tensor: Covariance matrix.
+        """
+        gpk_v = tf.cast(gpk_v, dtype=self.dists_dtype)
+        gpk_l = tf.cast(gpk_l, dtype=self.dists_dtype)
+
+        if kernel_type == 'RBF':
+            cov_matrix = tf.square(gpk_v) * tf.exp(
+                -tf.square(dXs) / (2.0 * tf.square(gpk_l))
+            )
+        elif kernel_type == 'matern52':
+            sqrt5 = tf.cast(tf.sqrt(5.0), dtype=self.dists_dtype)
+            frac1 = (sqrt5 * dXs) / gpk_l
+            frac2 = (5.0 * tf.square(dXs)) / (3.0 * tf.square(gpk_l))
+            cov_matrix = tf.square(gpk_v) * (1 + frac1 + frac2) * tf.exp(-frac1)
+        elif kernel_type == 'laplace':
+            cov_matrix = tf.square(gpk_l) * tf.exp(-dXs / gpk_l)
+        else:
+            raise ValueError("Unsupported kernel: {}".format(kernel_type))
+        # Add nugget term for numerical stability
+        return cov_matrix 
+    
+    def _return_sigma_xid_linear(self, gpk_slope, gpk_const, Xs):
+        '''linear kernel
+        '''
+        gpk_slope = tf.cast(gpk_slope, dtype=self.dists_dtype)
+        gpk_const = tf.cast(gpk_const, dtype=self.dists_dtype)        
+        cov_matrix = gpk_slope**2 * (Xs-gpk_const) * (tf.transpose(Xs) - gpk_const)
+        return cov_matrix
+
+    def set_log_prob_fixed(self,**kwargs):
+        # Create a one off covariance matrix -> then use it to get probability each time...
+        # Get cov matrix
+        cov_matrix = self._return_sigma(**kwargs)
+        chol = tf.linalg.cholesky(tf.cast(cov_matrix, dtype=self.dists_dtype))
+        # Get mean vector
+        m_vect = self._return_mfunc(**kwargs)
+        self.gp_prior_dist = tfd.MultivariateNormalTriL(
+            loc=tf.fill([self.n_vx], tf.squeeze(m_vect)),
+            scale_tril=tf.cast(chol, dtype=tf.float32),
+            allow_nan_stats=False,
+        )
+        self.return_log_prob = self._return_log_prob_fixed
+
+    @tf.function
+    def _return_log_prob_unfixed(self, parameter, n_inducers=None, **kwargs):
+        """
+        Unfixed parameters using TensorFlow distribution.
+        Recompute covariance and Cholesky decomposition on the fly.
+        Optionally uses random selection of n_inducers for sparse GP approximation.
+        """
+        inducing_indices = self._return_inducing_idx(n_inducers=n_inducers)
+        inducing_parameter = tf.gather(parameter, inducing_indices)
+        # Get cov matrix
+        cov_matrix = self._return_sigma(
+            inducing_indices=inducing_indices,
+            **kwargs,            
+            )
+        chol = tf.linalg.cholesky(tf.cast(cov_matrix, dtype=self.dists_dtype))
+        # Get mean vector
+        m_vect = self._return_mfunc(
+            inducing_indices=inducing_indices,
+            **kwargs
+            )
+        gp_prior_dist = tfd.MultivariateNormalTriL(
+            loc=tf.squeeze(tf.cast(m_vect, dtype=tf.float32)), #tf.fill([self.n_vx], tf.squeeze(m_vect)),
+            scale_tril=tf.cast(chol, dtype=tf.float32),
+            allow_nan_stats=False,
+        )
+        return gp_prior_dist.log_prob(inducing_parameter)
+
+    @tf.function
+    def _return_log_prob_fixed(self, parameter, **kwargs):
+        """
+        Unfixed parameters using TensorFlow distribution.
+        Recompute covariance and Cholesky decomposition on the fly.
+        Optionally uses random selection of n_inducers for sparse GP approximation.
+        """
+        return self.gp_prior_dist.log_prob(parameter)
+    
+    def add_mfunc_bijector(self, bijector_type, **kwargs):
+        ''' add transformations to parameters so that they are fit smoothly        
+        
+        identity        - do nothing
+        softplus        - don't let anything be negative
+
+        '''
+        dtype = kwargs.get('dtype', self.dists_dtype)
+        if bijector_type == 'identity':
+            self.mfunc_bijector = tfb.Identity()        
+        elif bijector_type == 'softplus':
+            # Don't let anything be negative
+            self.mfunc_bijector = tfb.Softplus()
+        elif bijector_type == 'sigmoid':
+            self.mfunc_bijector = tfb.Sigmoid(
+                low=kwargs.get('low'), high=kwargs.get('high'),
+            )
+        else:
+            self.mfunc_bijector = bijector_type
+
+    @tf.function
+    def _return_inducing_idx(self, n_inducers):        
+        if n_inducers is None or n_inducers >= self.n_vx:
+            # Everything...
+            return tf.range(self.n_vx)
+
+        # increment the seed each call - necessary because otherwise when graph is drawn it doesn't change...        
+        new_seed = self._seed.assign_add([1, 1])
+        # FOR DEBUGGING -> PRINT IT
+        # 2) print it for debugging
+        # tf.print("debug — new_seed:", new_seed)        
+        if self.inducer_selection == 'random':
+            # Randomly select indices for inducing points
+            inducing_indices = tf.random.experimental.stateless_shuffle(
+                tf.range(self.n_vx),
+                seed=new_seed)[:n_inducers]
+            inducing_indices = tf.sort(inducing_indices)  # Keep them sorted for easier indexing
+        else:
+            raise ValueError(f"Unknown inducer selection method: {self.inducer_selection}")
+
+        return inducing_indices 
+
 # **************************** 
 @tf.function
 def mds_embedding(distance_matrix, embedding_dim=10, eps=1e-3):
