@@ -1094,20 +1094,25 @@ class GPdistsM():
 
         # Setup distance matrix and positive semidefinite control
         self.psd_control   = kwargs.get('psd_control', 'euclidean')  # 'euclidean' or 'none'
+        self.eps           = kwargs.get('eps', 1e-6)
         self.embedding_dim = kwargs.get('embedding_dim', 10)
         self.dists_dtype   = kwargs.get('dists_dtype', tf.float64)
 
         self.stat_kernel_list = []
         self.lin_kernel_list = []
+        self.spec_kernel_list = []
         self.mfunc_list = []
         self.mfunc_bijector = tfb.Identity()
         self.Xs = {}
         self.dXs = {}
+        self.eig_vals = {}
+        self.eig_vects = {}
         self.kernel_type = {}
         self.pids = {}
         # Index of parameters to be passed...
         self.pids[0] = 'gpk_nugget' # Global nugget term
-        self.pids[1] = 'mfunc_mean' # Global mean term 
+        self.pids[1] = 'gpk_var'    # Global variance term
+        self.pids[2] = 'mfunc_mean' # Global mean term 
         self.pids_inv = {}
         self._update_pids_inv()
         self.return_log_prob = self._return_log_prob_unfixed # by default, return log prob unfixed...
@@ -1117,6 +1122,50 @@ class GPdistsM():
         self.pids_inv = {}
         self.pids_inv = {v:k for k,v in self.pids.items()}
 
+    # **************** MEAN FUNCTIONS ***************
+    def add_xid_linear_mfunc(self, xid, **kwargs):
+        ''' add a kernel
+        '''
+        Xs = kwargs.get('Xs', None)
+        self.mfunc_list.append(xid)        
+        self.Xs[xid] = tf.expand_dims(tf.convert_to_tensor(Xs, dtype=self.dists_dtype), axis=1)
+        # Add a lengthscale & a variance
+        self.pids[len(self.pids)] = f'mfunc{xid}_slope'
+        self.pids[len(self.pids)] = f'mfunc{xid}_const'
+
+        # Update the inverse dictionary
+        self._update_pids_inv()
+    
+    @tf.function
+    def _return_mfunc(self, inducing_indices=None, **kwargs):
+        '''Return the mean function
+        '''
+        if inducing_indices is None:
+            inducing_indices = tf.range(self.n_vx)        
+        # Start of with zero then add any regressors...
+        m_out = tf.zeros(len(inducing_indices), dtype=self.dists_dtype) + tf.cast(kwargs['mfunc_mean'], self.dists_dtype) # global mean...
+        for m in self.mfunc_list:
+            m_out += tf.squeeze(self._return_mfunc_xid_linear(
+                mfunc_slope=kwargs[f'mfunc{m}_slope'],
+                mfunc_const=kwargs[f'mfunc{m}_const'],
+                Xs=tf.gather(self.Xs[m], inducing_indices, axis=0)
+            ))
+        return self.mfunc_bijector(tf.cast(m_out, dtype=tf.float32))
+
+    @tf.function 
+    def _return_mfunc_xid_linear(self, mfunc_slope, mfunc_const, Xs):
+        '''linear kernel
+        '''
+        mfunc_slope = tf.cast(mfunc_slope, dtype=self.dists_dtype)
+        mfunc_const = tf.cast(mfunc_const, dtype=self.dists_dtype)        
+        m_out = mfunc_slope * Xs + mfunc_const 
+        return m_out
+
+    # ************************************************************************    
+    # ************************************************************************
+    # ************************************************************************
+
+    # *** Stationary 
     def add_xid_stationary_kernel(self, xid, **kwargs):
         ''' add a kernel 
         '''
@@ -1158,44 +1207,29 @@ class GPdistsM():
         # Update the inverse dictionary
         self._update_pids_inv()        
     
-    def add_xid_linear_mfunc(self, xid, **kwargs):
-        ''' add a kernel
-        '''
-        Xs = kwargs.get('Xs', None)
-        self.mfunc_list.append(xid)        
-        self.Xs[xid] = tf.expand_dims(tf.convert_to_tensor(Xs, dtype=self.dists_dtype), axis=1)
-        # Add a lengthscale & a variance
-        self.pids[len(self.pids)] = f'mfunc{xid}_slope'
-        self.pids[len(self.pids)] = f'mfunc{xid}_const'
+    def add_xid_spectral_kernel(self, xid, **kwargs):
+        # existing code ...
+        self.kernel_type[xid] = kwargs.get('kernel_type', 'spec_exp')                
+        # store eigenvalues and eigenvectors
+        self.eig_vals[xid] = tf.convert_to_tensor(kwargs['eig_vals'], dtype=self.dists_dtype)
+        self.eig_vects[xid] = tf.convert_to_tensor(kwargs['eig_vects'], dtype=self.dists_dtype)
 
-        # Update the inverse dictionary
+        # if spectral, expect precomputed eigenpairs
+        if self.kernel_type[xid] == 'spec_exp':
+            self.pids[len(self.pids)] = f'gpk{xid}_spec_l'
+            self.pids[len(self.pids)] = f'gpk{xid}_spec_v'
+
+        elif self.kernel_type[xid] == 'spec_heat':
+            self.pids[len(self.pids)] = f'gpk{xid}_spec_t'
+
+        elif self.kernel_type[xid] == 'spec_ratquad':
+            self.pids[len(self.pids)] = f'gpk{xid}_spec_alpha'
+            self.pids[len(self.pids)] = f'gpk{xid}_spec_beta'
+
+        self.spec_kernel_list.append(xid)
         self._update_pids_inv()
-    
-    @tf.function
-    def _return_mfunc(self, inducing_indices=None, **kwargs):
-        '''Return the mean function
-        '''
-        if inducing_indices is None:
-            inducing_indices = tf.range(self.n_vx)        
-        # Start of with zero then add any regressors...
-        m_out = tf.zeros(len(inducing_indices), dtype=self.dists_dtype) + tf.cast(kwargs['mfunc_mean'], self.dists_dtype) # global mean...
-        for m in self.mfunc_list:
-            m_out += tf.squeeze(self._return_mfunc_xid_linear(
-                mfunc_slope=kwargs[f'mfunc{m}_slope'],
-                mfunc_const=kwargs[f'mfunc{m}_const'],
-                Xs=tf.gather(self.Xs[m], inducing_indices, axis=0)
-            ))
-        return self.mfunc_bijector(tf.cast(m_out, dtype=tf.float32))
 
-    @tf.function 
-    def _return_mfunc_xid_linear(self, mfunc_slope, mfunc_const, Xs):
-        '''linear kernel
-        '''
-        mfunc_slope = tf.cast(mfunc_slope, dtype=self.dists_dtype)
-        mfunc_const = tf.cast(mfunc_const, dtype=self.dists_dtype)        
-        m_out = mfunc_slope * Xs + mfunc_const 
-        return m_out
-    
+
     @tf.function
     def _return_sigma(self, inducing_indices=None, **kwargs):
         ''' Putting all the kernels together - > return the covariance matrix
@@ -1221,13 +1255,22 @@ class GPdistsM():
                 dXs=tf.gather(tf.gather(self.dXs[s], inducing_indices, axis=0), inducing_indices, axis=1),
                 kernel_type=self.kernel_type[s]
             )
+
+        for s in self.spec_kernel_list:
+            spec_kwargs = {i.replace(s,''):k for i,k in kwargs.items() if 'spec' in i}
+            s_out += self._return_sigma_xid_spectral(
+                eig_vals = self.eig_vals[s],
+                eig_vects = tf.gather(self.eig_vects[s], inducing_indices, axis=0),
+                kernel_type=self.kernel_type[s],
+                **spec_kwargs,
+            )
+
         
+        s_out *= tf.cast(kwargs['gpk_var'], dtype=self.dists_dtype)
         # Add the nugget term
-        s_out += tf.eye(s_out.shape[0], dtype=self.dists_dtype) * tf.cast(1e-3 + kwargs[f'gpk_nugget'], dtype=self.dists_dtype)
+        s_out += tf.eye(s_out.shape[0], dtype=self.dists_dtype) * tf.cast(self.eps + kwargs[f'gpk_nugget'], dtype=self.dists_dtype)
         return s_out        
-
         
-
     @tf.function
     def _return_sigma_xid_stationary(self, gpk_l, gpk_v, dXs, kernel_type):
         """
@@ -1259,6 +1302,7 @@ class GPdistsM():
         # Add nugget term for numerical stability
         return cov_matrix 
     
+    @tf.function
     def _return_sigma_xid_linear(self, gpk_slope, gpk_const, Xs):
         '''linear kernel
         '''
@@ -1267,6 +1311,48 @@ class GPdistsM():
         cov_matrix = gpk_slope**2 * (Xs-gpk_const) * (tf.transpose(Xs) - gpk_const)
         return cov_matrix
 
+    @tf.function
+    def _return_sigma_xid_spectral(self, eig_vals, eig_vects, kernel_type, **kwargs):
+        """
+        Compute covariance matrix from spectral kernel:
+        K = eig_vects @ diag(var * f(eig_vals)) @ eig_vects^T
+
+        Args:
+            eig_vals: Tensor of eigenvalues [M]
+            eig_vects: Tensor of eigenvectors [N, M]
+            kernel_type: str, e.g., 'spec_exp', 'spec_heat', etc.
+            **kwargs: Hyperparameters depending on kernel_type
+
+        Returns:
+            Covariance matrix [N, N]
+        """
+        eig_vals = tf.cast(eig_vals, dtype=self.dists_dtype)
+        
+        if kernel_type == 'spec_exp':
+            ell = tf.cast(kwargs['gpk_spec_l'], dtype=self.dists_dtype)
+            var = tf.cast(kwargs['gpk_spec_v'], dtype=self.dists_dtype)
+            f_lambda = tf.exp(-tf.sqrt(eig_vals) / ell)
+
+        elif kernel_type == 'spec_heat':
+            t = tf.cast(kwargs['gpk_spec_t'], dtype=self.dists_dtype)
+            f_lambda = tf.exp(-t * eig_vals)
+            var = 1.0  # assume unit variance, or include a `spec_v` if needed
+
+        elif kernel_type == 'spec_ratquad':
+            alpha = tf.cast(kwargs['gpk_spec_alpha'], dtype=self.dists_dtype)
+            beta = tf.cast(kwargs['gpk_spec_beta'], dtype=self.dists_dtype)
+            f_lambda = tf.math.pow(1.0 + eig_vals / alpha, -beta)
+            var = 1.0
+
+        else:
+            raise ValueError(f"Unknown spectral kernel type: {kernel_type}")
+
+        # Scale filter
+        filt = var * f_lambda  # shape [M]
+        # Form covariance matrix
+        cov_matrix = tf.matmul(eig_vects * filt[tf.newaxis, :], eig_vects, transpose_b=True)
+        return cov_matrix    
+    
     def set_log_prob_fixed(self,**kwargs):
         # Create a one off covariance matrix -> then use it to get probability each time...
         # Get cov matrix

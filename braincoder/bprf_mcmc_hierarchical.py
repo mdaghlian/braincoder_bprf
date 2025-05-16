@@ -144,13 +144,13 @@ class BPRF_hier(BPRF):
                 new_h_labels.append(f'{pid}_{k}')
             # Bijectors
             for k in new_h_labels:
-                if any([substr in k for substr in ['_l', '_v', '_nugget']]):
+                if any([substr in k for substr in ['_l', '_v', '_nugget', '_spec']]):
                     self.h_add_bijector(pid=k, bijector_type=tfb.Softplus())        
                 else:
                     self.h_add_bijector(pid=k, bijector_type=tfb.Identity())        
 
             for k in new_h_labels:
-                if any([substr in k for substr in ['_l', '_v', '_nugget']]):
+                if any([substr in k for substr in ['_l', '_v', '_nugget', '_spec']]):
                     self.h_add_prior(
                         pid=k, 
                         prior_type='HalfNormal', 
