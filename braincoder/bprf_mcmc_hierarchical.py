@@ -37,6 +37,7 @@ class BPRF_hier(BPRF):
         self.h_mcmc_mean = None
         # MAP
         self.h_MAP_parameters = None
+        self._original_gp = None
 
                 
     def h_add_param(self, pid, h_prior_to_apply='normal', **kwargs):
@@ -144,13 +145,21 @@ class BPRF_hier(BPRF):
                 new_h_labels.append(f'{pid}_{k}')
             # Bijectors
             for k in new_h_labels:
-                if any([substr in k for substr in ['_l', '_v', '_nugget', '_spec']]):
+                if any([substr in k for substr in ['_spec_m', '_lm']]):
+                    self.h_add_bijector(pid=k, bijector_type=tfb.Identity())
+                elif any([substr in k for substr in ['_l', '_v', '_nugget', '_spec']]):
                     self.h_add_bijector(pid=k, bijector_type=tfb.Softplus())        
                 else:
                     self.h_add_bijector(pid=k, bijector_type=tfb.Identity())        
 
             for k in new_h_labels:
-                if any([substr in k for substr in ['_l', '_v', '_nugget', '_spec']]):
+                if any([substr in k for substr in ['_spec_m', '_lm']]):
+                    self.h_add_prior(
+                        pid=k, 
+                        prior_type='Normal', 
+                        distribution=tfd.Normal(loc=0.0, scale=20)
+                        )
+                elif any([substr in k for substr in ['_l', '_v', '_nugget', '_spec']]):
                     self.h_add_prior(
                         pid=k, 
                         prior_type='HalfNormal', 
@@ -287,6 +296,68 @@ class BPRF_hier(BPRF):
             ]
         return tf.stack(h_out, axis=-1)
     
+
+    def _stash_gps(self):
+        """
+        Store the entire state of h_gp_function manually, capturing all relevant attributes.
+        """
+        state = {}
+        for key, gp in self.h_gp_function.items():
+            entry = {
+                'n_vx': gp.n_vx if hasattr(gp, 'n_vx') else None
+            }
+            if hasattr(gp, 'dists'):
+                entry['dists'] = tf.identity(gp.dists)
+            if hasattr(gp, 'Xs'):
+                entry['Xs'] = {xk: tf.identity(xv) for xk, xv in gp.Xs.items()}
+            if hasattr(gp, 'dXs'):
+                entry['dXs'] = {dxk: tf.identity(dxv) for dxk, dxv in gp.dXs.items()}
+            if hasattr(gp, 'eig_vects'):
+                entry['eig_vects'] = {ek: tf.identity(ev) for ek, ev in gp.eig_vects.items()}
+            state[key] = entry
+        self._original_gp = state        
+
+    def _update_gps_for_idx(self, idx):
+        # If we have gp dists, we need to adjust them here
+        # check .dists, .Xs, .dXs, .eig_vects
+        if self._original_gp is None:
+            self._stash_gps()
+        for gpkey in self.h_gp_function.keys():
+            self.h_gp_function[gpkey].n_vx = len(idx)
+            if hasattr(self.h_gp_function[gpkey], 'dists'):
+                self.h_gp_function[gpkey].dists = tf.gather(tf.gather(self.h_gp_function[gpkey].dists, idx, axis=0), idx, axis=1)
+            if hasattr(self.h_gp_function[gpkey], 'dXs'):
+                for dXkey in self.h_gp_function[gpkey].dXs.keys():
+                    self.h_gp_function[gpkey].dXs[dXkey] = tf.gather(tf.gather(self.h_gp_function[gpkey].dXs[dXkey], idx, axis=0), idx, axis=1)
+            if hasattr(self.h_gp_function[gpkey], 'Xs'):
+                for Xkey in self.h_gp_function[gpkey].Xs.keys():
+                    self.h_gp_function[gpkey].Xs[Xkey] = tf.gather(self.h_gp_function[gpkey].Xs[Xkey], idx, axis=0)
+            if hasattr(self.h_gp_function[gpkey], 'eig_vects'):
+                for eigkey in self.h_gp_function[gpkey].eig_vects.keys():
+                    self.h_gp_function[gpkey].eig_vects[eigkey] = tf.gather(self.h_gp_function[gpkey].eig_vects[eigkey], idx, axis=0)
+    def _restore_gps(self):
+        if self._original_gp is None:
+            raise RuntimeError("No state stashed. Call stash_original() first.")
+
+        for gpkey, entry in self._original_gp.items():
+            gp = self.h_gp_function[gpkey]
+            if entry['n_vx'] is not None:
+                gp.n_vx = entry['n_vx']
+            if 'dists' in entry:
+                gp.dists = entry['dists']
+            if 'Xs' in entry:
+                for xk, xv in entry['Xs'].items():
+                    gp.Xs[xk] = xv
+            if 'dXs' in entry:
+                for dxk, dxv in entry['dXs'].items():
+                    gp.dXs[dxk] = dxv
+            if 'eig_vects' in entry:
+                for ek, ev in entry['eig_vects'].items():
+                    gp.eig_vects[ek] = ev
+
+        # clear stash
+        self._original_gp = None        
+
     def fit_mcmc_hier(self, 
             init_pars=None,
             h_init_pars=None,
@@ -303,6 +374,9 @@ class BPRF_hier(BPRF):
             idx = np.arange(self.n_voxels).tolist()
         elif isinstance(idx, int):
             idx = [idx]
+        self._update_gps_for_idx(idx)
+
+
         vx_bool = np.zeros(self.n_voxels, dtype=bool)
         vx_bool[idx] = True
         self.n_vx_to_fit = len(idx)
@@ -410,7 +484,8 @@ class BPRF_hier(BPRF):
             print(self.h_labels[h])
             self.h_mcmc_sampler[h] = h_samples[:,self.h_labels[h]]
         self.h_mcmc_sampler = pd.DataFrame(self.h_mcmc_sampler)
-        self.mcmc_stats = stats            
+        self.mcmc_stats = stats         
+        self._restore_gps()
 
     def get_mcmc_summary(self, burnin=100, pc_range=25):
         burnin = 100
@@ -478,6 +553,8 @@ class BPRF_hier(BPRF):
             idx = np.arange(self.n_voxels).tolist()
         elif isinstance(idx, int):
             idx = [idx]
+        self._update_gps_for_idx(idx)
+
         vx_bool = np.zeros(self.n_voxels, dtype=bool)
         vx_bool[idx] = True
         self.n_vx_to_fit = len(idx)
@@ -601,12 +678,15 @@ class BPRF_hier(BPRF):
             
             df = pd.DataFrame(estimated_p_dict, index=[ivx_fit]) # use map_sampler instead of mcmc_sampler
             df_list.append(df)
-        self.MAP_parameters = pd.concat(df_list).reindex(idx)
+        
+        # self.MAP_parameters = pd.concat(df_list).reindex(idx)
+        self.MAP_parameters = pd.concat(df_list).reindex(np.arange(self.n_voxels)).fillna(0.0)
         
         hdf = {}
         for i,h in enumerate(self.h_labels):
             hdf[h] = h_opt_vars[self.h_labels[h]]
         self.h_MAP_parameters = pd.DataFrame(hdf)
+        self._restore_gps() 
         print('MAP optimization finished.')    
     
     def _create_log_prior_fn(self):

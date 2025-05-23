@@ -783,7 +783,7 @@ class GPdists():
         self.kernel = kwargs.get('kernel', 'RBF')
         self.fixed_params = kwargs.get('fixed_params', 'unfixed') # fixed_vl, fixed_all
         self.inducer_selection = kwargs.get('inducer_selection', 'random')
-
+        self.eps = kwargs.get('eps', 1e-6) # for numerical stability
         # Fixed GP hyperparameters (when fixed_params is True)
         self.f_gp_variance = kwargs.get('gp_variance', None)
         self.f_gp_lengthscale = kwargs.get('gp_lengthscale', None)
@@ -884,7 +884,7 @@ class GPdists():
         else:
             raise ValueError("Unsupported kernel: {}".format(self.kernel))
         # Add nugget term for numerical stability
-        return cov_matrix + tf.eye(cov_matrix.shape[0], dtype=self.dists_dtype) * (1e-6 + gp_nugget)
+        return cov_matrix + tf.eye(cov_matrix.shape[0], dtype=self.dists_dtype) * tf.cast(self.eps + gp_nugget, dtype=self.dists_dtype)
     
     @tf.function
     def _compute_precision_and_conditional_log_prob(self, parameter, prec_matrix, gp_mean, full_norm):
@@ -1086,6 +1086,17 @@ class GPdistsM():
                 - psd_control: Method for ensuring positive semidefiniteness.
                 - dists_dtype: Data type for tensor conversion.
                 - kernel: Choice of covariance function (default: 'RBF').
+
+        ****************** TODO ********************
+        - clean up code
+
+        Possible ideas:
+        - mean function with univariate case? 
+        - use gpflow for more flexible, and robust GPs...
+        - nugget fit with LBO
+        - 1 x mean function? - put it all in together
+        - better combination / chaining abilities? How combine kernels?
+        - make it modular? 
         """
         self.n_vx = n_vx
         self.inducer_selection = kwargs.get('inducer_selection', 'random')
@@ -1102,6 +1113,7 @@ class GPdistsM():
         self.lin_kernel_list = []
         self.spec_kernel_list = []
         self.mfunc_list = []
+        self.nuggetfunc_list = []
         self.mfunc_bijector = tfb.Identity()
         self.Xs = {}
         self.dXs = {}
@@ -1121,6 +1133,7 @@ class GPdistsM():
     def _update_pids_inv(self):
         self.pids_inv = {}
         self.pids_inv = {v:k for k,v in self.pids.items()}
+
 
     # **************** MEAN FUNCTIONS ***************
     def add_xid_linear_mfunc(self, xid, **kwargs):
@@ -1160,12 +1173,33 @@ class GPdistsM():
         mfunc_const = tf.cast(mfunc_const, dtype=self.dists_dtype)        
         m_out = mfunc_slope * Xs + mfunc_const 
         return m_out
+    
+    def add_mfunc_bijector(self, bijector_type, **kwargs):
+        ''' add transformations to parameters so that they are fit smoothly        
+        
+        identity        - do nothing
+        softplus        - don't let anything be negative
 
-    # ************************************************************************    
-    # ************************************************************************
-    # ************************************************************************
+        '''
+        dtype = kwargs.get('dtype', self.dists_dtype)
+        if bijector_type == 'identity':
+            self.mfunc_bijector = tfb.Identity()        
+        elif bijector_type == 'softplus':
+            # Don't let anything be negative
+            self.mfunc_bijector = tfb.Softplus()
+        elif bijector_type == 'sigmoid':
+            self.mfunc_bijector = tfb.Sigmoid(
+                low=kwargs.get('low'), high=kwargs.get('high'),
+            )
+        else:
+            self.mfunc_bijector = bijector_type
 
-    # *** Stationary 
+    # *************************************************
+    # *************************************************
+    # *************************************************
+    
+    # *** KERNELS ***
+    # -> add Stationary kernels 
     def add_xid_stationary_kernel(self, xid, **kwargs):
         ''' add a kernel 
         '''
@@ -1191,7 +1225,8 @@ class GPdistsM():
 
         # Update the inverse dictionary
         self._update_pids_inv()        
-
+    
+    # -> add Linear kernels
     def add_xid_linear_kernel(self, xid, **kwargs):
         ''' add a kernel
         '''
@@ -1207,6 +1242,7 @@ class GPdistsM():
         # Update the inverse dictionary
         self._update_pids_inv()        
     
+    # -> add Spectral kernels (based on LBO)
     def add_xid_spectral_kernel(self, xid, **kwargs):
         # existing code ...
         self.kernel_type[xid] = kwargs.get('kernel_type', 'spec_exp')                
@@ -1225,10 +1261,40 @@ class GPdistsM():
         elif self.kernel_type[xid] == 'spec_ratquad':
             self.pids[len(self.pids)] = f'gpk{xid}_spec_alpha'
             self.pids[len(self.pids)] = f'gpk{xid}_spec_beta'
-
+        
+        elif self.kernel_type[xid] == 'spec_LBOwarp':
+            self.pids[len(self.pids)] = f'gpk{xid}_spec_l'
+            self.pids[len(self.pids)] = f'gpk{xid}_spec_v'
+            self.pids[len(self.pids)] = f'gpk{xid}_spec_m0'
+            for i in range(1, self.eig_vals[xid].shape[0]+1):
+                self.pids[len(self.pids)] = f'gpk{xid}_spec_m{i}'
+        
+        elif self.kernel_type[xid] == 'spec_LBOGibbs':
+            self.pids[len(self.pids)] = f'gpk{xid}_spec_v'
+            self.pids[len(self.pids)] = f'gpk{xid}_spec_lm0'
+            for i in range(1, self.eig_vals[xid].shape[0]+1):
+                self.pids[len(self.pids)] = f'gpk{xid}_spec_lm{i}'
+            
+            Xs = kwargs.get('Xs', None)
+            dXs = kwargs.get('dXs', None)
+            psd_control = kwargs.get('psd_control', self.psd_control)
+            embedding_dim = kwargs.get('embedding_dim', self.embedding_dim)
+            if dXs is None:
+                # Get distances from 
+                dXs = compute_euclidean_distance_matrix(Xs[...,np.newaxis])        
+            if psd_control == 'euclidean':
+                print('Embedding in Euclidean space...')
+                dXs = mds_embedding(dXs, embedding_dim)
+                dXs = compute_euclidean_distance_matrix(dXs)
+            self.dXs[xid] = tf.convert_to_tensor(dXs, dtype=self.dists_dtype)
+            self.dXs[xid] = (self.dXs[xid] + tf.transpose(self.dXs[xid])) / 2.0        
+                                
+        else:
+            raise ValueError(f"Unknown kernel type: {self.kernel_type[xid]}.")
         self.spec_kernel_list.append(xid)
         self._update_pids_inv()
 
+        
 
     @tf.function
     def _return_sigma(self, inducing_indices=None, **kwargs):
@@ -1258,6 +1324,9 @@ class GPdistsM():
 
         for s in self.spec_kernel_list:
             spec_kwargs = {i.replace(s,''):k for i,k in kwargs.items() if 'spec' in i}
+            if 'Gibbs' in self.kernel_type[s]:
+                # Gibbs kernel
+                spec_kwargs['dXs'] = tf.gather(tf.gather(self.dXs[s], inducing_indices, axis=0), inducing_indices, axis=1)
             s_out += self._return_sigma_xid_spectral(
                 eig_vals = self.eig_vals[s],
                 eig_vects = tf.gather(self.eig_vects[s], inducing_indices, axis=0),
@@ -1311,7 +1380,7 @@ class GPdistsM():
         cov_matrix = gpk_slope**2 * (Xs-gpk_const) * (tf.transpose(Xs) - gpk_const)
         return cov_matrix
 
-    @tf.function
+    # @tf.function
     def _return_sigma_xid_spectral(self, eig_vals, eig_vects, kernel_type, **kwargs):
         """
         Compute covariance matrix from spectral kernel:
@@ -1328,29 +1397,93 @@ class GPdistsM():
         """
         eig_vals = tf.cast(eig_vals, dtype=self.dists_dtype)
         
-        if kernel_type == 'spec_exp':
-            ell = tf.cast(kwargs['gpk_spec_l'], dtype=self.dists_dtype)
-            var = tf.cast(kwargs['gpk_spec_v'], dtype=self.dists_dtype)
-            f_lambda = tf.exp(-tf.sqrt(eig_vals) / ell)
-
+        if kernel_type == 'spec_exp':            
+            gpk_l = tf.cast(kwargs['gpk_spec_l'], dtype=self.dists_dtype)
+            gpk_v = tf.cast(kwargs['gpk_spec_v'], dtype=self.dists_dtype)
+            f_lambda = tf.exp(-tf.sqrt(eig_vals) / gpk_l)
+            # Scale filter
+            filt = gpk_v * f_lambda  # shape [M]
+            # Form covariance matrix
+            cov_matrix = tf.matmul(eig_vects * filt[tf.newaxis, :], eig_vects, transpose_b=True)
+        
         elif kernel_type == 'spec_heat':
             t = tf.cast(kwargs['gpk_spec_t'], dtype=self.dists_dtype)
-            f_lambda = tf.exp(-t * eig_vals)
-            var = 1.0  # assume unit variance, or include a `spec_v` if needed
+            filt = tf.exp(-t * eig_vals)
+            # Form covariance matrix
+            cov_matrix = tf.matmul(eig_vects * filt[tf.newaxis, :], eig_vects, transpose_b=True)
 
         elif kernel_type == 'spec_ratquad':
             alpha = tf.cast(kwargs['gpk_spec_alpha'], dtype=self.dists_dtype)
             beta = tf.cast(kwargs['gpk_spec_beta'], dtype=self.dists_dtype)
-            f_lambda = tf.math.pow(1.0 + eig_vals / alpha, -beta)
-            var = 1.0
+            filt = tf.math.pow(1.0 + eig_vals / alpha, -beta)
+            # Form covariance matrix
+            cov_matrix = tf.matmul(eig_vects * filt[tf.newaxis, :], eig_vects, transpose_b=True)        
 
+        elif kernel_type == 'spec_LBOwarp':
+            # [1] Weighted sum of eigenvectors (LBOwarp)
+            LBO_w0 = tf.cast(kwargs['gpk_spec_m0'], dtype=self.dists_dtype)
+            LBO_wX = tf.stack(
+                [kwargs[f"gpk_spec_m{i}"] for i in range(1, len(eig_vals)+1)],
+                axis=0
+            )
+            LBO_wX = tf.cast(LBO_wX, dtype=self.dists_dtype)
+            # Warped distances
+            warped_X = LBO_w0 + tf.matmul(eig_vects, LBO_wX) # [N, 1]
+            warped_X = tf.squeeze(warped_X, axis=-1) # [N,]
+            # [2] RBF kernel  (f1 - f2)           
+            gpk_l = tf.cast(kwargs['gpk_spec_l'], dtype=self.dists_dtype)
+            var = tf.cast(kwargs['gpk_spec_v'], dtype=self.dists_dtype)
+            dXs = compute_euclidean_distance_matrix(warped_X[...,tf.newaxis])        
+            cov_matrix = tf.square(var) * tf.exp(
+                -tf.square(dXs) / (2.0 * tf.square(gpk_l))
+            )
+
+        elif kernel_type == 'spec_LBOGibbs':
+            # * i know not really gibss...
+            # https://gpss.cc/gpss21/slides/Heinonen2021.pdf equation 27)
+            # Like the standard RBF kernel, but we let the lengthscale vary
+            # -> defined by a weighted sum of eigenvectors
+            
+            # Load from kwargs
+            gpk_v = tf.cast(kwargs['gpk_spec_v'], dtype=self.dists_dtype)
+            dXs = kwargs['dXs']
+            # -> weights 
+            LBO_w0 = tf.cast(kwargs['gpk_spec_lm0'], dtype=self.dists_dtype)
+            LBO_wX = tf.stack(
+                [kwargs[f"gpk_spec_lm{i}"] for i in range(1, len(eig_vals)+1)],
+                axis=0
+            )
+            LBO_wX = tf.cast(LBO_wX, dtype=self.dists_dtype)
+            
+            # Multiply by the eigenvectors to get varying lengthscale
+            gpk_l = LBO_w0 + tf.matmul(eig_vects, LBO_wX) # [N, 1]
+            gpk_l = tf.squeeze(gpk_l, axis=-1) # [N,]
+            # -> force positive
+            gpk_l = tf.exp(gpk_l) + tf.cast(self.eps, dtype=self.dists_dtype)            
+            # Informally, Gibbs kernel is:
+            # K = gpk_v^2 * norm_ * RBF_ 
+            #       norm_ = ((2*gpk_l*gpk_l.T)/(gpk_l^2+gpk_l.T^2))d/2 
+            # -> 
+            #       RBF_ = exp(-dXs^2/(gpk_l^2+gpk_l.T^2))
+            two_l_lT = 2 * tf.matmul(gpk_l[:,None], gpk_l[None,:])
+            lsq_lTsq = tf.square(gpk_l[:,None]) + tf.square(gpk_l[None,:])
+            # norm_ = tf.sqrt(two_l_lT / lsq_lTsq)
+            norm_ = two_l_lT / lsq_lTsq
+            cov_matrix     = tf.square(gpk_v) * norm_ * tf.exp(-tf.square(dXs) / lsq_lTsq)
+
+            # debug: eigenvalues
+            # eigs = tf.linalg.eigvalsh(K)
+            # tf.print("min(eigs):", eigs[0], "max(eigs):", eigs[-1])
+
+            # optionally assert no big negatives
+            # tf.debugging.check_numerics(eigs, message="NaN or Inf in eigenvalues!")
+            # tf.debugging.assert_equal(eigs[0] >= -1e-8, True,
+            #     message="Covariance is not PSD: negative eigenvalue detected."
+            # )
         else:
             raise ValueError(f"Unknown spectral kernel type: {kernel_type}")
 
-        # Scale filter
-        filt = var * f_lambda  # shape [M]
-        # Form covariance matrix
-        cov_matrix = tf.matmul(eig_vects * filt[tf.newaxis, :], eig_vects, transpose_b=True)
+
         return cov_matrix    
     
     def set_log_prob_fixed(self,**kwargs):
@@ -1402,26 +1535,6 @@ class GPdistsM():
         Optionally uses random selection of n_inducers for sparse GP approximation.
         """
         return self.gp_prior_dist.log_prob(parameter)
-    
-    def add_mfunc_bijector(self, bijector_type, **kwargs):
-        ''' add transformations to parameters so that they are fit smoothly        
-        
-        identity        - do nothing
-        softplus        - don't let anything be negative
-
-        '''
-        dtype = kwargs.get('dtype', self.dists_dtype)
-        if bijector_type == 'identity':
-            self.mfunc_bijector = tfb.Identity()        
-        elif bijector_type == 'softplus':
-            # Don't let anything be negative
-            self.mfunc_bijector = tfb.Softplus()
-        elif bijector_type == 'sigmoid':
-            self.mfunc_bijector = tfb.Sigmoid(
-                low=kwargs.get('low'), high=kwargs.get('high'),
-            )
-        else:
-            self.mfunc_bijector = bijector_type
 
     @tf.function
     def _return_inducing_idx(self, n_inducers):        
