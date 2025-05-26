@@ -1113,7 +1113,6 @@ class GPdistsM():
         self.lin_kernel_list = []
         self.spec_kernel_list = []
         self.mfunc_list = []
-        self.nuggetfunc_list = []
         self.mfunc_bijector = tfb.Identity()
         self.Xs = {}
         self.dXs = {}
@@ -1140,11 +1139,14 @@ class GPdistsM():
         ''' add a kernel
         '''
         Xs = kwargs.get('Xs', None)
+        Xs = tf.convert_to_tensor(Xs, dtype=self.dists_dtype)
+        if len(Xs.shape) == 1:
+            Xs = tf.expand_dims(Xs, axis=-1)
+        self.Xs[xid] = Xs
         self.mfunc_list.append(xid)        
-        self.Xs[xid] = tf.expand_dims(tf.convert_to_tensor(Xs, dtype=self.dists_dtype), axis=1)
-        # Add a lengthscale & a variance
-        self.pids[len(self.pids)] = f'mfunc{xid}_slope'
-        self.pids[len(self.pids)] = f'mfunc{xid}_const'
+        Ds = self.Xs[xid].shape[1]
+        for i in range(Ds):
+            self.pids[len(self.pids)] = f'mfunc{xid}_slope{i}'
 
         # Update the inverse dictionary
         self._update_pids_inv()
@@ -1155,24 +1157,14 @@ class GPdistsM():
         '''
         if inducing_indices is None:
             inducing_indices = tf.range(self.n_vx)        
-        # Start of with zero then add any regressors...
+        # Start of with zero then add global mean
         m_out = tf.zeros(len(inducing_indices), dtype=self.dists_dtype) + tf.cast(kwargs['mfunc_mean'], self.dists_dtype) # global mean...
+        # then add any regressors...
         for m in self.mfunc_list:
-            m_out += tf.squeeze(self._return_mfunc_xid_linear(
-                mfunc_slope=kwargs[f'mfunc{m}_slope'],
-                mfunc_const=kwargs[f'mfunc{m}_const'],
-                Xs=tf.gather(self.Xs[m], inducing_indices, axis=0)
-            ))
+            slopes = tf.stack([kwargs[f'mfunc{m}_slope{i}'] for i in range(self.Xs[m].shape[1])], axis=0)  # [D]
+            Xs = tf.gather(self.Xs[m], inducing_indices, axis=0)  # [N, D]
+            m_out += tf.reduce_sum(tf.cast(slopes, dtype=self.dists_dtype) * tf.transpose(Xs), axis=0) 
         return self.mfunc_bijector(tf.cast(m_out, dtype=tf.float32))
-
-    @tf.function 
-    def _return_mfunc_xid_linear(self, mfunc_slope, mfunc_const, Xs):
-        '''linear kernel
-        '''
-        mfunc_slope = tf.cast(mfunc_slope, dtype=self.dists_dtype)
-        mfunc_const = tf.cast(mfunc_const, dtype=self.dists_dtype)        
-        m_out = mfunc_slope * Xs + mfunc_const 
-        return m_out
     
     def add_mfunc_bijector(self, bijector_type, **kwargs):
         ''' add transformations to parameters so that they are fit smoothly        
@@ -1469,7 +1461,18 @@ class GPdistsM():
             lsq_lTsq = tf.square(gpk_l[:,None]) + tf.square(gpk_l[None,:])
             # norm_ = tf.sqrt(two_l_lT / lsq_lTsq)
             norm_ = two_l_lT / lsq_lTsq
+            # RBF
             cov_matrix     = tf.square(gpk_v) * norm_ * tf.exp(-tf.square(dXs) / lsq_lTsq)
+
+            # LAPLACE
+            # cov_matrix     = tf.square(gpk_v) * norm_ * tf.exp(-dXs / lsq_lTsq)
+
+            # MATRERN
+            # sqrt5 = tf.cast(tf.sqrt(5.0), dtype=self.dists_dtype)
+            # frac1 = (sqrt5 * dXs) / gpk_l
+            # frac2 = (5.0 * tf.square(dXs)) / (3.0 * tf.square(lsq_lTsq))
+            # cov_matrix = tf.square(gpk_v) * norm_ * (1 + frac1 + frac2) * tf.exp(-frac1)
+
 
             # debug: eigenvalues
             # eigs = tf.linalg.eigvalsh(K)
