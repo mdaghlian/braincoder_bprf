@@ -278,6 +278,7 @@ class BPRF_hier(BPRF):
         self.h_priors_to_loop = [
             p for p,t in self.h_prior_type.items() if t not in ('fixed', 'none')
         ]
+        print(f'Priors to loop through: {self.h_priors_to_loop}')
         self.h_labels_inv = {v:k for k,v in self.h_labels.items()}
 
     @tf.function
@@ -581,17 +582,20 @@ class BPRF_hier(BPRF):
 
         # Define the prior in 'tf'
         log_prior_fn = self._create_log_prior_fn()
-        
+        log_jac_fn = self._create_log_jac_fn()
+
         # Calculating the likelihood
         # -> based on our 'noise_method'
         residual_ln_likelihood_fn = self._create_residual_ln_likelihood_fn()
 
         # Now create the log_posterior_fn
         @tf.function
-        def log_posterior_fn(parameters, h_parameters):
-            parameters = self._bprf_transform_parameters_forward(parameters)
+        def log_posterior_fn(parameters_unc, h_parameters_unc):
+            # JACOBIAN BEFORE TRANSFORMING FORWARD
+            log_jac = log_jac_fn(parameters_unc, h_parameters_unc)
+            parameters = self._bprf_transform_parameters_forward(parameters_unc)
             parameters = self.fix_update_fn(parameters)            
-            h_parameters = self._h_bprf_transform_parameters_forward(h_parameters)
+            h_parameters = self._h_bprf_transform_parameters_forward(h_parameters_unc)
             h_parameters = self.h_fix_update_fn(h_parameters)
             par4pred = parameters[:,:self.n_model_params] # chop out any hyper / noise parameters
             predictions = self.model._predict(
@@ -599,7 +603,7 @@ class BPRF_hier(BPRF):
             residuals = y[:, vx_bool] - predictions[0]                        
             log_likelihood = residual_ln_likelihood_fn(parameters, residuals)            
             log_prior = log_prior_fn(parameters, h_parameters)            
-            return tf.reduce_sum(log_prior + log_likelihood)
+            return tf.reduce_sum(log_prior + log_likelihood + log_jac)
 
         # -> make sure we are in the correct dtype
         # Convert initial parameters to tensors
@@ -744,6 +748,36 @@ class BPRF_hier(BPRF):
             return p_out     
         return log_prior_fn
     
+    def _create_log_jac_fn(self):
+        if self.include_jacobian:
+            @tf.function
+            def log_jac_fn(parameters, h_parameters):
+                # Log-prior function for the model
+                p_out = 0.0                        
+                for p in self.priors_to_loop:
+                    p_out += tf.reduce_sum(self.p_bijector[p].forward_log_det_jacobian(
+                        tf.squeeze(parameters[:,self.model_labels[p]]), 
+                        event_ndims=0,
+                    ))
+                for p in self.h_gp_function.keys():
+                    p_out += tf.reduce_sum(self.p_bijector[p].forward_log_det_jacobian(
+                        tf.squeeze(parameters[:,self.model_labels[p]]), 
+                        event_ndims=1,
+                    ))                    
+                for p in self.h_priors_to_loop:
+                    p_out += tf.reduce_sum(self.h_bijector[p].forward_log_det_jacobian(
+                        tf.squeeze(h_parameters[:,self.h_labels[p]]), 
+                        event_ndims=0,
+                    ))
+                # Check shape of p_out
+                # assert p_out.shape == (1,), f"Log Jacobian output should be a scalar, but is {p_out}" 
+                return p_out           
+        else:
+            @tf.function
+            def log_jac_fn(parameters, h_parameters):
+                return 0.0
+        return log_jac_fn
+    
     def _create_residual_ln_likelihood_fn(self):
         # Calculating the likelihood
         if self.noise_method == 'fit_tdist':
@@ -752,8 +786,15 @@ class BPRF_hier(BPRF):
                 resid_ln_likelihood = calculate_log_prob_t(
                     data=residuals, scale=parameters[:,self.model_labels['noise_scale']], dof=parameters[:,self.model_labels['noise_dof']]
                 )
+                
+                # Use t-distribution from tensorflow_probability
+                # resid_dist = tfd.StudentT(
+                #     df=parameters[:,self.model_labels['noise_dof']],
+                #     loc=0.0,
+                #     scale=parameters[:,self.model_labels['noise_scale']],
+                # )
+                # resid_ln_likelihood = resid_dist.log_prob(residuals)
                 resid_ln_likelihood = tf.reduce_sum(resid_ln_likelihood, axis=0)       
-                # Return vector of length idx (optimize each chain separately)
                 return resid_ln_likelihood
         elif self.noise_method == 'fit_normal':
             # Assume residuals are normally distributed (loc=0.0)
@@ -764,6 +805,9 @@ class BPRF_hier(BPRF):
                 resid_ln_likelihood = calculate_log_prob_gauss_loc0(
                     data=residuals, scale=parameters[:,self.model_labels['noise_scale']],
                 )
+                # Use N(0, scale) from tensorflow_probability
+                # resid_dist = tfd.Normal(loc=0.0, scale=parameters[:,self.model_labels['noise_scale']])
+                # resid_ln_likelihood = resid_dist.log_prob(residuals)
                 resid_ln_likelihood = tf.reduce_sum(resid_ln_likelihood, axis=0)       
                 return resid_ln_likelihood              
         
@@ -778,6 +822,10 @@ class BPRF_hier(BPRF):
                 resid_ln_likelihood = calculate_log_prob_gauss_loc0(
                     data=residuals, scale=residuals_std,
                 )
+
+                # # [2] Use N(0, scale) from tensorflow_probability   
+                # resid_dist = tfd.Normal(loc=0.0, scale=residuals_std)
+                # resid_ln_likelihood = resid_dist.log_prob(residuals)
                 resid_ln_likelihood = tf.reduce_sum(resid_ln_likelihood, axis=0)       
                 return resid_ln_likelihood     
         
@@ -974,10 +1022,24 @@ class BPRF_hier(BPRF):
                 p_out += tf.reduce_sum(self.h_prior[h].prior(h_parameters[:,self.h_labels[h]]))            
             return p_out 
         print(self.h_prior_to_apply[pid])
-
+        if self.include_jacobian:
+            @tf.function
+            def log_jac_fn(h_parameters):
+                p_out = 0.0
+                for h in self.h_priors_to_loop:
+                    p_out += tf.reduce_sum(self.h_bijector[h].forward_log_det_jacobian(
+                        h_parameters[:,self.h_labels[h]], 
+                        # event_ndims=0
+                    ))
+                return p_out
+        else:
+            @tf.function
+            def log_jac_fn(h_parameters):
+                return 0.0
         # Now create the log_posterior_fn
         @tf.function
         def log_posterior_fn(h_parameters):
+            log_jac = log_jac_fn(h_parameters)
             h_parameters = self._h_bprf_transform_parameters_forward(h_parameters)
             h_parameters = self.h_fix_update_fn(h_parameters)
             log_prior = log_prior_fn(h_parameters)            
@@ -1009,7 +1071,7 @@ class BPRF_hier(BPRF):
                 )                     
             else:
                 raise AssertionError
-            return tf.reduce_sum(log_prior + gp_likelihood)
+            return tf.reduce_sum(log_prior + gp_likelihood + log_jac)
 
         # -> make sure we are in the correct dtype
         h_state_tensors = [
@@ -1081,98 +1143,98 @@ class BPRF_hier(BPRF):
         self.h_MAP_parameters = pd.DataFrame(hdf)
         print('MAP optimization finished.')    
 
-    def fit_grid_hier_GP_only(self,
-                pid,            # Which parameter is this GP associated with 
-                pid_pars,       # The values of these parameters (e.g., obtained with a basic grid fit)
-                grids={},
-                idx = None,
-                **kwargs):
-        '''
-        Maximum a posteriori (MAP) optimization for hierarchical model using a grid search over
-        specified hyperparameters (e.g., GP lengthscale, variance, etc.). Instead of continuously
-        optimizing these hyperparameters with gradient descent, we instead evaluate the objective
-        over a grid of candidate values and select the combination that minimizes the negative log
-        posterior. The remaining parts of the hierarchical model parameters are left at their
-        initial (or previously computed) values.
-        '''
-        # Setup voxel indices
-        if idx is None:  # Use all voxels
-            idx = np.arange(self.n_voxels).tolist()
-        elif isinstance(idx, int):
-            idx = [idx]
-        vx_bool = np.zeros(self.n_voxels, dtype=bool)
-        vx_bool[idx] = True
-        self.n_vx_to_fit = len(idx)
-        self.h_fixed_pars = kwargs.pop('h_fixed_pars', {})
-        self.n_params = len(self.model_labels)
-        self.h_prep_for_fitting(**kwargs)
-        self.h_n_params = len(self.h_labels)
+    # def fit_grid_hier_GP_only(self,
+        #         pid,            # Which parameter is this GP associated with 
+        #         pid_pars,       # The values of these parameters (e.g., obtained with a basic grid fit)
+        #         grids={},
+        #         idx = None,
+        #         **kwargs):
+        # '''
+        # Maximum a posteriori (MAP) optimization for hierarchical model using a grid search over
+        # specified hyperparameters (e.g., GP lengthscale, variance, etc.). Instead of continuously
+        # optimizing these hyperparameters with gradient descent, we instead evaluate the objective
+        # over a grid of candidate values and select the combination that minimizes the negative log
+        # posterior. The remaining parts of the hierarchical model parameters are left at their
+        # initial (or previously computed) values.
+        # '''
+        # # Setup voxel indices
+        # if idx is None:  # Use all voxels
+        #     idx = np.arange(self.n_voxels).tolist()
+        # elif isinstance(idx, int):
+        #     idx = [idx]
+        # vx_bool = np.zeros(self.n_voxels, dtype=bool)
+        # vx_bool[idx] = True
+        # self.n_vx_to_fit = len(idx)
+        # self.h_fixed_pars = kwargs.pop('h_fixed_pars', {})
+        # self.n_params = len(self.model_labels)
+        # self.h_prep_for_fitting(**kwargs)
+        # self.h_n_params = len(self.h_labels)
 
-        # Prepare parameter tensors
-        pid_pars = pid_pars.values.astype(np.float32)
-        pid_pars = tf.convert_to_tensor(pid_pars[vx_bool], dtype=tf.float32, name=pid)
+        # # Prepare parameter tensors
+        # pid_pars = pid_pars.values.astype(np.float32)
+        # pid_pars = tf.convert_to_tensor(pid_pars[vx_bool], dtype=tf.float32, name=pid)
         
         
-        g_list = [grids[i] for i in grids.keys()]
-        # Meshgrid 
-        mg_list = np.meshgrid(*g_list)
-        g_list = [i.flatten() for i in mg_list]
-        g_list = np.vstack(g_list).T
+        # g_list = [grids[i] for i in grids.keys()]
+        # # Meshgrid 
+        # mg_list = np.meshgrid(*g_list)
+        # g_list = [i.flatten() for i in mg_list]
+        # g_list = np.vstack(g_list).T
 
-        # Define the log prior function (same as in MAP fit)
-        @tf.function
-        def log_prior_fn(h_parameters):
-            p_out = 0.0
-            for h in self.h_priors_to_loop:
-                p_out += tf.reduce_sum(self.h_prior[h].prior(h_parameters[:, self.h_labels[h]]))
-            return p_out
+        # # Define the log prior function (same as in MAP fit)
+        # @tf.function
+        # def log_prior_fn(h_parameters):
+        #     p_out = 0.0
+        #     for h in self.h_priors_to_loop:
+        #         p_out += tf.reduce_sum(self.h_prior[h].prior(h_parameters[:, self.h_labels[h]]))
+        #     return p_out
 
-        # Define the log posterior function (including GP likelihood)
-        @tf.function
-        def log_posterior_fn(h_parameters):
-            # h_parameters = self._h_bprf_transform_parameters_forward(h_parameters)
-            h_parameters = self.h_fix_update_fn(h_parameters)
-            log_prior = log_prior_fn(h_parameters)
-            # Apply GP to parameters based on the type specified
-            if self.h_prior_to_apply[pid] == 'gp_dists':
-                gp_lengthscale = h_parameters[:, self.h_labels[f'{pid}_gp_lengthscale']]
-                gp_variance = h_parameters[:, self.h_labels[f'{pid}_gp_variance']]
-                gp_likelihood = self.h_gp_function[pid].return_log_prob(
-                    parameter=pid_pars, gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, 
-                    n_inducers=kwargs.pop('n_inducers', None),
-                )
-            elif self.h_prior_to_apply[pid] == 'gp_dists_full':
-                gp_lengthscale  = h_parameters[:, self.h_labels[f'{pid}_gp_lengthscale']]
-                gp_variance     = h_parameters[:, self.h_labels[f'{pid}_gp_variance']]
-                gp_mean         = h_parameters[:, self.h_labels[f'{pid}_gp_mean']]
-                gp_nugget       = h_parameters[:, self.h_labels[f'{pid}_gp_nugget']]
-                gp_likelihood = self.h_gp_function[pid].return_log_prob(
-                    parameter=pid_pars, gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, 
-                    gp_mean=gp_mean, gp_nugget=gp_nugget, n_inducers=kwargs.pop('n_inducers', None),
-                )
-            else:
-                raise AssertionError("Unrecognized GP prior type")
-            return tf.reduce_sum(log_prior + gp_likelihood)
+        # # Define the log posterior function (including GP likelihood)
+        # @tf.function
+        # def log_posterior_fn(h_parameters):
+        #     # h_parameters = self._h_bprf_transform_parameters_forward(h_parameters)
+        #     h_parameters = self.h_fix_update_fn(h_parameters)
+        #     log_prior = log_prior_fn(h_parameters)
+        #     # Apply GP to parameters based on the type specified
+        #     if self.h_prior_to_apply[pid] == 'gp_dists':
+        #         gp_lengthscale = h_parameters[:, self.h_labels[f'{pid}_gp_lengthscale']]
+        #         gp_variance = h_parameters[:, self.h_labels[f'{pid}_gp_variance']]
+        #         gp_likelihood = self.h_gp_function[pid].return_log_prob(
+        #             parameter=pid_pars, gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, 
+        #             n_inducers=kwargs.pop('n_inducers', None),
+        #         )
+        #     elif self.h_prior_to_apply[pid] == 'gp_dists_full':
+        #         gp_lengthscale  = h_parameters[:, self.h_labels[f'{pid}_gp_lengthscale']]
+        #         gp_variance     = h_parameters[:, self.h_labels[f'{pid}_gp_variance']]
+        #         gp_mean         = h_parameters[:, self.h_labels[f'{pid}_gp_mean']]
+        #         gp_nugget       = h_parameters[:, self.h_labels[f'{pid}_gp_nugget']]
+        #         gp_likelihood = self.h_gp_function[pid].return_log_prob(
+        #             parameter=pid_pars, gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, 
+        #             gp_mean=gp_mean, gp_nugget=gp_nugget, n_inducers=kwargs.pop('n_inducers', None),
+        #         )
+        #     else:
+        #         raise AssertionError("Unrecognized GP prior type")
+        #     return tf.reduce_sum(log_prior + gp_likelihood)
 
-        best_loss = np.inf
-        best_candidate = None
-        loss_list = []
-        # Grid search: iterate over all combinations of candidate values
-        for i,g in enumerate(g_list):# Convert the current grid point to a TensorFlow tensor
-            candidate = tf.constant(g, dtype=tf.float32)
-            candidate = tf.expand_dims(candidate, axis=0) # Add a batch dimension
-            loss = -log_posterior_fn(candidate).numpy()
-            loss_list.append(loss)
-            # Update the best candidate if the current loss is lower
-            if loss < best_loss:
-                best_loss = loss
-                best_candidate = candidate.numpy()
+        # best_loss = np.inf
+        # best_candidate = None
+        # loss_list = []
+        # # Grid search: iterate over all combinations of candidate values
+        # for i,g in enumerate(g_list):# Convert the current grid point to a TensorFlow tensor
+        #     candidate = tf.constant(g, dtype=tf.float32)
+        #     candidate = tf.expand_dims(candidate, axis=0) # Add a batch dimension
+        #     loss = -log_posterior_fn(candidate).numpy()
+        #     loss_list.append(loss)
+        #     # Update the best candidate if the current loss is lower
+        #     if loss < best_loss:
+        #         best_loss = loss
+        #         best_candidate = candidate.numpy()
 
-        if best_candidate is None:
-            raise ValueError("Grid search did not yield a valid candidate.")
-        # Organize parameters into a DataFrame for storage
-        hdf = {}
-        for h, idx_h in self.h_labels.items():
-            hdf[h] = best_candidate[:,idx_h]
-        self.h_MAP_parameters = pd.DataFrame(hdf)
-        return g_list, loss_list
+        # if best_candidate is None:
+        #     raise ValueError("Grid search did not yield a valid candidate.")
+        # # Organize parameters into a DataFrame for storage
+        # hdf = {}
+        # for h, idx_h in self.h_labels.items():
+        #     hdf[h] = best_candidate[:,idx_h]
+        # self.h_MAP_parameters = pd.DataFrame(hdf)
+        # return g_list, loss_list

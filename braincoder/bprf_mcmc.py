@@ -29,7 +29,7 @@ class BPRF(object):
         self.n_voxels = self.data.shape[-1]
         self.model_labels = {l:i for i,l in enumerate(self.model.parameter_labels)} # useful to have it as a dict per entry        
         self.n_model_params = len(self.model_labels) # length of model parameters only... 
-
+        self.include_jacobian = kwargs.get('include_jacobian', True)  # Include the jacobian in the model?
         # We can also fit noise -> 
         self.noise_method = kwargs.get('noise_method', 'fit_tdist')  # 'fit_normal' 'none'
         print(self.noise_method)
@@ -212,6 +212,7 @@ class BPRF(object):
         self.priors_to_loop = [
             p for p,t in self.p_prior_type.items() if t not in ('fixed', 'none')
         ]
+        print(f'Priors to loop through: {self.priors_to_loop}')
         self.model_labels_inv = {v:k for k,v in self.model_labels.items()}
 
     @tf.function
@@ -390,7 +391,7 @@ class BPRF(object):
 
         # Define the prior in 'tf'
         log_prior_fn = self._create_log_prior_fn()
-        
+        log_jac_fn = self._create_log_jac_fn()
         # Calculating the likelihood
         # -> based on our 'noise_method'
         residual_ln_likelihood_fn = self._create_residual_ln_likelihood_fn()
@@ -398,6 +399,7 @@ class BPRF(object):
         # Now create the log_posterior_fn
         @tf.function
         def log_posterior_fn(parameters):                        
+            log_jac = log_jac_fn(parameters) # before transformation 
             parameters = self._bprf_transform_parameters_forward(parameters)
             parameters = self.fix_update_fn(parameters)            
 
@@ -423,7 +425,7 @@ class BPRF(object):
             log_likelihood = residual_ln_likelihood_fn(parameters, residuals)
             log_prior = log_prior_fn(parameters) 
             # Return vector of length idx (optimize each chain separately)
-            return log_prior + log_likelihood
+            return log_prior + log_likelihood + log_jac
 
         # -> make sure we are in the correct dtype 
         initial_state = [tf.convert_to_tensor(init_pars[vx_bool,i], dtype=tf.float32) for i in range(self.n_params)]                          
@@ -491,27 +493,50 @@ class BPRF(object):
             return p_out   
         return log_prior_fn
 
+    def _create_log_jac_fn(self):
+        if self.include_jacobian:
+            @tf.function
+            def log_jac_fn(parameters):
+                # Log-prior function for the model
+                p_out = tf.zeros(parameters.shape[0])  
+                for p in self.priors_to_loop:
+                    p_out += self.p_bijector[p].forward_log_det_jacobian(
+                        parameters[:,self.model_labels[p]], 
+                        event_ndims=0
+                    )
+                return p_out           
+        else:
+            @tf.function
+            def log_jac_fn(parameters):
+                return tf.zeros(parameters.shape[0])
+        return log_jac_fn        
+    
     def _create_residual_ln_likelihood_fn(self):
         # Calculating the likelihood
         if self.noise_method == 'fit_tdist':
             @tf.function
             def residual_ln_likelihood_fn(parameters, residuals):                    
-                resid_ln_likelihood = calculate_log_prob_t(
-                    data=residuals, scale=parameters[:,self.model_labels['noise_scale']], dof=parameters[:,self.model_labels['noise_dof']]
-                )
-                resid_ln_likelihood = tf.reduce_sum(resid_ln_likelihood, axis=0)       
-
                 # Return vector of length idx (optimize each chain separately)
+                # Usef tfd.StudentT for t-distribution
+                resid_dist = tfd.StudentT(
+                    df=parameters[:,self.model_labels['noise_dof']],
+                    loc=0.0, 
+                    scale=parameters[:,self.model_labels['noise_scale']]
+                )
+                resid_ln_likelihood = resid_dist.log_prob(residuals)
+                resid_ln_likelihood = tf.reduce_sum(resid_ln_likelihood, axis=0)
                 return resid_ln_likelihood
         elif self.noise_method == 'fit_normal':
             # Assume residuals are normally distributed (loc=0.0)
             # Add the scale as an extra parameters to be fit             
             @tf.function
             def residual_ln_likelihood_fn(parameters, residuals):                    
-                # -> rescale based on std...
-                resid_ln_likelihood = calculate_log_prob_gauss_loc0(
-                    data=residuals, scale=parameters[:,self.model_labels['noise_scale']],
+                # [1] Use N(0, std) from tensorflow
+                resid_dist = tfd.Normal(
+                    loc=0.0, 
+                    scale=parameters[:,self.model_labels['noise_scale']]
                 )
+                resid_ln_likelihood = resid_dist.log_prob(residuals)
                 resid_ln_likelihood = tf.reduce_sum(resid_ln_likelihood, axis=0)
                 return resid_ln_likelihood              
         
@@ -522,10 +547,11 @@ class BPRF(object):
             def residual_ln_likelihood_fn(parameters, residuals):                    
                 # [1] Use N(0, std)         
                 residuals_std  = tf.math.reduce_std(residuals, axis=0)
-                # -> rescale based on std...
-                resid_ln_likelihood = calculate_log_prob_gauss_loc0(
-                    data=residuals, scale=residuals_std,
+                resid_dist = tfd.Normal(
+                    loc=0.0, 
+                    scale=residuals_std
                 )
+                resid_ln_likelihood = resid_dist.log_prob(residuals)
                 resid_ln_likelihood = tf.reduce_sum(resid_ln_likelihood, axis=0)
                 return resid_ln_likelihood     
         
@@ -833,22 +859,20 @@ class GPdists():
                 scale_tril=tf.cast(self.chol, dtype=tf.float32),
                 allow_nan_stats=False,
             )
-        elif self.fixed_params == 'fixed_vl':
-            raise NotImplementedError("Fixed parameters with 'fixed_vl' option is not implemented yet.")
         else:
             raise ValueError(f"Invalid fixed_params option: {self.fixed_params}. Choose from 'unfixed', 'fixed_vl', or 'fixed_all'.")
         self.set_log_prob()
 
-    @tf.function
-    def prior(self, param):
-        # Compute the conditional log-probability of the parameter under the GP prior
-        diff = param - self.f_gp_mean
-        raw_score = tf.linalg.matvec(self.prec_matrix, diff)
-        prec_ii = tf.linalg.diag_part(self.prec_matrix)
-        logZ = 0.5 * (tf.math.log(prec_ii) - tf.math.log(2 * math.pi))
-        quadratic = -0.5 * tf.square(raw_score) / prec_ii
-        log_probs = logZ + quadratic
-        return log_probs
+    # @tf.function
+    # def prior(self, param):
+    #     # Compute the conditional log-probability of the parameter under the GP prior
+    #     diff = param - self.f_gp_mean
+    #     raw_score = tf.linalg.matvec(self.prec_matrix, diff)
+    #     prec_ii = tf.linalg.diag_part(self.prec_matrix)
+    #     logZ = 0.5 * (tf.math.log(prec_ii) - tf.math.log(2 * math.pi))
+    #     quadratic = -0.5 * tf.square(raw_score) / prec_ii
+    #     log_probs = logZ + quadratic
+    #     return log_probs
         
         
     @tf.function
@@ -886,52 +910,52 @@ class GPdists():
         # Add nugget term for numerical stability
         return cov_matrix + tf.eye(cov_matrix.shape[0], dtype=self.dists_dtype) * tf.cast(self.eps + gp_nugget, dtype=self.dists_dtype)
     
-    @tf.function
-    def _compute_precision_and_conditional_log_prob(self, parameter, prec_matrix, gp_mean, full_norm):
-        if full_norm:
-            # Full normalization version:
-            diff = parameter - gp_mean
-            log_det_prec = tf.linalg.logdet(prec_matrix)
-            quad_form = tf.tensordot(diff, tf.linalg.matvec(prec_matrix, diff), axes=1)
-            n = tf.cast(tf.shape(parameter)[0], diff.dtype)
-            two_pi = tf.constant(2 * math.pi, dtype=diff.dtype)
-            return 0.5 * log_det_prec - 0.5 * quad_form - 0.5 * n * tf.math.log(two_pi)
-        else:
-            # Compute the conditional log-probability of the parameter under the GP prior
-            # i.e.
-            # > Compute [ log p(x_i | x_{-i}) ] for each entry i
-            # > under N(μ, Λ⁻¹).             
+    # @tf.function
+    # def _compute_precision_and_conditional_log_prob(self, parameter, prec_matrix, gp_mean, full_norm):
+    #     if full_norm:
+    #         # Full normalization version:
+    #         diff = parameter - gp_mean
+    #         log_det_prec = tf.linalg.logdet(prec_matrix)
+    #         quad_form = tf.tensordot(diff, tf.linalg.matvec(prec_matrix, diff), axes=1)
+    #         n = tf.cast(tf.shape(parameter)[0], diff.dtype)
+    #         two_pi = tf.constant(2 * math.pi, dtype=diff.dtype)
+    #         return 0.5 * log_det_prec - 0.5 * quad_form - 0.5 * n * tf.math.log(two_pi)
+    #     else:
+    #         # Compute the conditional log-probability of the parameter under the GP prior
+    #         # i.e.
+    #         # > Compute [ log p(x_i | x_{-i}) ] for each entry i
+    #         # > under N(μ, Λ⁻¹).             
                     
-            # 1) Centre the parameters
-            #    diff[i] = x_i - μ_i
-            diff = parameter - gp_mean
+    #         # 1) Centre the parameters
+    #         #    diff[i] = x_i - μ_i
+    #         diff = parameter - gp_mean
 
-            # 2) Influence of other parameters (x_{-i}) on x_i
-            #    raw_score[i] = sum_j Λ[i,j] * diff[j]
-            raw_score = tf.linalg.matvec(prec_matrix, diff)
+    #         # 2) Influence of other parameters (x_{-i}) on x_i
+    #         #    raw_score[i] = sum_j Λ[i,j] * diff[j]
+    #         raw_score = tf.linalg.matvec(prec_matrix, diff)
 
-            # 3) Precision matrix diagonal 
-            #    prec_ii = Λ[i,i], the scalar precision for x_i | x_-i
-            prec_ii = tf.linalg.diag_part(prec_matrix)
+    #         # 3) Precision matrix diagonal 
+    #         #    prec_ii = Λ[i,i], the scalar precision for x_i | x_-i
+    #         prec_ii = tf.linalg.diag_part(prec_matrix)
 
-            # 4) Normalization per Gaussian bell curve
-            #    logZ[i] = ½ (log prec_ii – log(2π))
-            #    → padds the height of the curve so it integrates to 1
-            logZ = 0.5 * (tf.math.log(prec_ii) - tf.math.log(2 * math.pi))
+    #         # 4) Normalization per Gaussian bell curve
+    #         #    logZ[i] = ½ (log prec_ii – log(2π))
+    #         #    → padds the height of the curve so it integrates to 1
+    #         logZ = 0.5 * (tf.math.log(prec_ii) - tf.math.log(2 * math.pi))
 
-            # 5) Quadratic term - penalty for deviation from the mean
-            #    Algebra shows that
-            #      (x_i – E[x_i|x_-i]) = raw_score[i] / prec_ii
-            #    So the penalty is
-            #      –½ · prec_ii · (x_i – E[·])²
-            #    which rearranges to:
-            #      –½ · (raw_score[i])² / prec_ii
-            quadratic = -0.5 * tf.square(raw_score) / prec_ii
+    #         # 5) Quadratic term - penalty for deviation from the mean
+    #         #    Algebra shows that
+    #         #      (x_i – E[x_i|x_-i]) = raw_score[i] / prec_ii
+    #         #    So the penalty is
+    #         #      –½ · prec_ii · (x_i – E[·])²
+    #         #    which rearranges to:
+    #         #      –½ · (raw_score[i])² / prec_ii
+    #         quadratic = -0.5 * tf.square(raw_score) / prec_ii
 
-            # 6) Combine them: each entry is
-            #      log p(x_i|x_-i) = logZ[i] + quadratic[i]
-            log_probs = logZ + quadratic
-            return log_probs   # shape [n]
+    #         # 6) Combine them: each entry is
+    #         #      log p(x_i|x_-i) = logZ[i] + quadratic[i]
+    #         log_probs = logZ + quadratic
+    #         return log_probs   # shape [n]
 
     def set_log_prob(self):
         """
@@ -1002,35 +1026,35 @@ class GPdists():
             )
             return inducing_gp_prior_dist.log_prob(inducing_parameter)
 
-    @tf.function
-    def _return_log_prob_fixed_prec(self, parameter, gp_lengthscale, gp_variance, gp_mean=0.0, gp_nugget=0.0, n_inducers=None):
-        """
-        Fixed parameters using precomputed precision matrix.
-        """
-        extra = tf.stop_gradient(gp_lengthscale + gp_variance + gp_mean + gp_nugget) * 0.0
-        return self._compute_precision_and_conditional_log_prob(parameter, self.prec_matrix, gp_mean, self.full_norm) + extra
+    # @tf.function
+    # def _return_log_prob_fixed_prec(self, parameter, gp_lengthscale, gp_variance, gp_mean=0.0, gp_nugget=0.0, n_inducers=None):
+    #     """
+    #     Fixed parameters using precomputed precision matrix.
+    #     """
+    #     extra = tf.stop_gradient(gp_lengthscale + gp_variance + gp_mean + gp_nugget) * 0.0
+    #     return self._compute_precision_and_conditional_log_prob(parameter, self.prec_matrix, gp_mean, self.full_norm) + extra
 
-    @tf.function
-    def _return_log_prob_unfixed_prec(self, parameter, gp_lengthscale, gp_variance, gp_mean=0.0, gp_nugget=0.0, n_inducers=None):
-        """
-        Unfixed parameters using precision matrix. Recompute the covariance and precision matrices on the fly.
-        """
-        if n_inducers is None or n_inducers >= self.n_vx:        
-            cov_matrix = self.return_sigma(gp_lengthscale, gp_variance, gp_nugget, n_inducers)
-            prec_matrix = tf.cast(tf.linalg.inv(cov_matrix), dtype=tf.float32)
-            return self._compute_precision_and_conditional_log_prob(parameter, prec_matrix, gp_mean, self.full_norm)
-        else:
-            # Sparse GP approximation using inducing points
-            if n_inducers <= 0:
-                raise ValueError("n_inducers must be a positive integer.")
-            inducing_indices, inducing_dists = self._return_inducing_idx_and_dists(n_inducers=n_inducers)
-            # Get the parameter values at the inducing points
-            inducing_parameter = tf.gather(parameter, inducing_indices)
+    # @tf.function
+    # def _return_log_prob_unfixed_prec(self, parameter, gp_lengthscale, gp_variance, gp_mean=0.0, gp_nugget=0.0, n_inducers=None):
+    #     """
+    #     Unfixed parameters using precision matrix. Recompute the covariance and precision matrices on the fly.
+    #     """
+    #     if n_inducers is None or n_inducers >= self.n_vx:        
+    #         cov_matrix = self.return_sigma(gp_lengthscale, gp_variance, gp_nugget, n_inducers)
+    #         prec_matrix = tf.cast(tf.linalg.inv(cov_matrix), dtype=tf.float32)
+    #         return self._compute_precision_and_conditional_log_prob(parameter, prec_matrix, gp_mean, self.full_norm)
+    #     else:
+    #         # Sparse GP approximation using inducing points
+    #         if n_inducers <= 0:
+    #             raise ValueError("n_inducers must be a positive integer.")
+    #         inducing_indices, inducing_dists = self._return_inducing_idx_and_dists(n_inducers=n_inducers)
+    #         # Get the parameter values at the inducing points
+    #         inducing_parameter = tf.gather(parameter, inducing_indices)
 
-            # Calculate the covariance matrix for the inducing points
-            inducing_cov_matrix = self.return_sigma(gp_lengthscale, gp_variance, gp_nugget, dists=inducing_dists)
-            prec_matrix = tf.cast(tf.linalg.inv(inducing_cov_matrix), dtype=tf.float32)
-            return self._compute_precision_and_conditional_log_prob(inducing_parameter, prec_matrix, gp_mean, self.full_norm)
+    #         # Calculate the covariance matrix for the inducing points
+    #         inducing_cov_matrix = self.return_sigma(gp_lengthscale, gp_variance, gp_nugget, dists=inducing_dists)
+    #         prec_matrix = tf.cast(tf.linalg.inv(inducing_cov_matrix), dtype=tf.float32)
+    #         return self._compute_precision_and_conditional_log_prob(inducing_parameter, prec_matrix, gp_mean, self.full_norm)
     
     @tf.function
     def _return_inducing_idx_and_dists(self, n_inducers):
@@ -1054,7 +1078,7 @@ class GPdists():
                 maxval=self.n_vx,
                 dtype=tf.int32,
                 seed=new_seed
-            )            
+            )
             # Get the indices of the closest n_inducers points
             _, inducing_indices = tf.math.top_k(-self.dists[centre_idx, :], k=n_inducers)
             inducing_indices = tf.sort(inducing_indices)  # Keep sorted
@@ -1108,6 +1132,9 @@ class GPdistsM():
         self.eps           = kwargs.get('eps', 1e-6)
         self.embedding_dim = kwargs.get('embedding_dim', 10)
         self.dists_dtype   = kwargs.get('dists_dtype', tf.float64)
+        self.dists         = kwargs.get('dists', None)
+        if self.dists is not None:
+            self.dists = tf.convert_to_tensor(self.dists, dtype=self.dists_dtype)
 
         self.stat_kernel_list = []
         self.lin_kernel_list = []
@@ -1556,6 +1583,20 @@ class GPdistsM():
                 tf.range(self.n_vx),
                 seed=new_seed)[:n_inducers]
             inducing_indices = tf.sort(inducing_indices)  # Keep them sorted for easier indexing
+        elif self.inducer_selection == 'close':
+            # Pick the n closest (requires self.dists)
+            # centre_idx = np.random.randint(0, self.n_vx)
+            centre_idx = tf.random.stateless_uniform(
+                shape=[],
+                minval=0,
+                maxval=self.n_vx,
+                dtype=tf.int32,
+                seed=new_seed
+            )       
+            # Get the indices of the closest n_inducers points
+            _, inducing_indices = tf.math.top_k(-self.dists[centre_idx, :], k=n_inducers)
+            inducing_indices = tf.sort(inducing_indices)  # Keep sorted
+
         else:
             raise ValueError(f"Unknown inducer selection method: {self.inducer_selection}")
 
