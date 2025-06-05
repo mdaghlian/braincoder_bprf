@@ -371,10 +371,12 @@ class BPRF_hier(BPRF):
         Does that even make sense?
         '''
         self.n_inducers = kwargs.pop('n_inducers', None)
+        self.inducer_selection = kwargs.pop('inducer_selection', 'random')
         if idx is None: # all of them?
             idx = np.arange(self.n_voxels).tolist()
         elif isinstance(idx, int):
             idx = [idx]
+        self.idx_to_fit = idx
         self._update_gps_for_idx(idx)
 
 
@@ -415,17 +417,23 @@ class BPRF_hier(BPRF):
         
         @tf.function
         def log_posterior_fn(parameters, h_parameters):
-            # Not needed - it does this under the hood with HMC
-            # parameters = self._bprf_transform_parameters_forward(parameters)
-            # h_parameters = self._h_bprf_transform_parameters_forward(h_parameters)
-            parameters = self.fix_update_fn(parameters)            
+            # Jacobian not needed - it does this under the hood with HMC
+            # For the same reason, do not need to pass parameters forward...
+            # ***parameters = self._bprf_transform_parameters_forward(parameters)
+            # ***h_parameters = self._h_bprf_transform_parameters_forward(h_parameters)
+            
+            parameters = self.fix_update_fn(parameters)                        
             h_parameters = self.h_fix_update_fn(h_parameters)
-            par4pred = parameters[:,:self.n_model_params] # chop out any hyper / noise parameters
+            
+            # Only predict with a subsample of vx? -> for speed
+            inducing_indices = self._return_inducing_idx(self.n_inducers)
+
+            par4pred = tf.gather(parameters[:,:self.n_model_params],inducing_indices) # chop out any hyper / noise parameters            
             predictions = self.model._predict(
                 paradigm_[tf.newaxis, ...], par4pred[tf.newaxis, ...], None)     # Only include those parameters that are fed to the model
-            residuals = y[:, vx_bool] - predictions[0]                        
-            log_likelihood = residual_ln_likelihood_fn(parameters, residuals)            
-            log_prior = log_prior_fn(parameters, h_parameters)            
+            residuals = tf.gather(y[:, vx_bool], inducing_indices, axis=1) - predictions[0]                                    
+            log_likelihood = residual_ln_likelihood_fn(parameters, residuals, inducing_indices)            
+            log_prior = log_prior_fn(parameters, h_parameters, inducing_indices)                        
             return tf.reduce_sum(log_prior + log_likelihood)        
         
         # -> make sure we are in the correct dtype 
@@ -466,7 +474,20 @@ class BPRF_hier(BPRF):
             # OTHER STUFF TO OPTIMIZE
             step_size=step_size, 
             **kwargs
-            )                
+            )   
+        # samples, stats = sample_nuts(
+        #     init_state = all_initial_state, 
+        #     target_log_prob_fn=target_log_prob_fn, 
+        #     bijectors=[*self.p_bijector_list, *self.h_bijector_list], 
+        #     step_size=step_size, 
+        #     **kwargs
+        #     # num_chains=4, 
+        #     # burnin=burnin, 
+        #     # draws=draws,
+        #     # target_accept=0.8, 
+        #     # max_depth=8            
+        #     )  
+        # return samples, stats                      
         # stuff to save...        
         all_samples = tf.stack(samples[:self.n_params], axis=-1).numpy()
         # nsteps, n_voxels, n_params
@@ -481,6 +502,7 @@ class BPRF_hier(BPRF):
         
         h_samples = tf.stack(samples[self.n_params:], axis=-1).numpy().squeeze()
         print(h_samples.shape)
+        self.h_mcmc_sampler = {}
         for h in self.h_labels:
             print(self.h_labels[h])
             self.h_mcmc_sampler[h] = h_samples[:,self.h_labels[h]]
@@ -549,11 +571,13 @@ class BPRF_hier(BPRF):
         '''
         optimizer_type = kwargs.get('optimizer', 'adam' )
         self.n_inducers = kwargs.pop('n_inducers', None)
+        self.inducer_selection = kwargs.pop('inducer_selection', 'random')
         adam_kwargs = kwargs.pop('adam_kwargs', {})
         if idx is None: # all of them?
             idx = np.arange(self.n_voxels).tolist()
         elif isinstance(idx, int):
             idx = [idx]
+        self.idx_to_fit = idx
         self._update_gps_for_idx(idx)
 
         vx_bool = np.zeros(self.n_voxels, dtype=bool)
@@ -592,17 +616,20 @@ class BPRF_hier(BPRF):
         @tf.function
         def log_posterior_fn(parameters_unc, h_parameters_unc):
             # JACOBIAN BEFORE TRANSFORMING FORWARD
-            log_jac = log_jac_fn(parameters_unc, h_parameters_unc)
+            # -> which sample of indices are we inducing from
+            inducing_indices = self._return_inducing_idx(self.n_inducers)
+            log_jac = log_jac_fn(parameters_unc, h_parameters_unc, inducing_indices)
+            
             parameters = self._bprf_transform_parameters_forward(parameters_unc)
             parameters = self.fix_update_fn(parameters)            
             h_parameters = self._h_bprf_transform_parameters_forward(h_parameters_unc)
             h_parameters = self.h_fix_update_fn(h_parameters)
-            par4pred = parameters[:,:self.n_model_params] # chop out any hyper / noise parameters
+            par4pred = tf.gather(parameters[:,:self.n_model_params],inducing_indices) # chop out any hyper / noise parameters            
             predictions = self.model._predict(
                 paradigm_[tf.newaxis, ...], par4pred[tf.newaxis, ...], None)     # Only include those parameters that are fed to the model
-            residuals = y[:, vx_bool] - predictions[0]                        
-            log_likelihood = residual_ln_likelihood_fn(parameters, residuals)            
-            log_prior = log_prior_fn(parameters, h_parameters)            
+            residuals = tf.gather(y[:, vx_bool], inducing_indices, axis=1) - predictions[0]                                    
+            log_likelihood = residual_ln_likelihood_fn(parameters, residuals, inducing_indices)            
+            log_prior = log_prior_fn(parameters, h_parameters, inducing_indices)            
             return tf.reduce_sum(log_prior + log_likelihood + log_jac)
 
         # -> make sure we are in the correct dtype
@@ -695,17 +722,18 @@ class BPRF_hier(BPRF):
     
     def _create_log_prior_fn(self):
         @tf.function
-        def log_prior_fn(parameters, h_parameters):
+        def log_prior_fn(parameters, h_parameters, inducing_indices):
             # Log-prior function for the model
-            p_out = 0.0            
+            p_out = 0.0      
             for p in self.priors_to_loop:
-                p_out += tf.reduce_sum(self.p_prior[p].prior(parameters[:,self.model_labels[p]]))
+
+                p_out += tf.reduce_sum(self.p_prior[p].prior(tf.gather(parameters[:,self.model_labels[p]], inducing_indices)))
             # Also apply the hierarchical priors
             for h in self.h_prior_to_apply.keys():
                 if self.h_prior_to_apply[h]=='normal':
-                    p_for_prior = parameters[:,self.model_labels[h]]                    
+                    p_for_prior = parameters[inducing_indices,self.model_labels[h]]                    
                     loc_for_prior = h_parameters[:,self.h_labels[h+'_loc']]
-                    scale_for_prior = h_parameters[:,self.h_labels[h+'_scale']]
+                    scale_for_prior = h_parameters[:,self.h_labels[h+'_scale']]                    
                     p_out += tf.reduce_sum(calculate_log_prob_gauss(
                         data=p_for_prior, loc=loc_for_prior, scale=scale_for_prior
                     ))
@@ -719,6 +747,7 @@ class BPRF_hier(BPRF):
                         gp_variance=gp_variance, 
                         parameter=param_values, 
                         n_inducers=self.n_inducers,
+                        inducing_indices=inducing_indices,
                     )
                 elif self.h_prior_to_apply[h]=='gp_dists_full':
                     param_values = parameters[:, self.model_labels[h]] # Values of parameter 'h' for vertices being fit
@@ -730,6 +759,7 @@ class BPRF_hier(BPRF):
                         parameter=param_values, gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, 
                         gp_mean=gp_mean, gp_nugget=gp_nugget,
                         n_inducers=self.n_inducers,
+                        inducing_indices=inducing_indices,
                     )
                 elif self.h_prior_to_apply[h]=='gp_dists_m':
                     param_values = parameters[:, self.model_labels[h]] # Values of parameter 'h' for vertices being fit
@@ -739,6 +769,7 @@ class BPRF_hier(BPRF):
                             gpkwargs[k.split(f'{h}_')[-1]] = h_parameters[:, self.h_labels[k]]
                     p_out += self.h_gp_function[h].return_log_prob(
                         parameter=param_values, n_inducers=self.n_inducers,
+                        inducing_indices=inducing_indices,
                         **gpkwargs,
                     )
 
@@ -751,17 +782,20 @@ class BPRF_hier(BPRF):
     def _create_log_jac_fn(self):
         if self.include_jacobian:
             @tf.function
-            def log_jac_fn(parameters, h_parameters):
+            def log_jac_fn(parameters, h_parameters, inducing_indices):
                 # Log-prior function for the model
-                p_out = 0.0                        
+                p_out = 0.0           
+                # inducing_indices = tf.cast(inducing_indices, tf.int32)        
+                # tf.squeeze(parameters[tf.squeeze(inducing_indices),self.model_labels['width_r']])
+                # bloop
                 for p in self.priors_to_loop:
                     p_out += tf.reduce_sum(self.p_bijector[p].forward_log_det_jacobian(
-                        tf.squeeze(parameters[:,self.model_labels[p]]), 
+                        tf.squeeze(tf.gather(parameters[:,self.model_labels[p]], inducing_indices)), 
                         event_ndims=0,
                     ))
                 for p in self.h_gp_function.keys():
                     p_out += tf.reduce_sum(self.p_bijector[p].forward_log_det_jacobian(
-                        tf.squeeze(parameters[:,self.model_labels[p]]), 
+                        tf.squeeze(tf.gather(parameters[:,self.model_labels[p]], inducing_indices)), 
                         event_ndims=1,
                     ))                    
                 for p in self.h_priors_to_loop:
@@ -774,7 +808,7 @@ class BPRF_hier(BPRF):
                 return p_out           
         else:
             @tf.function
-            def log_jac_fn(parameters, h_parameters):
+            def log_jac_fn(parameters, h_parameters, inducing_indices):
                 return 0.0
         return log_jac_fn
     
@@ -782,9 +816,11 @@ class BPRF_hier(BPRF):
         # Calculating the likelihood
         if self.noise_method == 'fit_tdist':
             @tf.function
-            def residual_ln_likelihood_fn(parameters, residuals):                    
+            def residual_ln_likelihood_fn(parameters, residuals, inducing_indices):                    
                 resid_ln_likelihood = calculate_log_prob_t(
-                    data=residuals, scale=parameters[:,self.model_labels['noise_scale']], dof=parameters[:,self.model_labels['noise_dof']]
+                    data=residuals, 
+                    scale=tf.gather(parameters[:,self.model_labels['noise_scale']],inducing_indices), 
+                    dof=tf.gather(parameters[:,self.model_labels['noise_dof']],inducing_indices), 
                 )
                 
                 # Use t-distribution from tensorflow_probability
@@ -800,10 +836,11 @@ class BPRF_hier(BPRF):
             # Assume residuals are normally distributed (loc=0.0)
             # Add the scale as an extra parameters to be fit             
             @tf.function
-            def residual_ln_likelihood_fn(parameters, residuals):                    
+            def residual_ln_likelihood_fn(parameters, residuals, inducing_indices):                    
                 # -> rescale based on std...
                 resid_ln_likelihood = calculate_log_prob_gauss_loc0(
-                    data=residuals, scale=parameters[:,self.model_labels['noise_scale']],
+                    data=residuals, 
+                    scale=tf.gather(parameters[:,self.model_labels['noise_scale']],inducing_indices), 
                 )
                 # Use N(0, scale) from tensorflow_probability
                 # resid_dist = tfd.Normal(loc=0.0, scale=parameters[:,self.model_labels['noise_scale']])
@@ -815,7 +852,7 @@ class BPRF_hier(BPRF):
             # Do not fit the noise - assume it is normally distributed
             # -> calculate scale based on the standard deviation of the residuals 
             @tf.function
-            def residual_ln_likelihood_fn(parameters, residuals):                    
+            def residual_ln_likelihood_fn(parameters, residuals, inducing_indices):                    
                 # [1] Use N(0, std)         
                 residuals_std  = tf.math.reduce_std(residuals, axis=0)
                 # -> rescale based on std...
@@ -864,6 +901,7 @@ class BPRF_hier(BPRF):
             idx = np.arange(self.n_voxels).tolist()
         elif isinstance(idx, int):
             idx = [idx]
+        self.idx_to_fit = idx
         vx_bool = np.zeros(self.n_voxels, dtype=bool)
         vx_bool[idx] = True
         self.n_vx_to_fit = len(idx)
@@ -961,7 +999,8 @@ class BPRF_hier(BPRF):
             # OTHER STUFF TO OPTIMIZE
             step_size=step_size, 
             **kwargs
-            )                
+            )               
+       
         # stuff to save...        
         
         h_samples = tf.stack(samples, axis=-1).numpy().squeeze()
@@ -996,10 +1035,12 @@ class BPRF_hier(BPRF):
         optimizer_type = kwargs.get('optimizer', 'adam' )
         adam_kwargs = kwargs.pop('adam_kwargs', {})
         self.n_inducers = kwargs.pop('n_inducers', None)
+        self.inducer_selection = kwargs.pop('inducer_selection', 'random')
         if idx is None: # all of them?
             idx = np.arange(self.n_voxels).tolist()
         elif isinstance(idx, int):
             idx = [idx]
+        self.idx_to_fit = idx
         vx_bool = np.zeros(self.n_voxels, dtype=bool)
         vx_bool[idx] = True
         self.n_vx_to_fit = len(idx)
@@ -1021,7 +1062,6 @@ class BPRF_hier(BPRF):
             for h in self.h_priors_to_loop:
                 p_out += tf.reduce_sum(self.h_prior[h].prior(h_parameters[:,self.h_labels[h]]))            
             return p_out 
-        print(self.h_prior_to_apply[pid])
         if self.include_jacobian:
             @tf.function
             def log_jac_fn(h_parameters):
@@ -1029,8 +1069,12 @@ class BPRF_hier(BPRF):
                 for h in self.h_priors_to_loop:
                     p_out += tf.reduce_sum(self.h_bijector[h].forward_log_det_jacobian(
                         h_parameters[:,self.h_labels[h]], 
-                        # event_ndims=0
-                    ))
+                        event_ndims=0,
+                    ))                
+                    p_out += tf.reduce_sum(self.p_bijector[pid].forward_log_det_jacobian(
+                        tf.squeeze(pid_pars), 
+                        event_ndims=1,
+                    ))                        
                 return p_out
         else:
             @tf.function

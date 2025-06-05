@@ -67,6 +67,14 @@ class BPRF(object):
         # MAP 
         self.MAP_parameters = [None] * self.data.shape[1]
         
+        # Used to select a sub set of vx to sample...
+        # 2-element seed for stateless RNG; will be incremented each call
+        self._seed = tf.Variable([0, 0], dtype=tf.int32, trainable=False)        
+        self.dists         = kwargs.get('dists', None)
+        if self.dists is not None:
+            self.dists = tf.convert_to_tensor(self.dists, dtype=tf.float32)
+        self._dists_idx = None
+
     def add_prior(self, pid, prior_type, **kwargs):
         ''' 
         Adds the prior to each parameter:
@@ -162,6 +170,10 @@ class BPRF(object):
         '''        
         # Ok lets map everything so we can fix some parameters
         # Are there any parameters to fix? 
+        if self.dists is not None:  
+            # If we are using "close" for inducer selection...      
+            self._dists_idx = tf.gather(tf.gather(self.dists, self.idx_to_fit, axis=0), self.idx_to_fit, axis=1)
+
         if (len(self.fixed_pars) != 0):
             k_check = list(self.fixed_pars.keys())
             for k in k_check:
@@ -243,6 +255,7 @@ class BPRF(object):
             idx = np.arange(self.n_voxels).tolist()
         elif isinstance(idx, int):
             idx = [idx]
+        self.idx_to_fit = idx
         vx_bool = np.zeros(self.n_voxels, dtype=bool)
         vx_bool[idx] = True
         self.n_vx_to_fit = len(idx)
@@ -373,6 +386,7 @@ class BPRF(object):
             idx = np.arange(self.n_voxels).tolist()
         elif isinstance(idx, int):
             idx = [idx]
+        self.idx_to_fit = idx
         vx_bool = np.zeros(self.n_voxels, dtype=bool)
         vx_bool[idx] = True
         self.n_vx_to_fit = len(idx)
@@ -481,6 +495,37 @@ class BPRF(object):
         self.MAP_parameters = pd.concat(df_list).reindex(idx)
         print('MAP optimization finished.')    
 
+    @tf.function
+    def _return_inducing_idx(self, n_inducers):
+        # increment the seed each call - necessary because otherwise when graph is drawn it doesn't change...
+        new_seed = self._seed.assign_add([1, 1])
+        # FOR DEBUGGING -> PRINT IT
+        # 2) print it for debugging
+        # tf.print("debug — new_seed:", new_seed)        
+        if self.inducer_selection == 'random':
+            # Randomly select indices for inducing points
+            inducing_indices = tf.random.experimental.stateless_shuffle(
+                tf.range(self.n_vx_to_fit),
+                seed=new_seed)[:n_inducers]
+            inducing_indices = tf.sort(inducing_indices)  # Keep them sorted for easier indexing
+
+        elif self.inducer_selection == 'close':
+            # centre_idx = np.random.randint(0, self.n_vx)
+            centre_idx = tf.random.stateless_uniform(
+                shape=[],
+                minval=0,
+                maxval=self.n_vx_to_fit,
+                dtype=tf.int32,
+                seed=new_seed
+            )
+            # Get the indices of the closest n_inducers points
+            _, inducing_indices = tf.math.top_k(-self._dists_idx[centre_idx, :], k=n_inducers)
+            inducing_indices = tf.sort(inducing_indices)  # Keep sorted
+
+        else:
+            raise ValueError(f"Unknown inducer selection method: {self.inducer_selection}")
+        
+        return inducing_indices
     def _create_log_prior_fn(self):
         @tf.function
         def log_prior_fn(parameters):
@@ -674,7 +719,7 @@ import tensorflow as tf
 import tensorflow_probability as tfp
 
 # Copied from .utils.mcmc
-@tf.function
+@tf.function(autograph=False, jit_compile=False)
 def bprf_sample_NUTS(
         init_state,
         step_size,
@@ -684,9 +729,11 @@ def bprf_sample_NUTS(
         unrolled_leapfrog_steps=1,
         max_tree_depth=10,
         num_steps=50,
-        burnin=50):
+        burnin=50,
+        parallel_iterations=1,
+        ):
 
-
+    bloop
     def trace_fn(_, pkr):
         return {
             'log_prob': pkr.inner_results.inner_results.target_log_prob,
@@ -719,19 +766,59 @@ def bprf_sample_NUTS(
         log_accept_prob_getter_fn=lambda pkr: pkr.inner_results.log_accept_ratio,
     )
     
-    start = timer()
+    # start = tf.timestamp()
     # Sampling from the chain.
     samples, stats = tfp.mcmc.sample_chain(
         num_results=burnin + num_steps,
         current_state=init_state,
         kernel=adaptive_sampler,
-        trace_fn=trace_fn)
+        trace_fn=trace_fn,
+        parallel_iterations=parallel_iterations,
+        )
 
-    duration = timer() - start
-    stats['elapsed_time'] = duration
+    # duration = tf.timestamp() - start
+    # stats['elapsed_time'] = duration
 
     return samples, stats
 # Summarize MCMC
+# @tf.function
+def sample_nuts(
+    init_state,
+    target_log_prob_fn,
+    bijectors,
+    step_size,
+    burnin,
+    draws,
+    target_accept=0.8,
+    max_depth=10,
+    parallel_iterations=32):
+
+  # 1) Build your NUTS wrapped in transform + dual averaging:
+  nuts = tfp.mcmc.NoUTurnSampler(
+      target_log_prob_fn,
+      step_size=step_size,
+      max_tree_depth=max_depth)
+  kernel = tfp.mcmc.TransformedTransitionKernel(nuts, bijector=bijectors)
+  adaptive = tfp.mcmc.DualAveragingStepSizeAdaptation(
+      inner_kernel=kernel,
+      num_adaptation_steps=int(0.8 * burnin),
+      target_accept_prob=target_accept)
+
+  # 2) Single call: specify burn-in and draws, and get back the trace.
+  samples, trace = tfp.mcmc.sample_chain(
+      num_results=draws,
+      current_state=init_state,
+      kernel=adaptive,
+      num_burnin_steps=burnin,                  # ← handles burnin internally
+      parallel_iterations=parallel_iterations,
+      trace_fn=lambda _, pkr: {
+        'log_prob': pkr.inner_results.target_log_prob,
+        'is_accepted': pkr.inner_results.is_accepted,
+        'leapfrogs': pkr.inner_results.leapfrogs_taken,
+        'step_size': pkr.inner_results.step_size,
+      })
+
+  return samples, trace
 
 def get_mcmc_summary(sampler, burnin=100, pc_range=25):
     keys = sampler[0].keys()
@@ -979,7 +1066,7 @@ class GPdists():
 
 
     @tf.function
-    def _return_log_prob_fixed_tf(self, parameter, gp_lengthscale, gp_variance, gp_mean=0.0, gp_nugget=0.0, n_inducers=None):
+    def _return_log_prob_fixed_tf(self, parameter, gp_lengthscale, gp_variance, gp_mean=0.0, gp_nugget=0.0, n_inducers=None, inducing_indices=None):
         """
         Fixed parameters using TensorFlow distribution.
         The extra hyperparameter inputs are included to maintain the gradient graph,
@@ -990,7 +1077,7 @@ class GPdists():
         return self.gp_prior_dist.log_prob(parameter) + extra
 
     @tf.function
-    def _return_log_prob_unfixed_tf(self, parameter, gp_lengthscale, gp_variance, gp_mean=0.0, gp_nugget=0.0, n_inducers=None):
+    def _return_log_prob_unfixed_tf(self, parameter, gp_lengthscale, gp_variance, gp_mean=0.0, gp_nugget=0.0, n_inducers=None, inducing_indices=None):
         """
         Unfixed parameters using TensorFlow distribution.
         Recompute covariance and Cholesky decomposition on the fly.
@@ -1011,7 +1098,8 @@ class GPdists():
             # Sparse GP approximation using inducing points
             if n_inducers <= 0:
                 raise ValueError("n_inducers must be a positive integer.")
-            inducing_indices, inducing_dists = self._return_inducing_idx_and_dists(n_inducers=n_inducers)
+
+            inducing_indices, inducing_dists = self._return_inducing_idx_and_dists(n_inducers=n_inducers, inducing_indices=inducing_indices)
             # Get the parameter values at the inducing points
             inducing_parameter = tf.gather(parameter, inducing_indices)
 
@@ -1057,34 +1145,35 @@ class GPdists():
     #         return self._compute_precision_and_conditional_log_prob(inducing_parameter, prec_matrix, gp_mean, self.full_norm)
     
     @tf.function
-    def _return_inducing_idx_and_dists(self, n_inducers):
+    def _return_inducing_idx_and_dists(self, n_inducers, inducing_indices=None):
         # increment the seed each call - necessary because otherwise when graph is drawn it doesn't change...
         new_seed = self._seed.assign_add([1, 1])
         # FOR DEBUGGING -> PRINT IT
         # 2) print it for debugging
-        # tf.print("debug — new_seed:", new_seed)        
-        if self.inducer_selection == 'random':
-            # Randomly select indices for inducing points
-            inducing_indices = tf.random.experimental.stateless_shuffle(
-                tf.range(self.n_vx),
-                seed=new_seed)[:n_inducers]
-            inducing_indices = tf.sort(inducing_indices)  # Keep them sorted for easier indexing
+        # tf.print("debug — new_seed:", new_seed)    
+        if inducing_indices is None:   
+            if self.inducer_selection == 'random':
+                # Randomly select indices for inducing points
+                inducing_indices = tf.random.experimental.stateless_shuffle(
+                    tf.range(self.n_vx),
+                    seed=new_seed)[:n_inducers]
+                inducing_indices = tf.sort(inducing_indices)  # Keep them sorted for easier indexing
 
-        elif self.inducer_selection == 'close':
-            # centre_idx = np.random.randint(0, self.n_vx)
-            centre_idx = tf.random.stateless_uniform(
-                shape=[],
-                minval=0,
-                maxval=self.n_vx,
-                dtype=tf.int32,
-                seed=new_seed
-            )
-            # Get the indices of the closest n_inducers points
-            _, inducing_indices = tf.math.top_k(-self.dists[centre_idx, :], k=n_inducers)
-            inducing_indices = tf.sort(inducing_indices)  # Keep sorted
+            elif self.inducer_selection == 'close':
+                # centre_idx = np.random.randint(0, self.n_vx)
+                centre_idx = tf.random.stateless_uniform(
+                    shape=[],
+                    minval=0,
+                    maxval=self.n_vx,
+                    dtype=tf.int32,
+                    seed=new_seed
+                )
+                # Get the indices of the closest n_inducers points
+                _, inducing_indices = tf.math.top_k(-self.dists[centre_idx, :], k=n_inducers)
+                inducing_indices = tf.sort(inducing_indices)  # Keep sorted
 
-        else:
-            raise ValueError(f"Unknown inducer selection method: {self.inducer_selection}")
+            else:
+                raise ValueError(f"Unknown inducer selection method: {self.inducer_selection}")
 
         # Gather distances for the selected inducing points
         inducing_dists = tf.gather(tf.gather(self.dists, inducing_indices, axis=0), inducing_indices, axis=1)
@@ -1516,19 +1605,19 @@ class GPdistsM():
 
         return cov_matrix    
     
-    def set_log_prob_fixed(self,**kwargs):
-        # Create a one off covariance matrix -> then use it to get probability each time...
-        # Get cov matrix
-        cov_matrix = self._return_sigma(**kwargs)
-        chol = tf.linalg.cholesky(tf.cast(cov_matrix, dtype=self.dists_dtype))
-        # Get mean vector
-        m_vect = self._return_mfunc(**kwargs)
-        self.gp_prior_dist = tfd.MultivariateNormalTriL(
-            loc=tf.fill([self.n_vx], tf.squeeze(m_vect)),
-            scale_tril=tf.cast(chol, dtype=tf.float32),
-            allow_nan_stats=False,
-        )
-        self.return_log_prob = self._return_log_prob_fixed
+    # def set_log_prob_fixed(self,**kwargs):
+    #     # Create a one off covariance matrix -> then use it to get probability each time...
+    #     # Get cov matrix
+    #     cov_matrix = self._return_sigma(**kwargs)
+    #     chol = tf.linalg.cholesky(tf.cast(cov_matrix, dtype=self.dists_dtype))
+    #     # Get mean vector
+    #     m_vect = self._return_mfunc(**kwargs)
+    #     self.gp_prior_dist = tfd.MultivariateNormalTriL(
+    #         loc=tf.fill([self.n_vx], tf.squeeze(m_vect)),
+    #         scale_tril=tf.cast(chol, dtype=tf.float32),
+    #         allow_nan_stats=False,
+    #     )
+    #     self.return_log_prob = self._return_log_prob_fixed
 
     @tf.function
     def _return_log_prob_unfixed(self, parameter, n_inducers=None, **kwargs):
@@ -1537,7 +1626,8 @@ class GPdistsM():
         Recompute covariance and Cholesky decomposition on the fly.
         Optionally uses random selection of n_inducers for sparse GP approximation.
         """
-        inducing_indices = self._return_inducing_idx(n_inducers=n_inducers)
+        inducing_indices = kwargs.pop('inducing_indices', None)
+        inducing_indices = self._return_inducing_idx(n_inducers=n_inducers, inducing_indices=inducing_indices)
         inducing_parameter = tf.gather(parameter, inducing_indices)
         # Get cov matrix
         cov_matrix = self._return_sigma(
@@ -1567,7 +1657,7 @@ class GPdistsM():
         return self.gp_prior_dist.log_prob(parameter)
 
     @tf.function
-    def _return_inducing_idx(self, n_inducers):        
+    def _return_inducing_idx(self, n_inducers, inducing_indices=None):        
         if n_inducers is None or n_inducers >= self.n_vx:
             # Everything...
             return tf.range(self.n_vx)
@@ -1576,29 +1666,31 @@ class GPdistsM():
         new_seed = self._seed.assign_add([1, 1])
         # FOR DEBUGGING -> PRINT IT
         # 2) print it for debugging
-        # tf.print("debug — new_seed:", new_seed)        
-        if self.inducer_selection == 'random':
-            # Randomly select indices for inducing points
-            inducing_indices = tf.random.experimental.stateless_shuffle(
-                tf.range(self.n_vx),
-                seed=new_seed)[:n_inducers]
-            inducing_indices = tf.sort(inducing_indices)  # Keep them sorted for easier indexing
-        elif self.inducer_selection == 'close':
-            # Pick the n closest (requires self.dists)
-            # centre_idx = np.random.randint(0, self.n_vx)
-            centre_idx = tf.random.stateless_uniform(
-                shape=[],
-                minval=0,
-                maxval=self.n_vx,
-                dtype=tf.int32,
-                seed=new_seed
-            )       
-            # Get the indices of the closest n_inducers points
-            _, inducing_indices = tf.math.top_k(-self.dists[centre_idx, :], k=n_inducers)
-            inducing_indices = tf.sort(inducing_indices)  # Keep sorted
+        # tf.print("debug — new_seed:", new_seed)     
+        if inducing_indices is None:   
+            bloop
+            if self.inducer_selection == 'random':
+                # Randomly select indices for inducing points
+                inducing_indices = tf.random.experimental.stateless_shuffle(
+                    tf.range(self.n_vx),
+                    seed=new_seed)[:n_inducers]
+                inducing_indices = tf.sort(inducing_indices)  # Keep them sorted for easier indexing
+            elif self.inducer_selection == 'close':
+                # Pick the n closest (requires self.dists)
+                # centre_idx = np.random.randint(0, self.n_vx)
+                centre_idx = tf.random.stateless_uniform(
+                    shape=[],
+                    minval=0,
+                    maxval=self.n_vx,
+                    dtype=tf.int32,
+                    seed=new_seed
+                )       
+                # Get the indices of the closest n_inducers points
+                _, inducing_indices = tf.math.top_k(-self.dists[centre_idx, :], k=n_inducers)
+                inducing_indices = tf.sort(inducing_indices)  # Keep sorted
 
-        else:
-            raise ValueError(f"Unknown inducer selection method: {self.inducer_selection}")
+            else:
+                raise ValueError(f"Unknown inducer selection method: {self.inducer_selection}")
 
         return inducing_indices 
 
