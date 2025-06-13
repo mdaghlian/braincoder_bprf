@@ -29,7 +29,7 @@ class BPRF(object):
         self.n_voxels = self.data.shape[-1]
         self.model_labels = {l:i for i,l in enumerate(self.model.parameter_labels)} # useful to have it as a dict per entry        
         self.n_model_params = len(self.model_labels) # length of model parameters only... 
-        self.include_jacobian = kwargs.get('include_jacobian', True)  # Include the jacobian in the model?
+        self.include_jacobian = kwargs.get('include_jacobian', False)  # Include the jacobian in the model?
         # We can also fit noise -> 
         self.noise_method = kwargs.get('noise_method', 'fit_tdist')  # 'fit_normal' 'none'
         print(self.noise_method)
@@ -105,8 +105,10 @@ class BPRF(object):
             self.p_prior[pid] = PriorFixed(fixed_val)
         elif prior_type == 'gp_dists':
             dists = kwargs.pop('dists')
-            fixed_params = kwargs.pop('fixed_params', True)
+            fixed_params = kwargs.pop('fixed_params', 'fixed_all')
             self.p_prior[pid] = GPdists(dists, fixed_params=fixed_params, **kwargs)
+        elif prior_type == 'gp_dists_m':
+            self.p_prior[pid] = kwargs.pop('gp_obj')
         else:
             self.p_prior[pid] = PriorGeneral(prior_type=prior_type, distribution=kwargs.get('distribution'))
     
@@ -343,8 +345,6 @@ class BPRF(object):
         self.mcmc_stats = stats
 
     def get_mcmc_summary(self, burnin=100, pc_range=25):
-        burnin = 100
-        pc_range = 25
         bpars = {}
         bpars_m = {}
         for p in list(self.model_labels.keys()): 
@@ -719,7 +719,8 @@ import tensorflow as tf
 import tensorflow_probability as tfp
 
 # Copied from .utils.mcmc
-@tf.function(autograph=False, jit_compile=False)
+# @tf.function(autograph=False, jit_compile=False)
+@tf.function
 def bprf_sample_NUTS(
         init_state,
         step_size,
@@ -733,7 +734,7 @@ def bprf_sample_NUTS(
         parallel_iterations=1,
         ):
 
-    bloop
+    # bloop
     def trace_fn(_, pkr):
         return {
             'log_prob': pkr.inner_results.inner_results.target_log_prob,
@@ -781,44 +782,6 @@ def bprf_sample_NUTS(
 
     return samples, stats
 # Summarize MCMC
-# @tf.function
-def sample_nuts(
-    init_state,
-    target_log_prob_fn,
-    bijectors,
-    step_size,
-    burnin,
-    draws,
-    target_accept=0.8,
-    max_depth=10,
-    parallel_iterations=32):
-
-  # 1) Build your NUTS wrapped in transform + dual averaging:
-  nuts = tfp.mcmc.NoUTurnSampler(
-      target_log_prob_fn,
-      step_size=step_size,
-      max_tree_depth=max_depth)
-  kernel = tfp.mcmc.TransformedTransitionKernel(nuts, bijector=bijectors)
-  adaptive = tfp.mcmc.DualAveragingStepSizeAdaptation(
-      inner_kernel=kernel,
-      num_adaptation_steps=int(0.8 * burnin),
-      target_accept_prob=target_accept)
-
-  # 2) Single call: specify burn-in and draws, and get back the trace.
-  samples, trace = tfp.mcmc.sample_chain(
-      num_results=draws,
-      current_state=init_state,
-      kernel=adaptive,
-      num_burnin_steps=burnin,                  # ← handles burnin internally
-      parallel_iterations=parallel_iterations,
-      trace_fn=lambda _, pkr: {
-        'log_prob': pkr.inner_results.target_log_prob,
-        'is_accepted': pkr.inner_results.is_accepted,
-        'leapfrogs': pkr.inner_results.leapfrogs_taken,
-        'step_size': pkr.inner_results.step_size,
-      })
-
-  return samples, trace
 
 def get_mcmc_summary(sampler, burnin=100, pc_range=25):
     keys = sampler[0].keys()
@@ -950,16 +913,16 @@ class GPdists():
             raise ValueError(f"Invalid fixed_params option: {self.fixed_params}. Choose from 'unfixed', 'fixed_vl', or 'fixed_all'.")
         self.set_log_prob()
 
-    # @tf.function
-    # def prior(self, param):
-    #     # Compute the conditional log-probability of the parameter under the GP prior
-    #     diff = param - self.f_gp_mean
-    #     raw_score = tf.linalg.matvec(self.prec_matrix, diff)
-    #     prec_ii = tf.linalg.diag_part(self.prec_matrix)
-    #     logZ = 0.5 * (tf.math.log(prec_ii) - tf.math.log(2 * math.pi))
-    #     quadratic = -0.5 * tf.square(raw_score) / prec_ii
-    #     log_probs = logZ + quadratic
-    #     return log_probs
+    @tf.function
+    def prior(self, param):
+        # Compute the conditional log-probability of the parameter under the GP prior
+        diff = param - self.f_gp_mean
+        raw_score = tf.linalg.matvec(self.prec_matrix, diff)
+        prec_ii = tf.linalg.diag_part(self.prec_matrix)
+        logZ = 0.5 * (tf.math.log(prec_ii) - tf.math.log(2 * math.pi))
+        quadratic = -0.5 * tf.square(raw_score) / prec_ii
+        log_probs = logZ + quadratic
+        return log_probs
         
         
     @tf.function
@@ -1073,7 +1036,9 @@ class GPdists():
         even though they are not used.
         """
         # Note: The extra terms are added via tf.stop_gradient to keep gradients flowing
-        extra = tf.stop_gradient(gp_lengthscale + gp_variance + gp_mean + gp_nugget) * 0.0
+        # extra = tf.stop_gradient(gp_lengthscale + gp_variance + gp_mean + gp_nugget) * 0.0
+        # bloop
+        extra = (gp_lengthscale + gp_variance + gp_mean + gp_nugget) * 0.0
         return self.gp_prior_dist.log_prob(parameter) + extra
 
     @tf.function
@@ -1249,7 +1214,18 @@ class GPdistsM():
         self.pids_inv = {}
         self.pids_inv = {v:k for k,v in self.pids.items()}
 
-
+    @tf.function
+    def prior(self, param):
+        # Compute the conditional log-probability of the parameter under the GP prior
+        diff = param - self.m_vect
+        raw_score = tf.linalg.matvec(self.prec_matrix, diff)
+        prec_ii = tf.linalg.diag_part(self.prec_matrix)
+        logZ = 0.5 * (tf.math.log(prec_ii) - tf.math.log(2 * math.pi))
+        quadratic = -0.5 * tf.square(raw_score) / prec_ii
+        log_probs = logZ + quadratic
+        return log_probs
+        
+        
     # **************** MEAN FUNCTIONS ***************
     def add_xid_linear_mfunc(self, xid, **kwargs):
         ''' add a kernel
@@ -1605,19 +1581,21 @@ class GPdistsM():
 
         return cov_matrix    
     
-    # def set_log_prob_fixed(self,**kwargs):
-    #     # Create a one off covariance matrix -> then use it to get probability each time...
-    #     # Get cov matrix
-    #     cov_matrix = self._return_sigma(**kwargs)
-    #     chol = tf.linalg.cholesky(tf.cast(cov_matrix, dtype=self.dists_dtype))
-    #     # Get mean vector
-    #     m_vect = self._return_mfunc(**kwargs)
-    #     self.gp_prior_dist = tfd.MultivariateNormalTriL(
-    #         loc=tf.fill([self.n_vx], tf.squeeze(m_vect)),
-    #         scale_tril=tf.cast(chol, dtype=tf.float32),
-    #         allow_nan_stats=False,
-    #     )
-    #     self.return_log_prob = self._return_log_prob_fixed
+    def set_log_prob_fixed(self,**kwargs):
+        # Create a one off covariance matrix -> then use it to get probability each time...
+        # Get cov matrix
+        self.cov_matrix = self._return_sigma(**kwargs)
+        self.chol = tf.linalg.cholesky(tf.cast(self.cov_matrix, dtype=self.dists_dtype))
+        # Get mean vector
+        self.m_vect = self._return_mfunc(**kwargs)
+        self.prec_matrix = tf.cast(tf.linalg.inv(self.cov_matrix), dtype=tf.float32)
+
+        self.gp_prior_dist = tfd.MultivariateNormalTriL(
+            loc=tf.squeeze(tf.cast(self.m_vect, dtype=tf.float32)), 
+            scale_tril=tf.cast(self.chol, dtype=tf.float32),
+            allow_nan_stats=False,
+        )
+        self.return_log_prob = self._return_log_prob_fixed
 
     @tf.function
     def _return_log_prob_unfixed(self, parameter, n_inducers=None, **kwargs):
@@ -1668,7 +1646,7 @@ class GPdistsM():
         # 2) print it for debugging
         # tf.print("debug — new_seed:", new_seed)     
         if inducing_indices is None:   
-            bloop
+            # bloop
             if self.inducer_selection == 'random':
                 # Randomly select indices for inducing points
                 inducing_indices = tf.random.experimental.stateless_shuffle(

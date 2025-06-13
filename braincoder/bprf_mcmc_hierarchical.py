@@ -326,7 +326,8 @@ class BPRF_hier(BPRF):
         for gpkey in self.h_gp_function.keys():
             self.h_gp_function[gpkey].n_vx = len(idx)
             if hasattr(self.h_gp_function[gpkey], 'dists'):
-                self.h_gp_function[gpkey].dists = tf.gather(tf.gather(self.h_gp_function[gpkey].dists, idx, axis=0), idx, axis=1)
+                if self.h_gp_function[gpkey].dists is not None:
+                    self.h_gp_function[gpkey].dists = tf.gather(tf.gather(self.h_gp_function[gpkey].dists, idx, axis=0), idx, axis=1)
             if hasattr(self.h_gp_function[gpkey], 'dXs'):
                 for dXkey in self.h_gp_function[gpkey].dXs.keys():
                     self.h_gp_function[gpkey].dXs[dXkey] = tf.gather(tf.gather(self.h_gp_function[gpkey].dXs[dXkey], idx, axis=0), idx, axis=1)
@@ -511,8 +512,6 @@ class BPRF_hier(BPRF):
         self._restore_gps()
 
     def get_mcmc_summary(self, burnin=100, pc_range=25):
-        burnin = 100
-        pc_range = 25
         bpars = {}
         bpars_m = {}
         for p in list(self.model_labels.keys()): 
@@ -630,7 +629,8 @@ class BPRF_hier(BPRF):
             residuals = tf.gather(y[:, vx_bool], inducing_indices, axis=1) - predictions[0]                                    
             log_likelihood = residual_ln_likelihood_fn(parameters, residuals, inducing_indices)            
             log_prior = log_prior_fn(parameters, h_parameters, inducing_indices)            
-            return tf.reduce_sum(log_prior + log_likelihood + log_jac)
+            # scaled_prior_jac = (log_prior+log_jac ) * (self.n_vx_to_fit / self.n_inducers)
+            return tf.reduce_sum(log_likelihood + log_prior + log_jac)
 
         # -> make sure we are in the correct dtype
         # Convert initial parameters to tensors
@@ -705,7 +705,7 @@ class BPRF_hier(BPRF):
             for i,p in enumerate(self.model_labels):
                 estimated_p_dict[p] = p_opt_vars[i][ivx_loc]
             for p,v in self.fixed_pars.items():
-                estimated_p_dict[p] = estimated_p_dict[p]*0 + v[ivx_fit]
+                estimated_p_dict[p] = estimated_p_dict[p]*0 + v[ivx_loc]
             
             df = pd.DataFrame(estimated_p_dict, index=[ivx_fit]) # use map_sampler instead of mcmc_sampler
             df_list.append(df)
@@ -797,7 +797,7 @@ class BPRF_hier(BPRF):
                     p_out += tf.reduce_sum(self.p_bijector[p].forward_log_det_jacobian(
                         tf.squeeze(tf.gather(parameters[:,self.model_labels[p]], inducing_indices)), 
                         event_ndims=1,
-                    ))                    
+                    ))     
                 for p in self.h_priors_to_loop:
                     p_out += tf.reduce_sum(self.h_bijector[p].forward_log_det_jacobian(
                         tf.squeeze(h_parameters[:,self.h_labels[p]]), 
@@ -991,6 +991,7 @@ class BPRF_hier(BPRF):
 
         # CALLING GILLES' "sample_hmc" from .utils.mcmc
         print(f"Starting NUTS sampling...")
+        from braincoder.bprf_mcmc import bprf_sample_NUTS
         samples, stats = bprf_sample_NUTS(
             init_state = h_initial_state, 
             target_log_prob_fn=target_log_prob_fn, 
