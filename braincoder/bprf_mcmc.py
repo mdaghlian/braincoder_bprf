@@ -29,7 +29,7 @@ class BPRF(object):
         self.n_voxels = self.data.shape[-1]
         self.model_labels = {l:i for i,l in enumerate(self.model.parameter_labels)} # useful to have it as a dict per entry        
         self.n_model_params = len(self.model_labels) # length of model parameters only... 
-        self.include_jacobian = kwargs.get('include_jacobian', False)  # Include the jacobian in the model?
+        self.include_jacobian = kwargs.get('include_jacobian', True)  # Include the jacobian in the model?
         # We can also fit noise -> 
         self.noise_method = kwargs.get('noise_method', 'fit_tdist')  # 'fit_normal' 'none'
         print(self.noise_method)
@@ -412,32 +412,25 @@ class BPRF(object):
 
         # Now create the log_posterior_fn
         @tf.function
-        def log_posterior_fn(parameters):                        
-            log_jac = log_jac_fn(parameters) # before transformation 
-            parameters = self._bprf_transform_parameters_forward(parameters)
-            parameters = self.fix_update_fn(parameters)            
+        def log_posterior_fn(parameters_unc):                        
+            # [1] Mask fixed parameters
+            f_parameters_unc = self.fix_update_fn(parameters_unc)            
 
-            # *** NAN DEBUGGING ***            
-            # nan_mask = tf.math.is_nan(parameters)            
-            # if tf.reduce_any(nan_mask):
-            #     nan_indices = tf.where(nan_mask)
-            #     tf.print("NaN values found in parameters at indices:", nan_indices)
+            # [2] Jacobian
+            log_jac = log_jac_fn(f_parameters_unc) # before transformation 
+            
+            # [3] bijectors
+            f_parameters = self._bprf_transform_parameters_forward(f_parameters_unc)
 
-            par4pred = parameters[:,:self.n_model_params] # chop out any hyper / noise parameters
+            # [4] Prior
+            log_prior = log_prior_fn(f_parameters) 
+
+            # [5] Likelihood
+            par4pred = f_parameters[:,:self.n_model_params] # chop out any hyper / noise parameters
             predictions = self.model._predict(
                 paradigm_[tf.newaxis, ...], par4pred[tf.newaxis, ...], None)     # Only include those parameters that are fed to the model
-            residuals = y[:, vx_bool] - predictions[0]                                    
-            
-            # *** NAN DEBUGGING ***
-            # nan_mask = tf.math.is_nan(predictions)   
-            # if tf.reduce_any(nan_mask):
-            #     nan_indices = tf.where(nan_mask)
-            #     tf.print("NaN values found in parameters at indices:", nan_indices[0])            
-            # tf.debugging.assert_all_finite(predictions, f"NaN or Inf found in predictions!")                         
-            # tf.debugging.assert_all_finite(residuals, f"NaN or Inf found in residuals!")                         
-
-            log_likelihood = residual_ln_likelihood_fn(parameters, residuals)
-            log_prior = log_prior_fn(parameters) 
+            residuals = y[:, vx_bool] - predictions[0]                                                
+            log_likelihood = residual_ln_likelihood_fn(f_parameters, residuals)
             # Return vector of length idx (optimize each chain separately)
             return log_prior + log_likelihood + log_jac
 
@@ -497,6 +490,9 @@ class BPRF(object):
 
     @tf.function
     def _return_inducing_idx(self, n_inducers):
+        if self.n_inducers is None:
+            # Return all indices if no inducing points are specified
+            return tf.range(self.n_vx_to_fit, dtype=tf.int32)
         # increment the seed each call - necessary because otherwise when graph is drawn it doesn't change...
         new_seed = self._seed.assign_add([1, 1])
         # FOR DEBUGGING -> PRINT IT
@@ -657,18 +653,39 @@ class BPRF(object):
 
 
 # *** FIX UPDATE FN **
-class FixUdateFn():
-    '''Replace lambda to make it pickleable'''
+class FixUdateFn:
+    """Mask out ‘fixed’ entries in `parameters` using the same init args."""
     def __init__(self, fix_update_index=None, fix_update_value=None):
-        self.fix_update_index = fix_update_index
-        self.fix_update_value = fix_update_value
+        # fix_update_index: an [N,1] or [N,D] int64 tensor of indices into the V-vector
+        # fix_update_value: a length-N float tensor of the values you want to hold fixed
+        if fix_update_index is not None:            
+            self.fix_update_index = tf.convert_to_tensor(fix_update_index, dtype=tf.int32)
+            self.fix_update_value = tf.convert_to_tensor(fix_update_value, dtype=tf.float32)
+        else:
+            self.fix_update_index = None
+            self.fix_update_value = None
 
     def update_fn(self, parameters):
+        # parameters: a [V] float tensor of your raw_x
         if self.fix_update_index is None:
             return parameters
-        else:
-            return tf.tensor_scatter_nd_update(parameters, self.fix_update_index, self.fix_update_value)             
 
+        # 1) build a full-length mask of 1s and zero out the fixed positions
+        mask = tf.ones_like(parameters)
+        zeros_for_mask = tf.zeros(tf.shape(self.fix_update_value), dtype=mask.dtype)
+        mask = tf.tensor_scatter_nd_update(mask,
+                                           self.fix_update_index,
+                                           zeros_for_mask)
+        # 2) build a full-length "fixed values" vector: 0s everywhere except
+        #    your desired fix_update_value at the fixed positions
+        fixed_vals = tf.zeros_like(parameters)
+        fixed_vals = tf.tensor_scatter_nd_update(
+            fixed_vals,
+            self.fix_update_index,
+            tf.cast(self.fix_update_value, parameters.dtype)
+        )
+        # 3) fuse it all: keep parameters where mask==1, else use fixed_vals
+        return mask * parameters + (1.0 - mask) * fixed_vals
 # *** PRIORS ***
 class PriorBase():
     prior_type = 'base'
@@ -1066,7 +1083,7 @@ class GPdists():
 
             inducing_indices, inducing_dists = self._return_inducing_idx_and_dists(n_inducers=n_inducers, inducing_indices=inducing_indices)
             # Get the parameter values at the inducing points
-            inducing_parameter = tf.gather(parameter, inducing_indices)
+            inducing_parameter = parameter
 
             # Calculate the covariance matrix for the inducing points
             inducing_cov_matrix = self.return_sigma(gp_lengthscale, gp_variance, gp_nugget, dists=inducing_dists)
@@ -1124,7 +1141,7 @@ class GPdists():
                     seed=new_seed)[:n_inducers]
                 inducing_indices = tf.sort(inducing_indices)  # Keep them sorted for easier indexing
 
-            elif self.inducer_selection == 'close':
+            elif self.inducer_selection == 'close':                
                 # centre_idx = np.random.randint(0, self.n_vx)
                 centre_idx = tf.random.stateless_uniform(
                     shape=[],
@@ -1346,12 +1363,41 @@ class GPdistsM():
             self.pids[len(self.pids)] = f'gpk{xid}_spec_alpha'
             self.pids[len(self.pids)] = f'gpk{xid}_spec_beta'
         
-        elif self.kernel_type[xid] == 'spec_LBOwarp':
-            self.pids[len(self.pids)] = f'gpk{xid}_spec_l'
-            self.pids[len(self.pids)] = f'gpk{xid}_spec_v'
-            self.pids[len(self.pids)] = f'gpk{xid}_spec_m0'
+        elif self.kernel_type[xid] == 'spec_LBOwarp_dx':
+            # Distance for RBF type kernel comes from warped LBO            
+            self.pids[len(self.pids)] = f'gpk{xid}_spec_l' # lengthscale
+            self.pids[len(self.pids)] = f'gpk{xid}_spec_v' # variance 
+            self.pids[len(self.pids)] = f'gpk{xid}_spec_dxm0'# 
             for i in range(1, self.eig_vals[xid].shape[0]+1):
-                self.pids[len(self.pids)] = f'gpk{xid}_spec_m{i}'
+                self.pids[len(self.pids)] = f'gpk{xid}_spec_dxm{i}'
+
+        elif self.kernel_type[xid] == 'spec_LBOwarp_dxl':
+            # Distance for RBF type kernel comes from warped LBO            
+            # As does lengthscale...
+            self.pids[len(self.pids)] = f'gpk{xid}_spec_v' # variance 
+            self.pids[len(self.pids)] = f'gpk{xid}_spec_lm0' # lengthscale
+            for i in range(1, self.eig_vals[xid].shape[0]+1):
+                self.pids[len(self.pids)] = f'gpk{xid}_spec_lm{i}'             
+
+            self.pids[len(self.pids)] = f'gpk{xid}_spec_dxm0'# 
+            for i in range(1, self.eig_vals[xid].shape[0]+1):
+                self.pids[len(self.pids)] = f'gpk{xid}_spec_dxm{i}'  
+
+        elif self.kernel_type[xid] == 'spec_LBOwarp_dxlv':
+            # Distance for RBF type kernel comes from warped LBO            
+            # As does lengthscale...
+            # variance is also warped...
+            self.pids[len(self.pids)] = f'gpk{xid}_spec_vm0' # variance
+            for i in range(1, self.eig_vals[xid].shape[0]+1):
+                self.pids[len(self.pids)] = f'gpk{xid}_spec_vm{i}'             
+
+            self.pids[len(self.pids)] = f'gpk{xid}_spec_lm0' # lengthscale
+            for i in range(1, self.eig_vals[xid].shape[0]+1):
+                self.pids[len(self.pids)] = f'gpk{xid}_spec_lm{i}'             
+
+            self.pids[len(self.pids)] = f'gpk{xid}_spec_dxm0'# 
+            for i in range(1, self.eig_vals[xid].shape[0]+1):
+                self.pids[len(self.pids)] = f'gpk{xid}_spec_dxm{i}' 
         
         elif self.kernel_type[xid] == 'spec_LBOGibbs':
             self.pids[len(self.pids)] = f'gpk{xid}_spec_v'
@@ -1464,7 +1510,7 @@ class GPdistsM():
         cov_matrix = gpk_slope**2 * (Xs-gpk_const) * (tf.transpose(Xs) - gpk_const)
         return cov_matrix
 
-    # @tf.function
+    @tf.function
     def _return_sigma_xid_spectral(self, eig_vals, eig_vects, kernel_type, **kwargs):
         """
         Compute covariance matrix from spectral kernel:
@@ -1503,16 +1549,16 @@ class GPdistsM():
             # Form covariance matrix
             cov_matrix = tf.matmul(eig_vects * filt[tf.newaxis, :], eig_vects, transpose_b=True)        
 
-        elif kernel_type == 'spec_LBOwarp':
+        elif kernel_type == 'spec_LBOwarp_dx':
             # [1] Weighted sum of eigenvectors (LBOwarp)
-            LBO_w0 = tf.cast(kwargs['gpk_spec_m0'], dtype=self.dists_dtype)
-            LBO_wX = tf.stack(
-                [kwargs[f"gpk_spec_m{i}"] for i in range(1, len(eig_vals)+1)],
+            dxLBO_w0 = tf.cast(kwargs['gpk_spec_dxm0'], dtype=self.dists_dtype)
+            dxLBO_wX = tf.stack(
+                [kwargs[f"gpk_spec_dxm{i}"] for i in range(1, len(eig_vals)+1)],
                 axis=0
             )
-            LBO_wX = tf.cast(LBO_wX, dtype=self.dists_dtype)
+            dxLBO_wX = tf.cast(dxLBO_wX, dtype=self.dists_dtype)
             # Warped distances
-            warped_X = LBO_w0 + tf.matmul(eig_vects, LBO_wX) # [N, 1]
+            warped_X = dxLBO_w0 + tf.matmul(eig_vects, dxLBO_wX) # [N, 1]
             warped_X = tf.squeeze(warped_X, axis=-1) # [N,]
             # [2] RBF kernel  (f1 - f2)           
             gpk_l = tf.cast(kwargs['gpk_spec_l'], dtype=self.dists_dtype)
@@ -1521,6 +1567,101 @@ class GPdistsM():
             cov_matrix = tf.square(var) * tf.exp(
                 -tf.square(dXs) / (2.0 * tf.square(gpk_l))
             )
+        
+        elif kernel_type == 'spec_LBOwarp_dxl':
+            # [1] Weighted sum of eigenvectors (LBOwarp)
+            dxLBO_w0 = tf.cast(kwargs['gpk_spec_dxm0'], dtype=self.dists_dtype)
+            dxLBO_wX = tf.stack(
+                [kwargs[f"gpk_spec_dxm{i}"] for i in range(1, len(eig_vals)+1)],
+                axis=0
+            )
+            dxLBO_wX = tf.cast(dxLBO_wX, dtype=self.dists_dtype)
+            # Warped distances
+            warped_X = dxLBO_w0 + tf.matmul(eig_vects, dxLBO_wX) # [N, 1]
+            warped_X = tf.squeeze(warped_X, axis=-1) # [N,]
+            dXs = compute_euclidean_distance_matrix(warped_X[...,tf.newaxis])        
+            
+            # [2] Warped lengthscale
+            lLBO_w0 = tf.cast(kwargs['gpk_spec_lm0'], dtype=self.dists_dtype)
+            lLBO_wX = tf.stack(
+                [kwargs[f"gpk_spec_lm{i}"] for i in range(1, len(eig_vals)+1)],
+                axis=0
+            )
+            lLBO_wX = tf.cast(lLBO_wX, dtype=self.dists_dtype)
+            # Warped lengthscale
+            warped_l = lLBO_w0 + tf.matmul(eig_vects, lLBO_wX) # [N, 1]
+            warped_l = tf.squeeze(warped_l, axis=-1)
+            # -> force positive
+            gpk_l = tf.exp(warped_l) + tf.cast(self.eps, dtype=self.dists_dtype)
+
+            # [2] RBF kernel  (f1 - f2)           
+            gpk_v = tf.cast(kwargs['gpk_spec_v'], dtype=self.dists_dtype)
+            # Informally, Gibbs kernel is:
+            # K = gpk_v^2 * norm_ * RBF_ 
+            #       norm_ = ((2*gpk_l*gpk_l.T)/(gpk_l^2+gpk_l.T^2))d/2 
+            # -> 
+            #       RBF_ = exp(-dXs^2/(gpk_l^2+gpk_l.T^2))
+            two_l_lT = 2 * tf.matmul(gpk_l[:,None], gpk_l[None,:])
+            lsq_lTsq = tf.square(gpk_l[:,None]) + tf.square(gpk_l[None,:])
+            norm_ = tf.sqrt(two_l_lT / lsq_lTsq)
+            # RBF
+            cov_matrix     = tf.square(gpk_v) * norm_ * tf.exp(-tf.square(dXs) / lsq_lTsq)    
+        
+        elif kernel_type == 'spec_LBOwarp_dxlv':
+            # [1] --- Warp the inputs (distances) -----------------------------
+            dxLBO_w0 = tf.cast(kwargs['gpk_spec_dxm0'], dtype=self.dists_dtype)
+            dxLBO_wX = tf.stack(
+                [kwargs[f"gpk_spec_dxm{i}"] for i in range(1, len(eig_vals)+1)],
+                axis=0
+            )
+            dxLBO_wX = tf.cast(dxLBO_wX, dtype=self.dists_dtype)
+
+            # Weighted sum of eigenvectors → warped coords
+            warped_X = dxLBO_w0 + tf.matmul(eig_vects, dxLBO_wX)  # shape [N,1]
+            warped_X = tf.squeeze(warped_X, axis=-1)             # shape [N,]
+
+            # Pairwise distances in warped space
+            dXs = compute_euclidean_distance_matrix(warped_X[..., tf.newaxis])
+
+            # [2] --- Warp the length‑scales ----------------------------------
+            lLBO_w0 = tf.cast(kwargs['gpk_spec_lm0'], dtype=self.dists_dtype)
+            lLBO_wX = tf.stack(
+                [kwargs[f"gpk_spec_lm{i}"] for i in range(1, len(eig_vals)+1)],
+                axis=0
+            )
+            lLBO_wX = tf.cast(lLBO_wX, dtype=self.dists_dtype)
+
+            warped_l = lLBO_w0 + tf.matmul(eig_vects, lLBO_wX)   # [N,1]
+            warped_l = tf.squeeze(warped_l, axis=-1)            # [N,]
+            # make positive
+            gpk_l = tf.exp(warped_l) + tf.cast(self.eps, dtype=self.dists_dtype)
+
+            # [3] --- Warp the variances --------------------------------------
+            # we model log-variance offsets per eigenvector, same pattern:
+            vLBO_w0 = tf.cast(kwargs['gpk_spec_vm0'], dtype=self.dists_dtype)
+            vLBO_wX = tf.stack(
+                [kwargs[f"gpk_spec_vm{i}"] for i in range(1, len(eig_vals)+1)],
+                axis=0
+            )
+            vLBO_wX = tf.cast(vLBO_wX, dtype=self.dists_dtype)
+
+            warped_v = vLBO_w0 + tf.matmul(eig_vects, vLBO_wX)   # [N,1]
+            warped_v = tf.squeeze(warped_v, axis=-1)            # [N,]
+            # make positive
+            gpk_v = tf.exp(warped_v) + tf.cast(self.eps, dtype=self.dists_dtype)
+
+            # [4] --- Build the Gibbs RBF with pointwise ℓ and v ---------------
+            # Normalization term: (2 ℓ_i ℓ_j / (ℓ_i^2 + ℓ_j^2))^{d/2}
+            two_l_lT  = 2 * tf.matmul(gpk_l[:, None], gpk_l[None, :])    # [N,N]
+            lsq_lTsq = tf.square(gpk_l[:, None]) + tf.square(gpk_l[None, :])
+            norm_     = tf.sqrt(two_l_lT / lsq_lTsq)
+
+            # Squared-distance exponent
+            exp_term = tf.exp(-tf.square(dXs) / lsq_lTsq)
+
+            # Finally, use the *pointwise* variance product:
+            # cov[i,j] = (gpk_v[i] * gpk_v[j]) * norm_[i,j] * exp_term[i,j]
+            cov_matrix = (gpk_v[:, None] * gpk_v[None, :]) * norm_ * exp_term                    
 
         elif kernel_type == 'spec_LBOGibbs':
             # * i know not really gibss...
@@ -1606,7 +1747,7 @@ class GPdistsM():
         """
         inducing_indices = kwargs.pop('inducing_indices', None)
         inducing_indices = self._return_inducing_idx(n_inducers=n_inducers, inducing_indices=inducing_indices)
-        inducing_parameter = tf.gather(parameter, inducing_indices)
+        inducing_parameter = parameter
         # Get cov matrix
         cov_matrix = self._return_sigma(
             inducing_indices=inducing_indices,

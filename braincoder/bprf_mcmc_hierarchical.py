@@ -145,7 +145,7 @@ class BPRF_hier(BPRF):
                 new_h_labels.append(f'{pid}_{k}')
             # Bijectors
             for k in new_h_labels:
-                if any([substr in k for substr in ['_spec_m', '_lm']]):
+                if any([substr in k for substr in ['_spec_m', '_lm', '_spec_dxm', '_spec_vm']]):
                     self.h_add_bijector(pid=k, bijector_type=tfb.Identity())
                 elif any([substr in k for substr in ['_l', '_v', '_nugget', '_spec']]):
                     self.h_add_bijector(pid=k, bijector_type=tfb.Softplus())        
@@ -388,10 +388,8 @@ class BPRF_hier(BPRF):
         self.h_fixed_pars = kwargs.pop('h_fixed_pars', {})        
         self.prep_for_fitting(**kwargs)
         self.n_params = len(self.model_labels)
-        self.model_labels_inv = {v:k for k,v in self.model_labels.items()}
         self.h_prep_for_fitting(**kwargs)
         self.h_n_params = len(self.h_labels)
-        self.h_labels_inv = {v:k for k,v in self.h_labels.items()}
 
         step_size = kwargs.pop('step_size', 0.0001) # rest of the kwargs go to "hmc_sample"                
         self.total_n_params = self.n_params + self.h_n_params
@@ -418,23 +416,26 @@ class BPRF_hier(BPRF):
         
         @tf.function
         def log_posterior_fn(parameters, h_parameters):
+
+            # [1] Mask fixed parameters             
+            f_parameters = self.fix_update_fn(parameters)                        
+            f_h_parameters = self.h_fix_update_fn(h_parameters)
+            
+            # [2] Select patch of vx 
+            inducing_indices = self._return_inducing_idx(self.n_inducers)
+            patch_f_parameters = tf.gather(f_parameters, inducing_indices)
+            
             # Jacobian not needed - it does this under the hood with HMC
             # For the same reason, do not need to pass parameters forward...
             # ***parameters = self._bprf_transform_parameters_forward(parameters)
             # ***h_parameters = self._h_bprf_transform_parameters_forward(h_parameters)
-            
-            parameters = self.fix_update_fn(parameters)                        
-            h_parameters = self.h_fix_update_fn(h_parameters)
-            
-            # Only predict with a subsample of vx? -> for speed
-            inducing_indices = self._return_inducing_idx(self.n_inducers)
 
-            par4pred = tf.gather(parameters[:,:self.n_model_params],inducing_indices) # chop out any hyper / noise parameters            
+            par4pred = patch_f_parameters[:,:self.n_model_params] # chop out any hyper / noise parameters            
             predictions = self.model._predict(
                 paradigm_[tf.newaxis, ...], par4pred[tf.newaxis, ...], None)     # Only include those parameters that are fed to the model
             residuals = tf.gather(y[:, vx_bool], inducing_indices, axis=1) - predictions[0]                                    
-            log_likelihood = residual_ln_likelihood_fn(parameters, residuals, inducing_indices)            
-            log_prior = log_prior_fn(parameters, h_parameters, inducing_indices)                        
+            log_likelihood = residual_ln_likelihood_fn(patch_f_parameters, residuals)            
+            log_prior = log_prior_fn(patch_f_parameters, f_h_parameters, inducing_indices)                        
             return tf.reduce_sum(log_prior + log_likelihood)        
         
         # -> make sure we are in the correct dtype 
@@ -614,22 +615,32 @@ class BPRF_hier(BPRF):
         # Now create the log_posterior_fn
         @tf.function
         def log_posterior_fn(parameters_unc, h_parameters_unc):
-            # JACOBIAN BEFORE TRANSFORMING FORWARD
-            # -> which sample of indices are we inducing from
+            # [1] Mask fixed parameters 
+            f_parameters_unc = self.fix_update_fn(parameters_unc)            
+            f_h_parameters_unc = self.h_fix_update_fn(h_parameters_unc)
+
+            # [2] Select a patch of vertices
             inducing_indices = self._return_inducing_idx(self.n_inducers)
-            log_jac = log_jac_fn(parameters_unc, h_parameters_unc, inducing_indices)
+            patch_f_parameters_unc = tf.gather(f_parameters_unc, inducing_indices)
             
-            parameters = self._bprf_transform_parameters_forward(parameters_unc)
-            parameters = self.fix_update_fn(parameters)            
-            h_parameters = self._h_bprf_transform_parameters_forward(h_parameters_unc)
-            h_parameters = self.h_fix_update_fn(h_parameters)
-            par4pred = tf.gather(parameters[:,:self.n_model_params],inducing_indices) # chop out any hyper / noise parameters            
+            # [3] Jacobian on unstransformed patch
+            log_jac = log_jac_fn(patch_f_parameters_unc, h_parameters_unc) 
+            # [4] Push through bijectors (constrain)            
+            patch_f_parameters = self._bprf_transform_parameters_forward(patch_f_parameters_unc)
+            f_h_parameters = self._h_bprf_transform_parameters_forward(f_h_parameters_unc)
+            
+            # [5] Compute the priors -> only passing inducing indices for the GP (is being used)
+            log_prior = log_prior_fn(patch_f_parameters, f_h_parameters, inducing_indices)            
+
+            # [6] Compute the log likelihood
+            par4pred = patch_f_parameters[:,:self.n_model_params] # chop out any hyper / noise parameters            
             predictions = self.model._predict(
                 paradigm_[tf.newaxis, ...], par4pred[tf.newaxis, ...], None)     # Only include those parameters that are fed to the model
             residuals = tf.gather(y[:, vx_bool], inducing_indices, axis=1) - predictions[0]                                    
-            log_likelihood = residual_ln_likelihood_fn(parameters, residuals, inducing_indices)            
-            log_prior = log_prior_fn(parameters, h_parameters, inducing_indices)            
-            # scaled_prior_jac = (log_prior+log_jac ) * (self.n_vx_to_fit / self.n_inducers)
+            log_likelihood = residual_ln_likelihood_fn(patch_f_parameters, residuals)            
+            # tf.print("DEBUG:", "log jac", log_jac, summarize=-1)
+            # tf.print("DEBUG:", "log_prior:", log_prior, summarize=-1)
+            # tf.print("DEBUG:", "log_likelihodd:", log_likelihood, summarize=-1)
             return tf.reduce_sum(log_likelihood + log_prior + log_jac)
 
         # -> make sure we are in the correct dtype
@@ -726,12 +737,11 @@ class BPRF_hier(BPRF):
             # Log-prior function for the model
             p_out = 0.0      
             for p in self.priors_to_loop:
-
-                p_out += tf.reduce_sum(self.p_prior[p].prior(tf.gather(parameters[:,self.model_labels[p]], inducing_indices)))
+                p_out += tf.reduce_sum(self.p_prior[p].prior(parameters[:,self.model_labels[p]]))
             # Also apply the hierarchical priors
             for h in self.h_prior_to_apply.keys():
                 if self.h_prior_to_apply[h]=='normal':
-                    p_for_prior = parameters[inducing_indices,self.model_labels[h]]                    
+                    p_for_prior = parameters[:,self.model_labels[h]]                    
                     loc_for_prior = h_parameters[:,self.h_labels[h+'_loc']]
                     scale_for_prior = h_parameters[:,self.h_labels[h+'_scale']]                    
                     p_out += tf.reduce_sum(calculate_log_prob_gauss(
@@ -754,7 +764,7 @@ class BPRF_hier(BPRF):
                     gp_lengthscale  = h_parameters[:, self.h_labels[f'{h}_gp_lengthscale']] # Current value of GP lengthscale hyperparameter
                     gp_variance     = h_parameters[:, self.h_labels[f'{h}_gp_variance']] # Current value of GP variance hyperparameter
                     gp_mean         = h_parameters[:, self.h_labels[f'{h}_gp_mean']] # Current value of GP variance hyperparameter
-                    gp_nugget       = h_parameters[:, self.h_labels[f'{h}_gp_nugget']] # Current value of GP variance hyperparameter
+                    gp_nugget       = h_parameters[:, self.h_labels[f'{h}_gp_nugget']] # Current value of GP variance hyperparameter                    
                     p_out += self.h_gp_function[h].return_log_prob(
                         parameter=param_values, gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, 
                         gp_mean=gp_mean, gp_nugget=gp_nugget,
@@ -780,47 +790,50 @@ class BPRF_hier(BPRF):
         return log_prior_fn
     
     def _create_log_jac_fn(self):
-        if self.include_jacobian:
-            @tf.function
-            def log_jac_fn(parameters, h_parameters, inducing_indices):
-                # Log-prior function for the model
-                p_out = 0.0           
-                # inducing_indices = tf.cast(inducing_indices, tf.int32)        
-                # tf.squeeze(parameters[tf.squeeze(inducing_indices),self.model_labels['width_r']])
-                # bloop
-                for p in self.priors_to_loop:
-                    p_out += tf.reduce_sum(self.p_bijector[p].forward_log_det_jacobian(
-                        tf.squeeze(tf.gather(parameters[:,self.model_labels[p]], inducing_indices)), 
-                        event_ndims=0,
-                    ))
-                for p in self.h_gp_function.keys():
-                    p_out += tf.reduce_sum(self.p_bijector[p].forward_log_det_jacobian(
-                        tf.squeeze(tf.gather(parameters[:,self.model_labels[p]], inducing_indices)), 
-                        event_ndims=1,
-                    ))     
-                for p in self.h_priors_to_loop:
-                    p_out += tf.reduce_sum(self.h_bijector[p].forward_log_det_jacobian(
-                        tf.squeeze(h_parameters[:,self.h_labels[p]]), 
-                        event_ndims=0,
-                    ))
-                # Check shape of p_out
-                # assert p_out.shape == (1,), f"Log Jacobian output should be a scalar, but is {p_out}" 
-                return p_out           
-        else:
-            @tf.function
-            def log_jac_fn(parameters, h_parameters, inducing_indices):
-                return 0.0
+        if not self.include_jacobian:
+            return lambda params_unc, h_params_unc: 0.0
+
+        @tf.function
+        def log_jac_fn(params_unc, h_params_unc):
+            log_det = 0.0
+
+            # 1) “Other” model parameters (baseline, width, etc.)
+            for name in self.priors_to_loop:
+                x = params_unc[:, self.model_labels[name]]     # shape [n_inducers]
+                bij = self.p_bijector[name]                   # e.g. Sigmoid
+                log_det += tf.reduce_sum(
+                    bij.forward_log_det_jacobian(x, event_ndims=0)
+                )
+
+            # 2) Vertex-wise parameters with GP priors
+            for name in self.h_gp_function.keys():
+                x = params_unc[:, self.model_labels[name]]     # slice from params, not h_params
+                bij = self.p_bijector[name]                   # same bijector you used when transforming
+                log_det += tf.reduce_sum(
+                    bij.forward_log_det_jacobian(x, event_ndims=0)  # scalar per vertex
+                )
+
+            # 3) Hierarchical meta‐parameters (loc, scale, lengthscale hyperpriors, etc.)
+            for name in self.h_priors_to_loop:
+                x = h_params_unc[:, self.h_labels[name]]
+                bij = self.h_bijector[name]
+                log_det += tf.reduce_sum(
+                    bij.forward_log_det_jacobian(x, event_ndims=0)
+                )
+
+            return log_det
+
         return log_jac_fn
     
     def _create_residual_ln_likelihood_fn(self):
         # Calculating the likelihood
         if self.noise_method == 'fit_tdist':
             @tf.function
-            def residual_ln_likelihood_fn(parameters, residuals, inducing_indices):                    
+            def residual_ln_likelihood_fn(parameters, residuals):                    
                 resid_ln_likelihood = calculate_log_prob_t(
                     data=residuals, 
-                    scale=tf.gather(parameters[:,self.model_labels['noise_scale']],inducing_indices), 
-                    dof=tf.gather(parameters[:,self.model_labels['noise_dof']],inducing_indices), 
+                    scale=parameters[:,self.model_labels['noise_scale']], 
+                    dof=parameters[:,self.model_labels['noise_dof']], 
                 )
                 
                 # Use t-distribution from tensorflow_probability
@@ -830,29 +843,29 @@ class BPRF_hier(BPRF):
                 #     scale=parameters[:,self.model_labels['noise_scale']],
                 # )
                 # resid_ln_likelihood = resid_dist.log_prob(residuals)
-                resid_ln_likelihood = tf.reduce_sum(resid_ln_likelihood, axis=0)       
+                resid_ln_likelihood = tf.reduce_sum(resid_ln_likelihood)       
                 return resid_ln_likelihood
         elif self.noise_method == 'fit_normal':
             # Assume residuals are normally distributed (loc=0.0)
             # Add the scale as an extra parameters to be fit             
             @tf.function
-            def residual_ln_likelihood_fn(parameters, residuals, inducing_indices):                    
+            def residual_ln_likelihood_fn(parameters, residuals):                    
                 # -> rescale based on std...
                 resid_ln_likelihood = calculate_log_prob_gauss_loc0(
                     data=residuals, 
-                    scale=tf.gather(parameters[:,self.model_labels['noise_scale']],inducing_indices), 
+                    scale=parameters[:,self.model_labels['noise_scale']], 
                 )
                 # Use N(0, scale) from tensorflow_probability
                 # resid_dist = tfd.Normal(loc=0.0, scale=parameters[:,self.model_labels['noise_scale']])
                 # resid_ln_likelihood = resid_dist.log_prob(residuals)
-                resid_ln_likelihood = tf.reduce_sum(resid_ln_likelihood, axis=0)       
+                resid_ln_likelihood = tf.reduce_sum(resid_ln_likelihood)       
                 return resid_ln_likelihood              
         
         else: # self.noise_method == 'none': 
             # Do not fit the noise - assume it is normally distributed
             # -> calculate scale based on the standard deviation of the residuals 
             @tf.function
-            def residual_ln_likelihood_fn(parameters, residuals, inducing_indices):                    
+            def residual_ln_likelihood_fn(parameters, residuals):                    
                 # [1] Use N(0, std)         
                 residuals_std  = tf.math.reduce_std(residuals, axis=0)
                 # -> rescale based on std...
@@ -863,7 +876,7 @@ class BPRF_hier(BPRF):
                 # # [2] Use N(0, scale) from tensorflow_probability   
                 # resid_dist = tfd.Normal(loc=0.0, scale=residuals_std)
                 # resid_ln_likelihood = resid_dist.log_prob(residuals)
-                resid_ln_likelihood = tf.reduce_sum(resid_ln_likelihood, axis=0)       
+                resid_ln_likelihood = tf.reduce_sum(resid_ln_likelihood)       
                 return resid_ln_likelihood     
         
         return residual_ln_likelihood_fn
@@ -880,7 +893,10 @@ class BPRF_hier(BPRF):
                 num_steps=100, 
                 idx = None,
                 **kwargs):
-        '''
+        ''' **** TO BE DEPRECATED ****
+
+
+
         Maximum a posteriori (MAP) optimization for hierarchical model. Fitting the GP only
         The idea is to:
         [1] Do some basic traditional parameter fitting on the data (e.g., pRF, nCSF)
@@ -896,6 +912,7 @@ class BPRF_hier(BPRF):
 
         This is an alternative to fitting everything at the same time. Which is also an option in 
         '''
+        print(" TO BE DEPRECATED / updated - not currently fit for purpose")
         n_inducers = kwargs.pop('n_inducers', None)
         if idx is None: # all of them?
             idx = np.arange(self.n_voxels).tolist()
@@ -932,13 +949,17 @@ class BPRF_hier(BPRF):
             h_parameters = self._h_bprf_transform_parameters_forward(h_parameters)
             h_parameters = self.h_fix_update_fn(h_parameters)
             log_prior = log_prior_fn(h_parameters)            
+            # [2] Select patch of vx 
+            inducing_indices = self._return_inducing_idx(self.n_inducers)
+            patch_f_parameters = tf.gather(pid_pars, inducing_indices)            
             # Apply gp to parameters
             if self.h_prior_to_apply[pid]=='gp_dists':
                 gp_lengthscale = h_parameters[:, self.h_labels[f'{pid}_gp_lengthscale']] # Current value of GP lengthscale hyperparameter
                 gp_variance = h_parameters[:, self.h_labels[f'{pid}_gp_variance']] # Current value of GP variance hyperparameter
                 gp_likelihood = self.h_gp_function[pid].return_log_prob(
-                    parameter=pid_pars, gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, 
+                    parameter=patch_f_parameters, gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, 
                     n_inducers=n_inducers,
+                    inducing_indices=inducing_indices,
                 )
             elif self.h_prior_to_apply[pid]=='gp_dists_full':
                 gp_lengthscale  = h_parameters[:, self.h_labels[f'{pid}_gp_lengthscale']] # Current value of GP lengthscale hyperparameter
@@ -946,8 +967,9 @@ class BPRF_hier(BPRF):
                 gp_mean         = h_parameters[:, self.h_labels[f'{pid}_gp_mean']] # Current value of GP variance hyperparameter
                 gp_nugget       = h_parameters[:, self.h_labels[f'{pid}_gp_nugget']] # Current value of GP variance hyperparameter
                 gp_likelihood = self.h_gp_function[pid].return_log_prob(
-                    parameter=pid_pars, gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, 
+                    parameter=patch_f_parameters, gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, 
                     gp_mean=gp_mean, gp_nugget=gp_nugget, n_inducers=n_inducers,
+                    inducing_indices=inducing_indices,
                 )
             elif self.h_prior_to_apply[pid]=='gp_dists_m':
                 gpkwargs = {}
@@ -955,7 +977,8 @@ class BPRF_hier(BPRF):
                     if pid in k:
                         gpkwargs[k.split(f'{pid}_')[-1]] = h_parameters[:, self.h_labels[k]]
                 gp_likelihood = self.h_gp_function[pid].return_log_prob(
-                    parameter=pid_pars, n_inducers=self.n_inducers,
+                    parameter=patch_f_parameters, n_inducers=self.n_inducers,
+                    inducing_indices=inducing_indices,
                     **gpkwargs,
                 )                
             else:
@@ -1042,14 +1065,16 @@ class BPRF_hier(BPRF):
         elif isinstance(idx, int):
             idx = [idx]
         self.idx_to_fit = idx
+        if self.dists is not None:  
+            # If we are using "close" for inducer selection...      
+            self._dists_idx = tf.gather(tf.gather(self.dists, self.idx_to_fit, axis=0), self.idx_to_fit, axis=1)          
         vx_bool = np.zeros(self.n_voxels, dtype=bool)
         vx_bool[idx] = True
         self.n_vx_to_fit = len(idx)
-        self.h_fixed_pars = kwargs.pop('h_fixed_pars', {})                
+        self.h_fixed_pars = kwargs.pop('h_fixed_pars', {})      
         self.n_params = len(self.model_labels)
         self.h_prep_for_fitting(**kwargs)
         self.h_n_params = len(self.h_labels)
-        
         pid_pars = pid_pars.values.astype(np.float32) # These stay the same...
         pid_pars = tf.convert_to_tensor(pid_pars[vx_bool], dtype=tf.float32, name=pid) 
         h_init_pars = self.sort_h_parameters(h_init_pars)
@@ -1065,7 +1090,7 @@ class BPRF_hier(BPRF):
             return p_out 
         if self.include_jacobian:
             @tf.function
-            def log_jac_fn(h_parameters):
+            def log_jac_fn(h_parameters, parameters):
                 p_out = 0.0
                 for h in self.h_priors_to_loop:
                     p_out += tf.reduce_sum(self.h_bijector[h].forward_log_det_jacobian(
@@ -1073,28 +1098,35 @@ class BPRF_hier(BPRF):
                         event_ndims=0,
                     ))                
                     p_out += tf.reduce_sum(self.p_bijector[pid].forward_log_det_jacobian(
-                        tf.squeeze(pid_pars), 
-                        event_ndims=1,
+                        parameters, 
+                        event_ndims=0,
                     ))                        
                 return p_out
         else:
             @tf.function
-            def log_jac_fn(h_parameters):
+            def log_jac_fn(h_parameters, parameters):
                 return 0.0
         # Now create the log_posterior_fn
         @tf.function
-        def log_posterior_fn(h_parameters):
-            log_jac = log_jac_fn(h_parameters)
-            h_parameters = self._h_bprf_transform_parameters_forward(h_parameters)
+        def log_posterior_fn(h_parameters):       
+            # [1] Mask fixed parameters 
             h_parameters = self.h_fix_update_fn(h_parameters)
+            # [2] Make a sub selection
+            inducing_indices = self._return_inducing_idx(self.n_inducers)    
+            patch_parameters = tf.gather(pid_pars, inducing_indices, axis=0)
+            # [2] Jacobian
+            log_jac = log_jac_fn(h_parameters, patch_parameters)
+            # [3] Bijector (h parameter only, other are fixed)
+            h_parameters = self._h_bprf_transform_parameters_forward(h_parameters)
+            # [4] Prior (h parameters )
             log_prior = log_prior_fn(h_parameters)            
-            # Apply gp to parameters
+            # [5] Apply gp to parameters
             if self.h_prior_to_apply[pid]=='gp_dists':
                 gp_lengthscale = h_parameters[:, self.h_labels[f'{pid}_gp_lengthscale']] # Current value of GP lengthscale hyperparameter
                 gp_variance = h_parameters[:, self.h_labels[f'{pid}_gp_variance']] # Current value of GP variance hyperparameter
                 gp_likelihood = self.h_gp_function[pid].return_log_prob(
-                    parameter=pid_pars, gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, 
-                    n_inducers=self.n_inducers,
+                    parameter=patch_parameters, gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, 
+                    n_inducers=self.n_inducers, inducing_indices=inducing_indices
                 )
             elif self.h_prior_to_apply[pid]=='gp_dists_full':
                 gp_lengthscale  = h_parameters[:, self.h_labels[f'{pid}_gp_lengthscale']] # Current value of GP lengthscale hyperparameter
@@ -1102,8 +1134,9 @@ class BPRF_hier(BPRF):
                 gp_mean         = h_parameters[:, self.h_labels[f'{pid}_gp_mean']] # Current value of GP variance hyperparameter
                 gp_nugget       = h_parameters[:, self.h_labels[f'{pid}_gp_nugget']] # Current value of GP variance hyperparameter
                 gp_likelihood = self.h_gp_function[pid].return_log_prob(
-                    parameter=pid_pars, gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, 
+                    parameter=patch_parameters, gp_lengthscale=gp_lengthscale, gp_variance=gp_variance, 
                     gp_mean=gp_mean, gp_nugget=gp_nugget, n_inducers=self.n_inducers,
+                    inducing_indices=inducing_indices
                 )
             elif self.h_prior_to_apply[pid]=='gp_dists_m':
                 gpkwargs = {}
@@ -1111,7 +1144,8 @@ class BPRF_hier(BPRF):
                     if pid in k:
                         gpkwargs[k.split(f'{pid}_')[-1]] = h_parameters[:, self.h_labels[k]]
                 gp_likelihood = self.h_gp_function[pid].return_log_prob(
-                    parameter=pid_pars, n_inducers=self.n_inducers,
+                    parameter=patch_parameters, n_inducers=self.n_inducers,
+                    inducing_indices=inducing_indices,
                     **gpkwargs,
                 )                     
             else:
