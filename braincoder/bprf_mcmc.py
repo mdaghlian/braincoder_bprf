@@ -7,8 +7,9 @@ from tensorflow_probability import distributions as tfd
 from tensorflow_probability import bijectors as tfb
 from tqdm import tqdm
 import math
-
+from timeit import default_timer as timer
 import copy
+
 class BPRF(object):
     ''' Wrapper to do bayesian prf fitting
     designed by Marcus Daghlian
@@ -730,124 +731,6 @@ class PriorGeneral(PriorBase):
         self.distribution = distribution
 
 
-# *** SAMPLER ***
-from timeit import default_timer as timer
-import tensorflow as tf
-import tensorflow_probability as tfp
-
-# Copied from .utils.mcmc
-# @tf.function(autograph=False, jit_compile=False)
-@tf.function
-def bprf_sample_NUTS(
-        init_state,
-        step_size,
-        target_log_prob_fn,
-        unconstraining_bijectors,
-        target_accept_prob=0.85,
-        unrolled_leapfrog_steps=1,
-        max_tree_depth=10,
-        num_steps=50,
-        burnin=50,
-        parallel_iterations=1,
-        ):
-
-    # bloop
-    def trace_fn(_, pkr):
-        return {
-            'log_prob': pkr.inner_results.inner_results.target_log_prob,
-            'diverging': pkr.inner_results.inner_results.has_divergence,
-            'is_accepted': pkr.inner_results.inner_results.is_accepted,
-            'accept_ratio': tf.exp(pkr.inner_results.inner_results.log_accept_ratio),
-            'leapfrogs_taken': pkr.inner_results.inner_results.leapfrogs_taken,
-            'step_size': pkr.inner_results.inner_results.step_size}
-
-    hmc = tfp.mcmc.NoUTurnSampler(
-        target_log_prob_fn,
-        unrolled_leapfrog_steps=unrolled_leapfrog_steps,
-        max_tree_depth=max_tree_depth,
-        step_size=step_size)
-
-    hmc = tfp.mcmc.TransformedTransitionKernel(
-        inner_kernel=hmc,
-        bijector=unconstraining_bijectors)
-
-    adaptive_sampler = tfp.mcmc.DualAveragingStepSizeAdaptation(
-        inner_kernel=hmc,
-        num_adaptation_steps=int(0.8 * burnin),
-        target_accept_prob=target_accept_prob,
-        # NUTS inside of a TTK requires custom getter/setter functions.
-        step_size_setter_fn=lambda pkr, new_step_size: pkr._replace(
-            inner_results=pkr.inner_results._replace(
-                step_size=new_step_size)
-        ),
-        step_size_getter_fn=lambda pkr: pkr.inner_results.step_size,
-        log_accept_prob_getter_fn=lambda pkr: pkr.inner_results.log_accept_ratio,
-    )
-    
-    # start = tf.timestamp()
-    # Sampling from the chain.
-    samples, stats = tfp.mcmc.sample_chain(
-        num_results=burnin + num_steps,
-        current_state=init_state,
-        kernel=adaptive_sampler,
-        trace_fn=trace_fn,
-        parallel_iterations=parallel_iterations,
-        )
-
-    # duration = tf.timestamp() - start
-    # stats['elapsed_time'] = duration
-
-    return samples, stats
-# Summarize MCMC
-
-def get_mcmc_summary(sampler, burnin=100, pc_range=25):
-    keys = sampler[0].keys()
-    n_voxels = len(sampler)
-    bpars = {}
-    bpars_m = {}
-    for p in list(keys): 
-        m = []
-        q1 = []
-        q2 = []
-        uc = []
-        std = []
-        for idx in range(n_voxels):
-            this_p = sampler[idx][p][burnin:].to_numpy()
-            m.append(np.percentile(this_p,50))
-            tq1 = np.percentile(this_p, pc_range)
-            tq2 = np.percentile(this_p, 100-pc_range)
-            tuc = tq2 - tq1
-            
-            q1.append(tq1)
-            q2.append(tq2)
-            uc.append(tuc)
-            std.append(np.std(this_p))
-        bpars_m[p] = np.array(m)
-        bpars[f'm_{p}'] = np.array(m)
-        bpars[f'q1_{p}'] = np.array(q1)
-        bpars[f'q2_{p}'] = np.array(q2)
-        bpars[f'uc_{p}'] = np.array(uc)
-        bpars[f'std_{p}'] = np.array(std)
-    return pd.DataFrame(bpars) #, pd.DataFrame(bpars_m)
-import operator
-
-def reorder_dataframe_columns(pd_to_fix, dict_index):
-    """
-    Reorders the columns of the given DataFrame based on dict_index.
-    
-    Parameters:
-    - pd_to_fix: pandas DataFrame whose columns will be reordered.
-    - dict_index: Dictionary mapping column names to desired index positions.
-    
-    Returns:
-    - DataFrame with columns reordered according to dict_index.
-    """
-    # Sort the dict_index items by their value using operator.itemgetter
-    sorted_columns = [col for col, _ in sorted(dict_index.items(), key=operator.itemgetter(1))]
-    # Return DataFrame with columns ordered based on sorted_columns
-    return pd_to_fix[sorted_columns]
-
-
 
 # *************
 
@@ -976,53 +859,7 @@ class GPdists():
             raise ValueError("Unsupported kernel: {}".format(self.kernel))
         # Add nugget term for numerical stability
         return cov_matrix + tf.eye(cov_matrix.shape[0], dtype=self.dists_dtype) * tf.cast(self.eps + gp_nugget, dtype=self.dists_dtype)
-    
-    # @tf.function
-    # def _compute_precision_and_conditional_log_prob(self, parameter, prec_matrix, gp_mean, full_norm):
-    #     if full_norm:
-    #         # Full normalization version:
-    #         diff = parameter - gp_mean
-    #         log_det_prec = tf.linalg.logdet(prec_matrix)
-    #         quad_form = tf.tensordot(diff, tf.linalg.matvec(prec_matrix, diff), axes=1)
-    #         n = tf.cast(tf.shape(parameter)[0], diff.dtype)
-    #         two_pi = tf.constant(2 * math.pi, dtype=diff.dtype)
-    #         return 0.5 * log_det_prec - 0.5 * quad_form - 0.5 * n * tf.math.log(two_pi)
-    #     else:
-    #         # Compute the conditional log-probability of the parameter under the GP prior
-    #         # i.e.
-    #         # > Compute [ log p(x_i | x_{-i}) ] for each entry i
-    #         # > under N(μ, Λ⁻¹).             
-                    
-    #         # 1) Centre the parameters
-    #         #    diff[i] = x_i - μ_i
-    #         diff = parameter - gp_mean
 
-    #         # 2) Influence of other parameters (x_{-i}) on x_i
-    #         #    raw_score[i] = sum_j Λ[i,j] * diff[j]
-    #         raw_score = tf.linalg.matvec(prec_matrix, diff)
-
-    #         # 3) Precision matrix diagonal 
-    #         #    prec_ii = Λ[i,i], the scalar precision for x_i | x_-i
-    #         prec_ii = tf.linalg.diag_part(prec_matrix)
-
-    #         # 4) Normalization per Gaussian bell curve
-    #         #    logZ[i] = ½ (log prec_ii – log(2π))
-    #         #    → padds the height of the curve so it integrates to 1
-    #         logZ = 0.5 * (tf.math.log(prec_ii) - tf.math.log(2 * math.pi))
-
-    #         # 5) Quadratic term - penalty for deviation from the mean
-    #         #    Algebra shows that
-    #         #      (x_i – E[x_i|x_-i]) = raw_score[i] / prec_ii
-    #         #    So the penalty is
-    #         #      –½ · prec_ii · (x_i – E[·])²
-    #         #    which rearranges to:
-    #         #      –½ · (raw_score[i])² / prec_ii
-    #         quadratic = -0.5 * tf.square(raw_score) / prec_ii
-
-    #         # 6) Combine them: each entry is
-    #         #      log p(x_i|x_-i) = logZ[i] + quadratic[i]
-    #         log_probs = logZ + quadratic
-    #         return log_probs   # shape [n]
 
     def set_log_prob(self):
         """
@@ -1096,66 +933,11 @@ class GPdists():
             )
             return inducing_gp_prior_dist.log_prob(inducing_parameter)
 
-    # @tf.function
-    # def _return_log_prob_fixed_prec(self, parameter, gp_lengthscale, gp_variance, gp_mean=0.0, gp_nugget=0.0, n_inducers=None):
-    #     """
-    #     Fixed parameters using precomputed precision matrix.
-    #     """
-    #     extra = tf.stop_gradient(gp_lengthscale + gp_variance + gp_mean + gp_nugget) * 0.0
-    #     return self._compute_precision_and_conditional_log_prob(parameter, self.prec_matrix, gp_mean, self.full_norm) + extra
-
-    # @tf.function
-    # def _return_log_prob_unfixed_prec(self, parameter, gp_lengthscale, gp_variance, gp_mean=0.0, gp_nugget=0.0, n_inducers=None):
-    #     """
-    #     Unfixed parameters using precision matrix. Recompute the covariance and precision matrices on the fly.
-    #     """
-    #     if n_inducers is None or n_inducers >= self.n_vx:        
-    #         cov_matrix = self.return_sigma(gp_lengthscale, gp_variance, gp_nugget, n_inducers)
-    #         prec_matrix = tf.cast(tf.linalg.inv(cov_matrix), dtype=tf.float32)
-    #         return self._compute_precision_and_conditional_log_prob(parameter, prec_matrix, gp_mean, self.full_norm)
-    #     else:
-    #         # Sparse GP approximation using inducing points
-    #         if n_inducers <= 0:
-    #             raise ValueError("n_inducers must be a positive integer.")
-    #         inducing_indices, inducing_dists = self._return_inducing_idx_and_dists(n_inducers=n_inducers)
-    #         # Get the parameter values at the inducing points
-    #         inducing_parameter = tf.gather(parameter, inducing_indices)
-
-    #         # Calculate the covariance matrix for the inducing points
-    #         inducing_cov_matrix = self.return_sigma(gp_lengthscale, gp_variance, gp_nugget, dists=inducing_dists)
-    #         prec_matrix = tf.cast(tf.linalg.inv(inducing_cov_matrix), dtype=tf.float32)
-    #         return self._compute_precision_and_conditional_log_prob(inducing_parameter, prec_matrix, gp_mean, self.full_norm)
-    
     @tf.function
     def _return_inducing_idx_and_dists(self, n_inducers, inducing_indices=None):
-        # increment the seed each call - necessary because otherwise when graph is drawn it doesn't change...
-        new_seed = self._seed.assign_add([1, 1])
-        # FOR DEBUGGING -> PRINT IT
-        # 2) print it for debugging
-        # tf.print("debug — new_seed:", new_seed)    
-        if inducing_indices is None:   
-            if self.inducer_selection == 'random':
-                # Randomly select indices for inducing points
-                inducing_indices = tf.random.experimental.stateless_shuffle(
-                    tf.range(self.n_vx),
-                    seed=new_seed)[:n_inducers]
-                inducing_indices = tf.sort(inducing_indices)  # Keep them sorted for easier indexing
+        if n_inducers is None or n_inducers >= self.n_vx:
+            inducing_indices = tf.range(self.n_vx)
 
-            elif self.inducer_selection == 'close':                
-                # centre_idx = np.random.randint(0, self.n_vx)
-                centre_idx = tf.random.stateless_uniform(
-                    shape=[],
-                    minval=0,
-                    maxval=self.n_vx,
-                    dtype=tf.int32,
-                    seed=new_seed
-                )
-                # Get the indices of the closest n_inducers points
-                _, inducing_indices = tf.math.top_k(-self.dists[centre_idx, :], k=n_inducers)
-                inducing_indices = tf.sort(inducing_indices)  # Keep sorted
-
-            else:
-                raise ValueError(f"Unknown inducer selection method: {self.inducer_selection}")
 
         # Gather distances for the selected inducing points
         inducing_dists = tf.gather(tf.gather(self.dists, inducing_indices, axis=0), inducing_indices, axis=1)
@@ -1345,7 +1127,10 @@ class GPdistsM():
     
     # -> add Spectral kernels (based on LBO)
     def add_xid_spectral_kernel(self, xid, **kwargs):
-        # existing code ...
+        ''' add a spectral kernel
+        I know - this is not all spectral strictly speaking
+        I will clean it up later
+        '''
         self.kernel_type[xid] = kwargs.get('kernel_type', 'spec_exp')                
         # store eigenvalues and eigenvectors
         self.eig_vals[xid] = tf.convert_to_tensor(kwargs['eig_vals'], dtype=self.dists_dtype)
@@ -1362,42 +1147,35 @@ class GPdistsM():
         elif self.kernel_type[xid] == 'spec_ratquad':
             self.pids[len(self.pids)] = f'gpk{xid}_spec_alpha'
             self.pids[len(self.pids)] = f'gpk{xid}_spec_beta'
-        
-        elif self.kernel_type[xid] == 'spec_LBOwarp_dx':
-            # Distance for RBF type kernel comes from warped LBO            
-            self.pids[len(self.pids)] = f'gpk{xid}_spec_l' # lengthscale
-            self.pids[len(self.pids)] = f'gpk{xid}_spec_v' # variance 
-            self.pids[len(self.pids)] = f'gpk{xid}_spec_dxm0'# 
-            for i in range(1, self.eig_vals[xid].shape[0]+1):
-                self.pids[len(self.pids)] = f'gpk{xid}_spec_dxm{i}'
 
-        elif self.kernel_type[xid] == 'spec_LBOwarp_dxl':
-            # Distance for RBF type kernel comes from warped LBO            
-            # As does lengthscale...
-            self.pids[len(self.pids)] = f'gpk{xid}_spec_v' # variance 
-            self.pids[len(self.pids)] = f'gpk{xid}_spec_lm0' # lengthscale
-            for i in range(1, self.eig_vals[xid].shape[0]+1):
-                self.pids[len(self.pids)] = f'gpk{xid}_spec_lm{i}'             
-
-            self.pids[len(self.pids)] = f'gpk{xid}_spec_dxm0'# 
-            for i in range(1, self.eig_vals[xid].shape[0]+1):
-                self.pids[len(self.pids)] = f'gpk{xid}_spec_dxm{i}'  
-
-        elif self.kernel_type[xid] == 'spec_LBOwarp_dxlv':
-            # Distance for RBF type kernel comes from warped LBO            
-            # As does lengthscale...
-            # variance is also warped...
-            self.pids[len(self.pids)] = f'gpk{xid}_spec_vm0' # variance
-            for i in range(1, self.eig_vals[xid].shape[0]+1):
-                self.pids[len(self.pids)] = f'gpk{xid}_spec_vm{i}'             
-
-            self.pids[len(self.pids)] = f'gpk{xid}_spec_lm0' # lengthscale
-            for i in range(1, self.eig_vals[xid].shape[0]+1):
-                self.pids[len(self.pids)] = f'gpk{xid}_spec_lm{i}'             
-
+        elif 'spec_LBOwarp' in self.kernel_type[xid]:
+            # Warp distance and/or lengthscale & variance using LBO eigenvectors
+            #       spec_LBOwarp_dx    → dx only
+            #       spec_LBOwarp_dxl   → dx + l
+            #       spec_LBOwarp_dxv   → dx + v
+            #       spec_LBOwarp_dxlv  → dx + l + v            
+            use_l = 'l' in self.kernel_type[xid]
+            use_v = 'v' in self.kernel_type[xid]   
+            
+            # Distance for RBF type kernel comes from warped LBO
             self.pids[len(self.pids)] = f'gpk{xid}_spec_dxm0'# 
             for i in range(1, self.eig_vals[xid].shape[0]+1):
                 self.pids[len(self.pids)] = f'gpk{xid}_spec_dxm{i}' 
+            
+            # Lengthscale 
+            if use_l:
+                self.pids[len(self.pids)] = f'gpk{xid}_spec_lm0' 
+                for i in range(1, self.eig_vals[xid].shape[0]+1):
+                    self.pids[len(self.pids)] = f'gpk{xid}_spec_lm{i}'             
+            else:
+                self.pids[len(self.pids)] = f'gpk{xid}_spec_l'
+            # Variance
+            if use_v:
+                self.pids[len(self.pids)] = f'gpk{xid}_spec_vm0' 
+                for i in range(1, self.eig_vals[xid].shape[0]+1):
+                    self.pids[len(self.pids)] = f'gpk{xid}_spec_vm{i}'             
+            else:
+                self.pids[len(self.pids)] = f'gpk{xid}_spec_v'
         
         elif self.kernel_type[xid] == 'spec_LBOGibbs':
             self.pids[len(self.pids)] = f'gpk{xid}_spec_v'
@@ -1549,7 +1327,14 @@ class GPdistsM():
             # Form covariance matrix
             cov_matrix = tf.matmul(eig_vects * filt[tf.newaxis, :], eig_vects, transpose_b=True)        
 
-        elif kernel_type == 'spec_LBOwarp_dx':
+        elif 'spec_LBOwarp' in kernel_type:             
+            # Warp distance and/or lengthscale & variance using LBO eigenvectors
+            #       spec_LBOwarp_dx    → dx only
+            #       spec_LBOwarp_dxl   → dx + l
+            #       spec_LBOwarp_dxv   → dx + v
+            #       spec_LBOwarp_dxlv  → dx + l + v
+            use_l = 'l' in kernel_type
+            use_v = 'v' in kernel_type            
             # [1] Weighted sum of eigenvectors (LBOwarp)
             dxLBO_w0 = tf.cast(kwargs['gpk_spec_dxm0'], dtype=self.dists_dtype)
             dxLBO_wX = tf.stack(
@@ -1559,109 +1344,55 @@ class GPdistsM():
             dxLBO_wX = tf.cast(dxLBO_wX, dtype=self.dists_dtype)
             # Warped distances
             warped_X = dxLBO_w0 + tf.matmul(eig_vects, dxLBO_wX) # [N, 1]
-            warped_X = tf.squeeze(warped_X, axis=-1) # [N,]
-            # [2] RBF kernel  (f1 - f2)           
-            gpk_l = tf.cast(kwargs['gpk_spec_l'], dtype=self.dists_dtype)
-            var = tf.cast(kwargs['gpk_spec_v'], dtype=self.dists_dtype)
+            warped_X = tf.squeeze(warped_X, axis=-1) # [N,]            
             dXs = compute_euclidean_distance_matrix(warped_X[...,tf.newaxis])        
-            cov_matrix = tf.square(var) * tf.exp(
-                -tf.square(dXs) / (2.0 * tf.square(gpk_l))
-            )
-        
-        elif kernel_type == 'spec_LBOwarp_dxl':
-            # [1] Weighted sum of eigenvectors (LBOwarp)
-            dxLBO_w0 = tf.cast(kwargs['gpk_spec_dxm0'], dtype=self.dists_dtype)
-            dxLBO_wX = tf.stack(
-                [kwargs[f"gpk_spec_dxm{i}"] for i in range(1, len(eig_vals)+1)],
-                axis=0
-            )
-            dxLBO_wX = tf.cast(dxLBO_wX, dtype=self.dists_dtype)
-            # Warped distances
-            warped_X = dxLBO_w0 + tf.matmul(eig_vects, dxLBO_wX) # [N, 1]
-            warped_X = tf.squeeze(warped_X, axis=-1) # [N,]
-            dXs = compute_euclidean_distance_matrix(warped_X[...,tf.newaxis])        
-            
-            # [2] Warped lengthscale
-            lLBO_w0 = tf.cast(kwargs['gpk_spec_lm0'], dtype=self.dists_dtype)
-            lLBO_wX = tf.stack(
-                [kwargs[f"gpk_spec_lm{i}"] for i in range(1, len(eig_vals)+1)],
-                axis=0
-            )
-            lLBO_wX = tf.cast(lLBO_wX, dtype=self.dists_dtype)
-            # Warped lengthscale
-            warped_l = lLBO_w0 + tf.matmul(eig_vects, lLBO_wX) # [N, 1]
-            warped_l = tf.squeeze(warped_l, axis=-1)
-            # -> force positive
-            gpk_l = tf.exp(warped_l) + tf.cast(self.eps, dtype=self.dists_dtype)
 
-            # [2] RBF kernel  (f1 - f2)           
-            gpk_v = tf.cast(kwargs['gpk_spec_v'], dtype=self.dists_dtype)
-            # Informally, Gibbs kernel is:
-            # K = gpk_v^2 * norm_ * RBF_ 
-            #       norm_ = ((2*gpk_l*gpk_l.T)/(gpk_l^2+gpk_l.T^2))d/2 
-            # -> 
-            #       RBF_ = exp(-dXs^2/(gpk_l^2+gpk_l.T^2))
-            two_l_lT = 2 * tf.matmul(gpk_l[:,None], gpk_l[None,:])
-            lsq_lTsq = tf.square(gpk_l[:,None]) + tf.square(gpk_l[None,:])
-            norm_ = tf.sqrt(two_l_lT / lsq_lTsq)
-            # RBF
-            cov_matrix     = tf.square(gpk_v) * norm_ * tf.exp(-tf.square(dXs) / lsq_lTsq)    
-        
-        elif kernel_type == 'spec_LBOwarp_dxlv':
-            # [1] --- Warp the inputs (distances) -----------------------------
-            dxLBO_w0 = tf.cast(kwargs['gpk_spec_dxm0'], dtype=self.dists_dtype)
-            dxLBO_wX = tf.stack(
-                [kwargs[f"gpk_spec_dxm{i}"] for i in range(1, len(eig_vals)+1)],
-                axis=0
-            )
-            dxLBO_wX = tf.cast(dxLBO_wX, dtype=self.dists_dtype)
+            # [2] Lengthscale 
+            if use_l:
+                lLBO_w0 = tf.cast(kwargs['gpk_spec_lm0'], dtype=self.dists_dtype)
+                lLBO_wX = tf.stack(
+                    [kwargs[f"gpk_spec_lm{i}"] for i in range(1, len(eig_vals)+1)],
+                    axis=0
+                )
+                lLBO_wX = tf.cast(lLBO_wX, dtype=self.dists_dtype)
+                # Warped lengthscale
+                warped_l = lLBO_w0 + tf.matmul(eig_vects, lLBO_wX) # [N, 1]
+                warped_l = tf.squeeze(warped_l, axis=-1)
+                # -> force positive
+                gpk_l = tf.exp(warped_l) + tf.cast(self.eps, dtype=self.dists_dtype)                
+                # If lengthscale is warped, we need to compute the norm_ for RBF kernel
+                two_l_lT = 2 * tf.matmul(gpk_l[:,None], gpk_l[None,:])
+                lsq_lTsq = tf.square(gpk_l[:,None]) + tf.square(gpk_l[None,:])
+                norm_ = tf.sqrt(two_l_lT / lsq_lTsq)                
+            else:
+                gpk_l = tf.cast(kwargs['gpk_spec_l'], dtype=self.dists_dtype)
 
-            # Weighted sum of eigenvectors → warped coords
-            warped_X = dxLBO_w0 + tf.matmul(eig_vects, dxLBO_wX)  # shape [N,1]
-            warped_X = tf.squeeze(warped_X, axis=-1)             # shape [N,]
+            # [3] Variance
+            if use_v:
+                # we model log-variance offsets per eigenvector, same pattern:
+                vLBO_w0 = tf.cast(kwargs['gpk_spec_vm0'], dtype=self.dists_dtype)
+                vLBO_wX = tf.stack(
+                    [kwargs[f"gpk_spec_vm{i}"] for i in range(1, len(eig_vals)+1)],
+                    axis=0
+                )
+                vLBO_wX = tf.cast(vLBO_wX, dtype=self.dists_dtype)
 
-            # Pairwise distances in warped space
-            dXs = compute_euclidean_distance_matrix(warped_X[..., tf.newaxis])
+                warped_v = vLBO_w0 + tf.matmul(eig_vects, vLBO_wX)   # [N,1]
+                warped_v = tf.squeeze(warped_v, axis=-1)            # [N,]
+                # make positive
+                gpk_v = tf.exp(warped_v) + tf.cast(self.eps, dtype=self.dists_dtype)
+                gpk_v_square = (gpk_v[:,None] * gpk_v[None,:])
+            else:
+                gpk_v = tf.cast(kwargs['gpk_spec_v'], dtype=self.dists_dtype)                
+                gpk_v_square = tf.square(gpk_v) 
 
-            # [2] --- Warp the length‑scales ----------------------------------
-            lLBO_w0 = tf.cast(kwargs['gpk_spec_lm0'], dtype=self.dists_dtype)
-            lLBO_wX = tf.stack(
-                [kwargs[f"gpk_spec_lm{i}"] for i in range(1, len(eig_vals)+1)],
-                axis=0
-            )
-            lLBO_wX = tf.cast(lLBO_wX, dtype=self.dists_dtype)
-
-            warped_l = lLBO_w0 + tf.matmul(eig_vects, lLBO_wX)   # [N,1]
-            warped_l = tf.squeeze(warped_l, axis=-1)            # [N,]
-            # make positive
-            gpk_l = tf.exp(warped_l) + tf.cast(self.eps, dtype=self.dists_dtype)
-
-            # [3] --- Warp the variances --------------------------------------
-            # we model log-variance offsets per eigenvector, same pattern:
-            vLBO_w0 = tf.cast(kwargs['gpk_spec_vm0'], dtype=self.dists_dtype)
-            vLBO_wX = tf.stack(
-                [kwargs[f"gpk_spec_vm{i}"] for i in range(1, len(eig_vals)+1)],
-                axis=0
-            )
-            vLBO_wX = tf.cast(vLBO_wX, dtype=self.dists_dtype)
-
-            warped_v = vLBO_w0 + tf.matmul(eig_vects, vLBO_wX)   # [N,1]
-            warped_v = tf.squeeze(warped_v, axis=-1)            # [N,]
-            # make positive
-            gpk_v = tf.exp(warped_v) + tf.cast(self.eps, dtype=self.dists_dtype)
-
-            # [4] --- Build the Gibbs RBF with pointwise ℓ and v ---------------
-            # Normalization term: (2 ℓ_i ℓ_j / (ℓ_i^2 + ℓ_j^2))^{d/2}
-            two_l_lT  = 2 * tf.matmul(gpk_l[:, None], gpk_l[None, :])    # [N,N]
-            lsq_lTsq = tf.square(gpk_l[:, None]) + tf.square(gpk_l[None, :])
-            norm_     = tf.sqrt(two_l_lT / lsq_lTsq)
-
-            # Squared-distance exponent
-            exp_term = tf.exp(-tf.square(dXs) / lsq_lTsq)
-
-            # Finally, use the *pointwise* variance product:
-            # cov[i,j] = (gpk_v[i] * gpk_v[j]) * norm_[i,j] * exp_term[i,j]
-            cov_matrix = (gpk_v[:, None] * gpk_v[None, :]) * norm_ * exp_term                    
+            # Kernel 
+            if use_l:
+                cov_matrix = gpk_v_square * norm_ * tf.exp(-tf.square(dXs) / lsq_lTsq)    
+            else:
+                cov_matrix = gpk_v_square * tf.exp(
+                    -tf.square(dXs) / (2.0 * tf.square(gpk_l))
+                )
 
         elif kernel_type == 'spec_LBOGibbs':
             # * i know not really gibss...
@@ -1672,30 +1403,25 @@ class GPdistsM():
             # Load from kwargs
             gpk_v = tf.cast(kwargs['gpk_spec_v'], dtype=self.dists_dtype)
             dXs = kwargs['dXs']
-            # -> weights 
-            LBO_w0 = tf.cast(kwargs['gpk_spec_lm0'], dtype=self.dists_dtype)
-            LBO_wX = tf.stack(
+            lLBO_w0 = tf.cast(kwargs['gpk_spec_lm0'], dtype=self.dists_dtype)
+            lLBO_wX = tf.stack(
                 [kwargs[f"gpk_spec_lm{i}"] for i in range(1, len(eig_vals)+1)],
                 axis=0
             )
-            LBO_wX = tf.cast(LBO_wX, dtype=self.dists_dtype)
-            
-            # Multiply by the eigenvectors to get varying lengthscale
-            gpk_l = LBO_w0 + tf.matmul(eig_vects, LBO_wX) # [N, 1]
-            gpk_l = tf.squeeze(gpk_l, axis=-1) # [N,]
+            lLBO_wX = tf.cast(lLBO_wX, dtype=self.dists_dtype)
+            # Warped lengthscale
+            warped_l = lLBO_w0 + tf.matmul(eig_vects, lLBO_wX) # [N, 1]
+            warped_l = tf.squeeze(warped_l, axis=-1)
             # -> force positive
-            gpk_l = tf.exp(gpk_l) + tf.cast(self.eps, dtype=self.dists_dtype)            
-            # Informally, Gibbs kernel is:
-            # K = gpk_v^2 * norm_ * RBF_ 
-            #       norm_ = ((2*gpk_l*gpk_l.T)/(gpk_l^2+gpk_l.T^2))d/2 
-            # -> 
-            #       RBF_ = exp(-dXs^2/(gpk_l^2+gpk_l.T^2))
+            gpk_l = tf.exp(warped_l) + tf.cast(self.eps, dtype=self.dists_dtype)                
+            # If lengthscale is warped, we need to compute the norm_ for RBF kernel
             two_l_lT = 2 * tf.matmul(gpk_l[:,None], gpk_l[None,:])
             lsq_lTsq = tf.square(gpk_l[:,None]) + tf.square(gpk_l[None,:])
-            # norm_ = tf.sqrt(two_l_lT / lsq_lTsq)
-            norm_ = two_l_lT / lsq_lTsq
+            norm_ = tf.sqrt(two_l_lT / lsq_lTsq)                
+
             # RBF
-            cov_matrix     = tf.square(gpk_v) * norm_ * tf.exp(-tf.square(dXs) / lsq_lTsq)
+            # cov_matrix = tf.square(gpk_v) * norm_ * tf.exp(-tf.square(dXs) / lsq_lTsq)
+            cov_matrix = (gpk_l[:,None] * gpk_l[None,:]) * tf.exp(-tf.square(dXs) / (2.0 * tf.square(gpk_v)))
 
             # LAPLACE
             # cov_matrix     = tf.square(gpk_v) * norm_ * tf.exp(-dXs / lsq_lTsq)
@@ -1780,36 +1506,6 @@ class GPdistsM():
         if n_inducers is None or n_inducers >= self.n_vx:
             # Everything...
             return tf.range(self.n_vx)
-
-        # increment the seed each call - necessary because otherwise when graph is drawn it doesn't change...        
-        new_seed = self._seed.assign_add([1, 1])
-        # FOR DEBUGGING -> PRINT IT
-        # 2) print it for debugging
-        # tf.print("debug — new_seed:", new_seed)     
-        if inducing_indices is None:   
-            # bloop
-            if self.inducer_selection == 'random':
-                # Randomly select indices for inducing points
-                inducing_indices = tf.random.experimental.stateless_shuffle(
-                    tf.range(self.n_vx),
-                    seed=new_seed)[:n_inducers]
-                inducing_indices = tf.sort(inducing_indices)  # Keep them sorted for easier indexing
-            elif self.inducer_selection == 'close':
-                # Pick the n closest (requires self.dists)
-                # centre_idx = np.random.randint(0, self.n_vx)
-                centre_idx = tf.random.stateless_uniform(
-                    shape=[],
-                    minval=0,
-                    maxval=self.n_vx,
-                    dtype=tf.int32,
-                    seed=new_seed
-                )       
-                # Get the indices of the closest n_inducers points
-                _, inducing_indices = tf.math.top_k(-self.dists[centre_idx, :], k=n_inducers)
-                inducing_indices = tf.sort(inducing_indices)  # Keep sorted
-
-            else:
-                raise ValueError(f"Unknown inducer selection method: {self.inducer_selection}")
 
         return inducing_indices 
 
@@ -1910,3 +1606,119 @@ def compute_euclidean_distance_matrix(X, eps=1e-6):
     #    Adding eps inside the square root ensures numerical stability (avoiding sqrt(0) issues).
     D_euc = tf.sqrt(tf.reduce_sum(tf.square(diff), axis=-1) + eps)
     return D_euc
+
+
+# *** SAMPLER ***
+
+
+# Copied from .utils.mcmc
+# @tf.function(autograph=False, jit_compile=False)
+@tf.function
+def bprf_sample_NUTS(
+        init_state,
+        step_size,
+        target_log_prob_fn,
+        unconstraining_bijectors,
+        target_accept_prob=0.85,
+        unrolled_leapfrog_steps=1,
+        max_tree_depth=10,
+        num_steps=50,
+        burnin=50,
+        parallel_iterations=1,
+        ):
+
+    # bloop
+    def trace_fn(_, pkr):
+        return {
+            'log_prob': pkr.inner_results.inner_results.target_log_prob,
+            'diverging': pkr.inner_results.inner_results.has_divergence,
+            'is_accepted': pkr.inner_results.inner_results.is_accepted,
+            'accept_ratio': tf.exp(pkr.inner_results.inner_results.log_accept_ratio),
+            'leapfrogs_taken': pkr.inner_results.inner_results.leapfrogs_taken,
+            'step_size': pkr.inner_results.inner_results.step_size}
+
+    hmc = tfp.mcmc.NoUTurnSampler(
+        target_log_prob_fn,
+        unrolled_leapfrog_steps=unrolled_leapfrog_steps,
+        max_tree_depth=max_tree_depth,
+        step_size=step_size)
+
+    hmc = tfp.mcmc.TransformedTransitionKernel(
+        inner_kernel=hmc,
+        bijector=unconstraining_bijectors)
+
+    adaptive_sampler = tfp.mcmc.DualAveragingStepSizeAdaptation(
+        inner_kernel=hmc,
+        num_adaptation_steps=int(0.8 * burnin),
+        target_accept_prob=target_accept_prob,
+        # NUTS inside of a TTK requires custom getter/setter functions.
+        step_size_setter_fn=lambda pkr, new_step_size: pkr._replace(
+            inner_results=pkr.inner_results._replace(
+                step_size=new_step_size)
+        ),
+        step_size_getter_fn=lambda pkr: pkr.inner_results.step_size,
+        log_accept_prob_getter_fn=lambda pkr: pkr.inner_results.log_accept_ratio,
+    )
+    
+    # start = tf.timestamp()
+    # Sampling from the chain.
+    samples, stats = tfp.mcmc.sample_chain(
+        num_results=burnin + num_steps,
+        current_state=init_state,
+        kernel=adaptive_sampler,
+        trace_fn=trace_fn,
+        parallel_iterations=parallel_iterations,
+        )
+
+    # duration = tf.timestamp() - start
+    # stats['elapsed_time'] = duration
+
+    return samples, stats
+# Summarize MCMC
+
+def get_mcmc_summary(sampler, burnin=100, pc_range=25):
+    keys = sampler[0].keys()
+    n_voxels = len(sampler)
+    bpars = {}
+    bpars_m = {}
+    for p in list(keys): 
+        m = []
+        q1 = []
+        q2 = []
+        uc = []
+        std = []
+        for idx in range(n_voxels):
+            this_p = sampler[idx][p][burnin:].to_numpy()
+            m.append(np.percentile(this_p,50))
+            tq1 = np.percentile(this_p, pc_range)
+            tq2 = np.percentile(this_p, 100-pc_range)
+            tuc = tq2 - tq1
+            
+            q1.append(tq1)
+            q2.append(tq2)
+            uc.append(tuc)
+            std.append(np.std(this_p))
+        bpars_m[p] = np.array(m)
+        bpars[f'm_{p}'] = np.array(m)
+        bpars[f'q1_{p}'] = np.array(q1)
+        bpars[f'q2_{p}'] = np.array(q2)
+        bpars[f'uc_{p}'] = np.array(uc)
+        bpars[f'std_{p}'] = np.array(std)
+    return pd.DataFrame(bpars) #, pd.DataFrame(bpars_m)
+import operator
+
+def reorder_dataframe_columns(pd_to_fix, dict_index):
+    """
+    Reorders the columns of the given DataFrame based on dict_index.
+    
+    Parameters:
+    - pd_to_fix: pandas DataFrame whose columns will be reordered.
+    - dict_index: Dictionary mapping column names to desired index positions.
+    
+    Returns:
+    - DataFrame with columns reordered according to dict_index.
+    """
+    # Sort the dict_index items by their value using operator.itemgetter
+    sorted_columns = [col for col, _ in sorted(dict_index.items(), key=operator.itemgetter(1))]
+    # Return DataFrame with columns ordered based on sorted_columns
+    return pd_to_fix[sorted_columns]
