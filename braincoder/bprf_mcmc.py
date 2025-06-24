@@ -758,7 +758,6 @@ class GPdists():
         self.full_norm = kwargs.get('full_norm', False) # Use full normalization in precision method
         self.kernel = kwargs.get('kernel', 'RBF')
         self.fixed_params = kwargs.get('fixed_params', 'unfixed') # fixed_vl, fixed_all
-        self.inducer_selection = kwargs.get('inducer_selection', 'random')
         self.eps = kwargs.get('eps', 1e-6) # for numerical stability
         # Fixed GP hyperparameters (when fixed_params is True)
         self.f_gp_variance = kwargs.get('gp_variance', None)
@@ -773,9 +772,6 @@ class GPdists():
         self.dists_raw = tf.convert_to_tensor(dists, dtype=self.dists_dtype)
         self.dists_raw = (self.dists_raw + tf.transpose(self.dists_raw)) / 2.0        
         
-        # 2-element seed for stateless RNG; will be incremented each call
-        self._seed = tf.Variable([0, 0], dtype=tf.int32, trainable=False)
-        
         if self.psd_control == 'euclidean':
             print('Embedding in Euclidean space...')
             X = mds_embedding(self.dists_raw, self.embedding_dim)
@@ -783,7 +779,7 @@ class GPdists():
         else:
             self.dists = self.dists_raw
 
-        self.n_vx = self.dists.shape[0]
+        self.n_vx = tf.Variable(self.dists.shape[0], dtype=tf.int32, name="n_vx")
 
         # Precompute covariance related matrices if parameters are fixed
         if self.fixed_params == 'unfixed':
@@ -812,6 +808,8 @@ class GPdists():
         else:
             raise ValueError(f"Invalid fixed_params option: {self.fixed_params}. Choose from 'unfixed', 'fixed_vl', or 'fixed_all'.")
         self.set_log_prob()
+    def update_n_vx(self, new_value):
+        self.n_vx.assign(new_value)
 
     @tf.function
     def prior(self, param):
@@ -932,7 +930,6 @@ class GPdists():
                 allow_nan_stats=False,
             )
             return inducing_gp_prior_dist.log_prob(inducing_parameter)
-
     @tf.function
     def _return_inducing_idx_and_dists(self, n_inducers, inducing_indices=None):
         if n_inducers is None or n_inducers >= self.n_vx:
@@ -975,19 +972,13 @@ class GPdistsM():
         - better combination / chaining abilities? How combine kernels?
         - make it modular? 
         """
-        self.n_vx = n_vx
-        self.inducer_selection = kwargs.get('inducer_selection', 'random')
-        # 2-element seed for stateless RNG; will be incremented each call
-        self._seed = tf.Variable([0, 0], dtype=tf.int32, trainable=False)
+        self.n_vx = tf.Variable(n_vx, dtype=tf.int32, name="n_vx")
 
         # Setup distance matrix and positive semidefinite control
         self.psd_control   = kwargs.get('psd_control', 'euclidean')  # 'euclidean' or 'none'
         self.eps           = kwargs.get('eps', 1e-6)
         self.embedding_dim = kwargs.get('embedding_dim', 10)
         self.dists_dtype   = kwargs.get('dists_dtype', tf.float64)
-        self.dists         = kwargs.get('dists', None)
-        if self.dists is not None:
-            self.dists = tf.convert_to_tensor(self.dists, dtype=self.dists_dtype)
 
         self.stat_kernel_list = []
         self.lin_kernel_list = []
@@ -996,8 +987,8 @@ class GPdistsM():
         self.mfunc_bijector = tfb.Identity()
         self.Xs = {}
         self.dXs = {}
-        self.eig_vals = {}
-        self.eig_vects = {}
+        self.eig_vals = []
+        self.eig_vects = []
         self.kernel_type = {}
         self.pids = {}
         # Index of parameters to be passed...
@@ -1012,7 +1003,10 @@ class GPdistsM():
     def _update_pids_inv(self):
         self.pids_inv = {}
         self.pids_inv = {v:k for k,v in self.pids.items()}
-
+    
+    def update_n_vx(self, new_value):
+        self.n_vx.assign(new_value)
+        
     @tf.function
     def prior(self, param):
         # Compute the conditional log-probability of the parameter under the GP prior
@@ -1048,8 +1042,9 @@ class GPdistsM():
         '''
         if inducing_indices is None:
             inducing_indices = tf.range(self.n_vx)        
+        n_ind = tf.shape(inducing_indices)[0]
         # Start of with zero then add global mean
-        m_out = tf.zeros(len(inducing_indices), dtype=self.dists_dtype) + tf.cast(kwargs['mfunc_mean'], self.dists_dtype) # global mean...
+        m_out = tf.zeros(n_ind, dtype=self.dists_dtype) + tf.cast(kwargs['mfunc_mean'], self.dists_dtype) # global mean...
         # then add any regressors...
         for m in self.mfunc_list:
             slopes = tf.stack([kwargs[f'mfunc{m}_slope{i}'] for i in range(self.Xs[m].shape[1])], axis=0)  # [D]
@@ -1133,8 +1128,8 @@ class GPdistsM():
         '''
         self.kernel_type[xid] = kwargs.get('kernel_type', 'spec_exp')                
         # store eigenvalues and eigenvectors
-        self.eig_vals[xid] = tf.convert_to_tensor(kwargs['eig_vals'], dtype=self.dists_dtype)
-        self.eig_vects[xid] = tf.convert_to_tensor(kwargs['eig_vects'], dtype=self.dists_dtype)
+        self.eig_vals = tf.convert_to_tensor(kwargs['eig_vals'], dtype=self.dists_dtype)
+        self.eig_vects = tf.convert_to_tensor(kwargs['eig_vects'], dtype=self.dists_dtype)
 
         # if spectral, expect precomputed eigenpairs
         if self.kernel_type[xid] == 'spec_exp':
@@ -1159,20 +1154,20 @@ class GPdistsM():
             
             # Distance for RBF type kernel comes from warped LBO
             self.pids[len(self.pids)] = f'gpk{xid}_spec_dxm0'# 
-            for i in range(1, self.eig_vals[xid].shape[0]+1):
+            for i in range(1, self.eig_vals.shape[0]+1):
                 self.pids[len(self.pids)] = f'gpk{xid}_spec_dxm{i}' 
             
             # Lengthscale 
             if use_l:
                 self.pids[len(self.pids)] = f'gpk{xid}_spec_lm0' 
-                for i in range(1, self.eig_vals[xid].shape[0]+1):
+                for i in range(1, self.eig_vals.shape[0]+1):
                     self.pids[len(self.pids)] = f'gpk{xid}_spec_lm{i}'             
             else:
                 self.pids[len(self.pids)] = f'gpk{xid}_spec_l'
             # Variance
             if use_v:
                 self.pids[len(self.pids)] = f'gpk{xid}_spec_vm0' 
-                for i in range(1, self.eig_vals[xid].shape[0]+1):
+                for i in range(1, self.eig_vals.shape[0]+1):
                     self.pids[len(self.pids)] = f'gpk{xid}_spec_vm{i}'             
             else:
                 self.pids[len(self.pids)] = f'gpk{xid}_spec_v'
@@ -1180,7 +1175,7 @@ class GPdistsM():
         elif self.kernel_type[xid] == 'spec_LBOGibbs':
             self.pids[len(self.pids)] = f'gpk{xid}_spec_v'
             self.pids[len(self.pids)] = f'gpk{xid}_spec_lm0'
-            for i in range(1, self.eig_vals[xid].shape[0]+1):
+            for i in range(1, self.eig_vals.shape[0]+1):
                 self.pids[len(self.pids)] = f'gpk{xid}_spec_lm{i}'
             
             Xs = kwargs.get('Xs', None)
@@ -1236,8 +1231,8 @@ class GPdistsM():
                 # Gibbs kernel
                 spec_kwargs['dXs'] = tf.gather(tf.gather(self.dXs[s], inducing_indices, axis=0), inducing_indices, axis=1)
             s_out += self._return_sigma_xid_spectral(
-                eig_vals = self.eig_vals[s],
-                eig_vects = tf.gather(self.eig_vects[s], inducing_indices, axis=0),
+                eig_vals = self.eig_vals,
+                eig_vects = tf.gather(self.eig_vects, inducing_indices, axis=0),
                 kernel_type=self.kernel_type[s],
                 **spec_kwargs,
             )
@@ -1509,7 +1504,317 @@ class GPdistsM():
 
         return inducing_indices 
 
+
+class GPSpec(GPdistsM):
+    
+    def __init__(self, n_vx, eig_vects, eig_vals, **kwargs):
+        """
+        A ** TRUE ** spectral GP 
+               
+        Objective: LBO to construct a spectral GP 
+
+        """
+        super().__init__(n_vx, **kwargs)
+        # Setup distance matrix and positive semidefinite control
+        self.spec_method         = kwargs.get('spec_method', 'kappa') # Dense
+        self.eps           = kwargs.get('eps', 1e-6)
+        self.dists_dtype   = tf.float32 #kwargs.get('dists_dtype', tf.float64)
+        self.eig_vals = tf.convert_to_tensor(eig_vals, dtype=self.dists_dtype)
+        self.eig_vects = tf.convert_to_tensor(eig_vects, dtype=self.dists_dtype)
+        self.mass_matrix = kwargs.get('mass_matrix', None)
+        if self.mass_matrix is None:
+            self.mass_matrix = tf.ones([self.n_vx], dtype=self.dists_dtype)
+        else:
+            self.mass_matrix = tf.constant(self.mass_matrix, dtype=self.dists_dtype)   # [V]
+        
+        self.n_lbo = eig_vects.shape[-1]
+
+        self.kappa_kernel_list = []
+        self.return_log_prob = self._return_log_prob_unfixed # by default, return log prob unfixed...
+        self.gp_prior_dist = []
+
+    def _update_pids_inv(self):
+        self.pids_inv = {}
+        self.pids_inv = {v:k for k,v in self.pids.items()}
+
+    @tf.function
+    def prior(self, param):
+        # Compute the conditional log-probability of the parameter under the GP prior
+        return NotImplementedError
+
+    # *************************************************
+    # *************************************************
+    # *************************************************
+    
+    # *** KERNELS ***
+    # -> add Spectral kernels (based on LBO)
+    def add_xid_kappa_kernel(self, xid, **kwargs):
+        ''' CHANGED - may alter original as well
+        '''
+        self.kernel_type[xid] = kwargs.get('kernel_type', 'spec_exp')                
+        # if spectral, expect precomputed eigenpairs
+        if self.kernel_type[xid] == 'spec_exp':
+            self.pids[len(self.pids)] = f'gpk{xid}_kappa_l'
+            self.pids[len(self.pids)] = f'gpk{xid}_kappa_v'
+
+        elif self.kernel_type[xid] == 'spec_heat':
+            self.pids[len(self.pids)] = f'gpk{xid}_kappa_t'
+
+        elif self.kernel_type[xid] == 'spec_ratquad':
+            self.pids[len(self.pids)] = f'gpk{xid}_kappa_alpha'
+            self.pids[len(self.pids)] = f'gpk{xid}_kappa_beta'
+
+        else:
+            raise ValueError(f"Unknown kernel type: {self.kernel_type[xid]}.")
+        self.kappa_kernel_list.append(xid)
+        self._update_pids_inv()
+
+    def add_spec_warp(self):
+        ''' Add a warping function '''
+        for i in range(1, self.eig_vals.shape[0]+1):
+            self.pids[len(self.pids)] = f'gpk_warp_kappa_m{i}'                     
+        self._update_pids_inv()
+    
+    @tf.function
+    def _return_sigma_component(self, inducing_indices=None, **kwargs):
+        ''' Return the full Vx x Vx covariance matrix components
+        '''
+        if inducing_indices is None:
+            inducing_indices = tf.range(self.n_vx)
+        # Start covariance matrix from zero...
+        s_out = tf.zeros((len(inducing_indices),len(inducing_indices)), dtype=self.dists_dtype)
+
+        # Add in any linear kernels
+        for s in self.lin_kernel_list:
+            s_out += self._return_sigma_xid_linear(
+                gpk_slope=kwargs[f'gpk{s}_slope'],
+                gpk_const=kwargs[f'gpk{s}_const'],
+                Xs=tf.gather(self.Xs[s], inducing_indices, axis=0)
+            )
+        
+        # Add in any stationary kernels (e.g., RBF)
+        for s in self.stat_kernel_list:
+            s_out += self._return_sigma_xid_stationary(
+                gpk_l=kwargs[f'gpk{s}_l'],
+                gpk_v=kwargs[f'gpk{s}_v'],
+                dXs=tf.gather(tf.gather(self.dXs[s], inducing_indices, axis=0), inducing_indices, axis=1),
+                kernel_type=self.kernel_type[s]
+            )
+
+        for s in self.spec_kernel_list:
+            eig_vects = tf.gather(self.eig_vects, inducing_indices, axis=0)
+            spec_kwargs = {i.replace(s,''):k for i,k in kwargs.items() if 'spec' in i}
+            s_out += self._return_sigma_xid_spectral(
+                eig_vals = self.eig_vals,
+                eig_vects = eig_vects,
+                kernel_type=self.kernel_type[s],
+                **spec_kwargs,
+            )
+        return s_out
+    
+    # *** KAPPA 
+    @tf.function
+    def _return_kappa_diag_component(self, inducing_indices=None, **kwargs):
+        ''' Return the kappa diagonal component
+        '''
+        if inducing_indices is None:
+            inducing_indices = tf.range(self.n_vx)
+        # Start covariance matrix from zero...
+        k_out = np.zeros(self.n_lbo, dtype=self.dists_dtype)
+        for s in self.kappa_kernel_list:
+            spec_kwargs = {i.replace(s,''):k for i,k in kwargs.items() if 'kappa' in i}
+            k_out += self._return_kappa_xid_spectral(
+                eig_vals = self.eig_vals,
+                kernel_type=self.kernel_type[s],
+                **spec_kwargs,
+            )
+        
+        return k_out        
+    
+    @tf.function     
+    def _sigma_to_kappa_diag(self,sigma):
+        K_proj = tf.matmul(self.eig_vects, tf.matmul(sigma, self.eig_vects, transpose_a=True))
+        # # 2) Form the summed covariance in subspace
+        # K_sum = K_proj + tf.linalg.diag(kappa)  # [n,n]
+        # For now cheat and just get diagonal
+        return tf.linalg.diag_part(K_proj)
+        
+    @tf.function
+    def _return_kappa_xid_spectral(
+        self,
+        eig_vals,        # Tensor shape [M]
+                            kernel_type,     # 'spec_exp', 'spec_heat', or 'spec_ratquad'
+                            **kwargs) -> tf.Tensor:  # returns Tensor [M]
+        """
+        Compute spectral variances kappa_i = var * f(lambda_i) for each eigenvalue.
+
+        Args:
+            eig_vals:    Tensor of shape [M], the Laplacian eigenvalues.
+            kernel_type: 'spec_exp', 'spec_heat', or 'spec_ratquad'.
+            **kwargs:    Hyperparameters:
+                - spec_exp:     gpk_spec_l, gpk_spec_v
+                - spec_heat:    gpk_spec_t
+                - spec_ratquad: gpk_spec_alpha, gpk_spec_beta
+
+        Returns:
+            kappa: Tensor [M], the diagonal of the spectral covariance.
+        """
+        # cast to model dtype
+        eig_vals = tf.cast(eig_vals, dtype=self.dists_dtype)
+
+        if kernel_type == 'spec_exp':
+            # exponential kernel: kappa_i = sigma2 * exp(-sqrt(lambda_i)/l)
+            l = tf.cast(kwargs['gpk_kappa_l'], dtype=self.dists_dtype)
+            v = tf.cast(kwargs['gpk_kappa_v'], dtype=self.dists_dtype)
+            filt = tf.exp(-tf.sqrt(eig_vals) / l)
+            kappa = v * v * filt
+
+        elif kernel_type == 'spec_heat':
+            # heat kernel: kappa_i = exp(-t * lambda_i)
+            t = tf.cast(kwargs['gpk_kappa_t'], dtype=self.dists_dtype)
+            kappa = tf.exp(-t * eig_vals)
+
+        elif kernel_type == 'spec_ratquad':
+            # rational quadratic: kappa_i = (1 + lambda_i/alpha)^(-beta)
+            alpha = tf.cast(kwargs['gpk_kappa_alpha'], dtype=self.dists_dtype)
+            beta  = tf.cast(kwargs['gpk_kappa_beta'], dtype=self.dists_dtype)
+            kappa = tf.pow(1.0 + eig_vals / alpha, -beta)
+
+        else:
+            raise ValueError("Unknown spectral kernel type: {}".format(kernel_type))
+
+        return kappa
+
+
+    @tf.function
+    def _return_log_prob_unfixed(self, parameter, n_inducers=None, **kwargs):
+        """
+        Unfixed parameters using TensorFlow distribution.
+        Recompute covariance and Cholesky decomposition on the fly.
+        Optionally uses random selection of n_inducers for sparse GP approximation.
+        """
+        inducing_indices = kwargs.pop('inducing_indices', None)
+        inducing_indices = self._return_inducing_idx(n_inducers=n_inducers, inducing_indices=inducing_indices)
+        eig_vects = tf.gather(self.eig_vects, inducing_indices, axis=0)
+        mass_matrix = tf.gather(self.mass_matrix, inducing_indices, axis=0)
+
+        # [1] Get mean function
+        m_vect = self._return_mfunc(
+            inducing_indices=inducing_indices,
+            **kwargs
+            )
+        nvx = tf.shape(m_vect)[0]
+        # -> demean 
+        dm_parameter = parameter - m_vect      
+        # Project y into the spectral domain: z = Phi^T y
+        # -> not including mass_matrix
+        # proj_dm_parameter = tf.linalg.matvec(eig_vects, dm_parameter, transpose_a=True)  # [M]    
+        # Including mass matrix
+        w = tf.sqrt(mass_matrix)
+        yw = dm_parameter * w
+        phiw = eig_vects * tf.reshape(w, [-1, 1])
+        proj_dm_parameter = tf.linalg.matvec(phiw, yw, transpose_a=True)
+        # Warping - if appropriate 
+        warping_vect = tf.stack(
+            [kwargs.get(f"gpk_warp_spec_m{i}", 1.0) for i in range(1, self.n_lbo+1)],
+        )
+        warping_vect = tf.squeeze(warping_vect)
+        warped_proj = proj_dm_parameter #* warping_vect        
+        # Compute residual norm^2: r = y - Phi z
+        y_recon = tf.linalg.matvec(eig_vects, proj_dm_parameter)         # [N]
+        r2 = tf.reduce_sum((dm_parameter - y_recon) ** 2)                # scalar        
+
+        # Get kappa
+        kappa = self._return_kappa(
+            inducing_indices=inducing_indices,
+            **kwargs,            
+            ) 
+        # kappa = kappa * (warping_vect**2)
+
+        gp_prior_dist = tfd.MultivariateNormalDiag(loc=tf.zeros(self.n_lbo), scale_diag=tf.sqrt(kappa))
+        log_prob = gp_prior_dist.log_prob(warped_proj)
+
+        # Residual treated as iid noise: ||r||^2 / (2 σ2_obs) + const
+        gp_nugget = tf.cast(self.eps + kwargs[f'gpk_nugget'], dtype=self.dists_dtype)
+        lr = -0.5 * (r2 / gp_nugget + (tf.cast(nvx, self.dists_dtype) - tf.cast(self.n_lbo, self.dists_dtype)) * tf.math.log(2 * tf.constant(np.pi, dtype=self.dists_dtype) * gp_nugget))
+        return log_prob + lr
+    
+    def set_log_prob_fixed(self, **kwargs):
+        return None
+
+    @tf.function
+    def _return_log_prob_fixed(self, parameter, **kwargs):
+        # -> demean 
+        dm_parameter = parameter - self.m_vect      
+        # Project y into the spectral domain: z = Phi^T y
+        # -> not including mass_matrix
+        # proj_dm_parameter = tf.linalg.matvec(eig_vects, dm_parameter, transpose_a=True)  # [M]    
+        # Including mass matrix
+        yw = dm_parameter * self.w
+        phiw = self.eig_vects * tf.reshape(self.w, [-1, 1])
+        proj_dm_parameter = tf.linalg.matvec(phiw, yw, transpose_a=True)
+        warped_proj = proj_dm_parameter * self.warping_vect        
+        # Compute residual norm^2: r = y - Phi z
+        y_recon = tf.linalg.matvec(self.eig_vects, proj_dm_parameter)         # [N]
+        r2 = tf.reduce_sum((dm_parameter - y_recon) ** 2)                # scalar        
+        log_prob = self.gp_prior_dist.log_prob(warped_proj)
+
+        # Residual treated as iid noise: ||r||^2 / (2 σ2_obs) + const
+        
+        lr = -0.5 * \
+            (r2 / self.gp_nugget + (tf.cast(self.n_vxvx, self.dists_dtype) \
+            - tf.cast(self.n_lbo, self.dists_dtype)) * tf.math.log(2 * tf.constant(np.pi, dtype=self.dists_dtype) * self.gp_nugget))
+        return log_prob + lr
+
 # **************************** 
+# @tf.function
+def sigma2kappa(sigma, eig_vects):
+    """
+    Project a dense covariance matrix into the spectral domain.
+
+    Args:
+        sigma: tf.Tensor of shape (N, N), the covariance matrix in real space.
+        eig_vects: tf.Tensor of shape (N, L), the first L LBO eigenvectors.
+
+    Returns:
+        kappa: tf.Tensor of shape (L,), diagonal variances in spectral domain.
+    """
+    # Ensure symmetry for numerical stability
+    # sigma = (sigma + tf.transpose(sigma)) * 0.5
+
+    # Project covariance onto eigenbasis: phi^T * sigma * phi
+    # For efficiency compute sigma * phi first
+    sigma_phi = tf.matmul(sigma, eig_vects)  # shape (N, L)
+    # Then compute diagonal entries: sum over N: phi_i * (sigma * phi)_i
+    kappa = tf.reduce_sum(eig_vects * sigma_phi, axis=0)
+
+    return kappa
+
+
+# @tf.function
+def kappa2sigma(kappa, eig_vects):
+    """
+    Reconstruct the dense covariance matrix from spectral variances.
+
+    Args:
+        kappa: tf.Tensor of shape (L,), spectral variances.
+        eig_vects: tf.Tensor of shape (N, L), the first L LBO eigenvectors.
+
+    Returns:
+        sigma: tf.Tensor of shape (N, N), reconstructed covariance matrix.
+    """
+
+    # Form diagonal spectral matrix
+    Lambda = tf.linalg.diag(kappa)
+
+    # Reconstruct covariance: phi * Lambda * phi^T
+    sigma_recon = tf.matmul(eig_vects, tf.matmul(Lambda, eig_vects, transpose_b=True))
+
+    # Ensure symmetry
+    sigma_recon = (sigma_recon + tf.transpose(sigma_recon)) * 0.5
+
+    return sigma_recon
+
 @tf.function
 def mds_embedding(distance_matrix, embedding_dim=10, eps=1e-3):
     """

@@ -314,7 +314,11 @@ class BPRF_hier(BPRF):
             if hasattr(gp, 'dXs'):
                 entry['dXs'] = {dxk: tf.identity(dxv) for dxk, dxv in gp.dXs.items()}
             if hasattr(gp, 'eig_vects'):
-                entry['eig_vects'] = {ek: tf.identity(ev) for ek, ev in gp.eig_vects.items()}
+                # entry['eig_vects'] = {ek: tf.identity(ev) for ek, ev in gp.eig_vects.items()}
+                entry['eig_vects'] = tf.identity(gp.eig_vects)
+            if hasattr(gp, 'mass_matrix'):
+                # entry['eig_vects'] = {ek: tf.identity(ev) for ek, ev in gp.eig_vects.items()}
+                entry['mass_matrix'] = tf.identity(gp.mass_matrix)                
             state[key] = entry
         self._original_gp = state        
 
@@ -324,7 +328,7 @@ class BPRF_hier(BPRF):
         if self._original_gp is None:
             self._stash_gps()
         for gpkey in self.h_gp_function.keys():
-            self.h_gp_function[gpkey].n_vx = len(idx)
+            self.h_gp_function[gpkey].update_n_vx(len(idx))
             if hasattr(self.h_gp_function[gpkey], 'dists'):
                 if self.h_gp_function[gpkey].dists is not None:
                     self.h_gp_function[gpkey].dists = tf.gather(tf.gather(self.h_gp_function[gpkey].dists, idx, axis=0), idx, axis=1)
@@ -335,8 +339,11 @@ class BPRF_hier(BPRF):
                 for Xkey in self.h_gp_function[gpkey].Xs.keys():
                     self.h_gp_function[gpkey].Xs[Xkey] = tf.gather(self.h_gp_function[gpkey].Xs[Xkey], idx, axis=0)
             if hasattr(self.h_gp_function[gpkey], 'eig_vects'):
-                for eigkey in self.h_gp_function[gpkey].eig_vects.keys():
-                    self.h_gp_function[gpkey].eig_vects[eigkey] = tf.gather(self.h_gp_function[gpkey].eig_vects[eigkey], idx, axis=0)
+                self.h_gp_function[gpkey].eig_vects = tf.gather(self.h_gp_function[gpkey].eig_vects, idx, axis=0)
+                # for eigkey in self.h_gp_function[gpkey].eig_vects.keys():
+                #     self.h_gp_function[gpkey].eig_vects[eigkey] = tf.gather(self.h_gp_function[gpkey].eig_vects[eigkey], idx, axis=0)
+            if hasattr(self.h_gp_function[gpkey], 'mass_matrix'):
+                self.h_gp_function[gpkey].mass_matrix = tf.gather(self.h_gp_function[gpkey].mass_matrix, idx)                
     def _restore_gps(self):
         if self._original_gp is None:
             raise RuntimeError("No state stashed. Call stash_original() first.")
@@ -344,7 +351,7 @@ class BPRF_hier(BPRF):
         for gpkey, entry in self._original_gp.items():
             gp = self.h_gp_function[gpkey]
             if entry['n_vx'] is not None:
-                gp.n_vx = entry['n_vx']
+                gp.update_n_vx(entry['n_vx'])
             if 'dists' in entry:
                 gp.dists = entry['dists']
             if 'Xs' in entry:
@@ -354,9 +361,11 @@ class BPRF_hier(BPRF):
                 for dxk, dxv in entry['dXs'].items():
                     gp.dXs[dxk] = dxv
             if 'eig_vects' in entry:
-                for ek, ev in entry['eig_vects'].items():
-                    gp.eig_vects[ek] = ev
-
+                gp.eig_vects = entry['eig_vects']
+                # for ek, ev in entry['eig_vects'].items():
+                #     gp.eig_vects[ek] = ev
+            if 'mass_matrix' in entry:
+                gp.mass_matrix = entry['mass_matrix']
         # clear stash
         self._original_gp = None        
 
@@ -586,6 +595,8 @@ class BPRF_hier(BPRF):
         vx_bool = np.zeros(self.n_voxels, dtype=bool)
         vx_bool[idx] = True
         self.n_vx_to_fit = len(idx)
+        if self.n_inducers is None:
+            self.n_inducers = self.n_vx_to_fit        
         self.fixed_pars = fixed_pars
         self.h_fixed_pars = kwargs.pop('h_fixed_pars', {})                
         self.prep_for_fitting(**kwargs)
@@ -631,7 +642,7 @@ class BPRF_hier(BPRF):
             # [4] Push through bijectors (constrain)            
             patch_f_parameters = self._bprf_transform_parameters_forward(patch_f_parameters_unc)
             f_h_parameters = self._h_bprf_transform_parameters_forward(f_h_parameters_unc)
-            
+
             # [5] Compute the priors -> only passing inducing indices for the GP (is being used)
             log_prior = log_prior_fn(patch_f_parameters, f_h_parameters, inducing_indices)            
 
@@ -696,7 +707,7 @@ class BPRF_hier(BPRF):
 
         optimizer = tf.optimizers.Adam(**adam_kwargs)
         # Optimization loop with tqdm progress bar
-        progress_bar = tqdm(tf.range(num_steps), desc="MAP Optimization")
+        progress_bar = tqdm(tf.range(num_steps), desc="MAP hier")
         track_params_list = []
         track_h_params_list = []
         track_loss_list = []
@@ -706,7 +717,7 @@ class BPRF_hier(BPRF):
                 loss = neg_log_posterior_fn()
             gradients = tape.gradient(loss, all_opt_vars)
             optimizer.apply_gradients(zip(gradients, all_opt_vars))
-            progress_bar.set_description(f"MAP Optimization, Loss: {loss.numpy():.4f}")        
+            progress_bar.set_description(f"MAP hier, Loss: {loss.numpy():.4f}")        
             if track_loss:
                 track_loss_list.append(loss.numpy())
             if track_gradients:
@@ -957,12 +968,14 @@ class BPRF_hier(BPRF):
         vx_bool = np.zeros(self.n_voxels, dtype=bool)
         vx_bool[idx] = True
         self.n_vx_to_fit = len(idx)
+        if self.n_inducers is None:
+            self.n_inducers = self.n_vx_to_fit
         self.h_fixed_pars = kwargs.pop('h_fixed_pars', {})      
         self.n_params = len(self.model_labels)
         self.h_prep_for_fitting(**kwargs)
         self.h_n_params = len(self.h_labels)
         pid_pars = pid_pars.values.astype(np.float32) # These stay the same...
-        pid_pars = tf.convert_to_tensor(pid_pars[vx_bool], dtype=tf.float32, name=pid) 
+        pid_pars = tf.convert_to_tensor(pid_pars[vx_bool], dtype=tf.float32, name=pid)         
         h_init_pars = self.sort_h_parameters(h_init_pars)
         h_init_pars = format_parameters(h_init_pars)
         h_init_pars = h_init_pars.values.astype(np.float32)
@@ -1076,7 +1089,7 @@ class BPRF_hier(BPRF):
         patience_counter = 0
 
         optimizer = tf.optimizers.Adam(**adam_kwargs)
-        progress_bar = tqdm(tf.range(num_steps), desc="MAP Optimization")
+        progress_bar = tqdm(tf.range(num_steps), desc="MAP GP only")
 
         for step in progress_bar:
             with tf.GradientTape() as tape:
@@ -1095,7 +1108,7 @@ class BPRF_hier(BPRF):
             #     print(f"Early stopping at step {step}, Loss: {best_loss:.4f}")
             #     break
 
-            progress_bar.set_description(f"MAP Optimization, Loss: {loss.numpy():.4f}")
+            progress_bar.set_description(f"MAP GP only, Loss: {loss.numpy():.4f}")
 
 
         # Extract optimized parameters
