@@ -1516,7 +1516,13 @@ class GPSpec(GPdistsM):
         """
         super().__init__(n_vx, **kwargs)
         # Setup distance matrix and positive semidefinite control
-        self.spec_method         = kwargs.get('spec_method', 'kappa') # Dense
+        self.spec_method         = kwargs.get('spec_method', 'diag') # dense
+        if self.spec_method == 'diag':
+            self._return_kappa = self._return_kappa_diag     
+            self._return_kappa_dist = self._return_kappa_dist_diag
+        if self.spec_method == 'dense':
+            self._return_kappa = self._return_kappa_dense     
+            self._return_kappa_dist = self._return_kappa_dist_dense               
         self.eps           = kwargs.get('eps', 1e-6)
         self.dists_dtype   = tf.float32 #kwargs.get('dists_dtype', tf.float64)
         self.eig_vals = tf.convert_to_tensor(eig_vals, dtype=self.dists_dtype)
@@ -1526,6 +1532,7 @@ class GPSpec(GPdistsM):
             self.mass_matrix = tf.ones([self.n_vx], dtype=self.dists_dtype)
         else:
             self.mass_matrix = tf.constant(self.mass_matrix, dtype=self.dists_dtype)   # [V]
+        self.mass_matrix_sqrt = tf.sqrt(self.mass_matrix)  # useful for computations
         
         self.n_lbo = eig_vects.shape[-1]
 
@@ -1568,12 +1575,6 @@ class GPSpec(GPdistsM):
             raise ValueError(f"Unknown kernel type: {self.kernel_type[xid]}.")
         self.kappa_kernel_list.append(xid)
         self._update_pids_inv()
-
-    def add_spec_warp(self):
-        ''' Add a warping function '''
-        for i in range(1, self.eig_vals.shape[0]+1):
-            self.pids[len(self.pids)] = f'gpk_warp_kappa_m{i}'                     
-        self._update_pids_inv()
     
     @tf.function
     def _return_sigma_component(self, inducing_indices=None, **kwargs):
@@ -1612,32 +1613,6 @@ class GPSpec(GPdistsM):
             )
         return s_out
     
-    # *** KAPPA 
-    @tf.function
-    def _return_kappa_diag_component(self, inducing_indices=None, **kwargs):
-        ''' Return the kappa diagonal component
-        '''
-        if inducing_indices is None:
-            inducing_indices = tf.range(self.n_vx)
-        # Start covariance matrix from zero...
-        k_out = np.zeros(self.n_lbo, dtype=self.dists_dtype)
-        for s in self.kappa_kernel_list:
-            spec_kwargs = {i.replace(s,''):k for i,k in kwargs.items() if 'kappa' in i}
-            k_out += self._return_kappa_xid_spectral(
-                eig_vals = self.eig_vals,
-                kernel_type=self.kernel_type[s],
-                **spec_kwargs,
-            )
-        
-        return k_out        
-    
-    @tf.function     
-    def _sigma_to_kappa_diag(self,sigma):
-        K_proj = tf.matmul(self.eig_vects, tf.matmul(sigma, self.eig_vects, transpose_a=True))
-        # # 2) Form the summed covariance in subspace
-        # K_sum = K_proj + tf.linalg.diag(kappa)  # [n,n]
-        # For now cheat and just get diagonal
-        return tf.linalg.diag_part(K_proj)
         
     @tf.function
     def _return_kappa_xid_spectral(
@@ -1685,6 +1660,69 @@ class GPSpec(GPdistsM):
 
         return kappa
 
+    @tf.function
+    def _return_kappa_diag(self, inducing_indices, **kwargs):
+        ''' To return the (L,) tensor (for diagonal)'''
+        if inducing_indices is None:
+            inducing_indices = tf.range(self.n_vx)
+        eig_vects = tf.gather(self.eig_vects, inducing_indices, axis=0)
+        mass_matrix_sqrt = tf.gather(self.mass_matrix_sqrt, inducing_indices, axis=0)
+
+        k_out = tf.zeros(self.n_lbo, dtype=self.dists_dtype)            
+        s_out = self._return_sigma_component(inducing_indices=inducing_indices, **kwargs)
+        phiw = eig_vects * mass_matrix_sqrt[:, None]    # shape [N, L]
+        # And weight sigma*phi as well:
+        sigma_phi = tf.matmul(s_out * mass_matrix_sqrt[:, None], phiw)  # [N, L]
+        # Then the diagonal variances:
+        k_out += tf.reduce_sum(phiw * sigma_phi, axis=0)  # [L]        
+        
+        for s in self.kappa_kernel_list:
+            spec_kwargs = {i.replace(s,''):k for i,k in kwargs.items() if 'kappa' in i}
+            k_out += self._return_kappa_xid_spectral(
+                eig_vals = self.eig_vals,
+                kernel_type=self.kernel_type[s],
+                **spec_kwargs,
+            )
+                                
+        k_out *= tf.cast(kwargs['gpk_var'], dtype=self.dists_dtype)    
+        return k_out
+
+    @tf.function
+    def _return_kappa_dense(self, inducing_indices, **kwargs):
+        ''' To return the (L,) tensor (for diagonal)'''
+        if inducing_indices is None:
+            inducing_indices = tf.range(self.n_vx)
+        eig_vects = tf.gather(self.eig_vects, inducing_indices, axis=0)
+        mass_matrix = tf.gather(self.mass_matrix, inducing_indices, axis=0)
+        k_out = tf.zeros((self.n_lbo,self.n_lbo), dtype=self.dists_dtype)
+        
+        s_out = self._return_sigma_component(inducing_indices=inducing_indices, **kwargs)
+        k_out += sigma2kappa_dense(s_out, eig_vects, mass_matrix)        
+
+        for s in self.kappa_kernel_list:
+            spec_kwargs = {i.replace(s,''):k for i,k in kwargs.items() if 'kappa' in i}
+            k_diag = self._return_kappa_xid_spectral(
+                eig_vals = self.eig_vals,
+                kernel_type=self.kernel_type[s],
+                **spec_kwargs,
+            )
+            k_out += tf.linalg.diag(k_diag)
+                                
+        k_out *= tf.cast(kwargs['gpk_var'], dtype=self.dists_dtype)            
+        return k_out + tf.eye(self.n_lbo, dtype=self.dists_dtype) * tf.cast(self.eps+kwargs['gpk_nugget'], dtype=self.dists_dtype)
+
+    @tf.function
+    def _return_kappa_dist_diag(self, kappa):
+        return tfd.MultivariateNormalDiag(loc=tf.zeros(self.n_lbo), scale_diag=tf.sqrt(kappa))
+    @tf.function
+    def _return_kappa_dist_dense(self, kappa):
+        chol = tf.linalg.cholesky(tf.cast(kappa, dtype=tf.float64))
+        gp_prior_dist = tfd.MultivariateNormalTriL(
+            loc=tf.zeros(self.n_lbo), 
+            scale_tril=tf.cast(chol, dtype=tf.float32),
+            allow_nan_stats=False,
+        )        
+        return gp_prior_dist
 
     @tf.function
     def _return_log_prob_unfixed(self, parameter, n_inducers=None, **kwargs):
@@ -1696,7 +1734,7 @@ class GPSpec(GPdistsM):
         inducing_indices = kwargs.pop('inducing_indices', None)
         inducing_indices = self._return_inducing_idx(n_inducers=n_inducers, inducing_indices=inducing_indices)
         eig_vects = tf.gather(self.eig_vects, inducing_indices, axis=0)
-        mass_matrix = tf.gather(self.mass_matrix, inducing_indices, axis=0)
+        mass_matrix_sqrt = tf.gather(self.mass_matrix_sqrt, inducing_indices, axis=0)[...,None]
 
         # [1] Get mean function
         m_vect = self._return_mfunc(
@@ -1710,18 +1748,12 @@ class GPSpec(GPdistsM):
         # -> not including mass_matrix
         # proj_dm_parameter = tf.linalg.matvec(eig_vects, dm_parameter, transpose_a=True)  # [M]    
         # Including mass matrix
-        w = tf.sqrt(mass_matrix)
-        yw = dm_parameter * w
-        phiw = eig_vects * tf.reshape(w, [-1, 1])
-        proj_dm_parameter = tf.linalg.matvec(phiw, yw, transpose_a=True)
-        # Warping - if appropriate 
-        warping_vect = tf.stack(
-            [kwargs.get(f"gpk_warp_spec_m{i}", 1.0) for i in range(1, self.n_lbo+1)],
-        )
-        warping_vect = tf.squeeze(warping_vect)
-        warped_proj = proj_dm_parameter #* warping_vect        
+        yw = dm_parameter *tf.squeeze(mass_matrix_sqrt,-1)
+        phiw = eig_vects * mass_matrix_sqrt
+        proj_dm_parameter = tf.tensordot(phiw, yw, axes=[[0],[0]])  # [M]
+
         # Compute residual norm^2: r = y - Phi z
-        y_recon = tf.linalg.matvec(eig_vects, proj_dm_parameter)         # [N]
+        y_recon = tf.tensordot(phiw, proj_dm_parameter, axes=[[1],[0]])  # [N]
         r2 = tf.reduce_sum((dm_parameter - y_recon) ** 2)                # scalar        
 
         # Get kappa
@@ -1729,10 +1761,8 @@ class GPSpec(GPdistsM):
             inducing_indices=inducing_indices,
             **kwargs,            
             ) 
-        # kappa = kappa * (warping_vect**2)
-
-        gp_prior_dist = tfd.MultivariateNormalDiag(loc=tf.zeros(self.n_lbo), scale_diag=tf.sqrt(kappa))
-        log_prob = gp_prior_dist.log_prob(warped_proj)
+        gp_prior_dist = self._return_kappa_dist(kappa)
+        log_prob = gp_prior_dist.log_prob(proj_dm_parameter)
 
         # Residual treated as iid noise: ||r||^2 / (2 σ2_obs) + const
         gp_nugget = tf.cast(self.eps + kwargs[f'gpk_nugget'], dtype=self.dists_dtype)
@@ -1742,79 +1772,124 @@ class GPSpec(GPdistsM):
     def set_log_prob_fixed(self, **kwargs):
         return None
 
-    @tf.function
-    def _return_log_prob_fixed(self, parameter, **kwargs):
-        # -> demean 
-        dm_parameter = parameter - self.m_vect      
-        # Project y into the spectral domain: z = Phi^T y
-        # -> not including mass_matrix
-        # proj_dm_parameter = tf.linalg.matvec(eig_vects, dm_parameter, transpose_a=True)  # [M]    
-        # Including mass matrix
-        yw = dm_parameter * self.w
-        phiw = self.eig_vects * tf.reshape(self.w, [-1, 1])
-        proj_dm_parameter = tf.linalg.matvec(phiw, yw, transpose_a=True)
-        warped_proj = proj_dm_parameter * self.warping_vect        
-        # Compute residual norm^2: r = y - Phi z
-        y_recon = tf.linalg.matvec(self.eig_vects, proj_dm_parameter)         # [N]
-        r2 = tf.reduce_sum((dm_parameter - y_recon) ** 2)                # scalar        
-        log_prob = self.gp_prior_dist.log_prob(warped_proj)
-
-        # Residual treated as iid noise: ||r||^2 / (2 σ2_obs) + const
-        
-        lr = -0.5 * \
-            (r2 / self.gp_nugget + (tf.cast(self.n_vxvx, self.dists_dtype) \
-            - tf.cast(self.n_lbo, self.dists_dtype)) * tf.math.log(2 * tf.constant(np.pi, dtype=self.dists_dtype) * self.gp_nugget))
-        return log_prob + lr
 
 # **************************** 
-# @tf.function
-def sigma2kappa(sigma, eig_vects):
+@tf.function
+def sigma2kappa_diag(sigma, eig_vects, mass_matrix_sqrt):
     """
-    Project a dense covariance matrix into the spectral domain.
+    Project a dense covariance matrix into the spectral domain,
+    accounting for the mass matrix weights.
 
     Args:
-        sigma: tf.Tensor of shape (N, N), the covariance matrix in real space.
-        eig_vects: tf.Tensor of shape (N, L), the first L LBO eigenvectors.
+        sigma: tf.Tensor [N, N], the covariance matrix Σ.
+        eig_vects: tf.Tensor [N, L], the first L LBO eigenvectors Φ.
+        mass_matrix_sqrt: tf.Tensor [N], the sqrt of the mass matrix diag(M)^(1/2).
 
     Returns:
-        kappa: tf.Tensor of shape (L,), diagonal variances in spectral domain.
+        kappa: tf.Tensor [L], the diagonal variances in spectral domain.
     """
-    # Ensure symmetry for numerical stability
-    # sigma = (sigma + tf.transpose(sigma)) * 0.5
+    # weight eigenvectors:
+    phiw = eig_vects * tf.expand_dims(mass_matrix_sqrt, -1)  # [N, L]
 
-    # Project covariance onto eigenbasis: phi^T * sigma * phi
-    # For efficiency compute sigma * phi first
-    sigma_phi = tf.matmul(sigma, eig_vects)  # shape (N, L)
-    # Then compute diagonal entries: sum over N: phi_i * (sigma * phi)_i
-    kappa = tf.reduce_sum(eig_vects * sigma_phi, axis=0)
+    # apply sigma, then weight the result:
+    sigma_phiw = tf.matmul(sigma, phiw)                      # [N, L]
+    weighted = sigma_phiw * tf.expand_dims(mass_matrix_sqrt, -1)  # [N, L]
+
+    # extract diagonal entries:
+    kappa = tf.reduce_sum(phiw * weighted, axis=0)           # [L]
 
     return kappa
 
-
-# @tf.function
-def kappa2sigma(kappa, eig_vects):
+@tf.function
+def sigma2kappa_dense(sigma, eig_vects, mass_matrix):
     """
-    Reconstruct the dense covariance matrix from spectral variances.
+    Project a dense covariance matrix into the spectral domain,
+    accounting for the mass‐matrix weights.
 
     Args:
-        kappa: tf.Tensor of shape (L,), spectral variances.
-        eig_vects: tf.Tensor of shape (N, L), the first L LBO eigenvectors.
+        sigma: tf.Tensor of shape (N, N), the covariance matrix Σ.
+        eig_vects: tf.Tensor of shape (N, L), the first L LBO eigenvectors Φ.
+        mass_matrix: tf.Tensor of shape (N,), the diagonal of M.
 
     Returns:
-        sigma: tf.Tensor of shape (N, N), reconstructed covariance matrix.
+        kappa: tf.Tensor of shape (L, L), the full spectral covariance.
     """
+    # weight the eigenvectors: M * Φ
+    mp = eig_vects * tf.expand_dims(mass_matrix, -1)        # [N, L]
 
-    # Form diagonal spectral matrix
-    Lambda = tf.linalg.diag(kappa)
+    # apply Σ to the weighted eigenvectors: Σ (M Φ)
+    sigma_mp = tf.matmul(sigma, mp)                         # [N, L]
 
-    # Reconstruct covariance: phi * Lambda * phi^T
-    sigma_recon = tf.matmul(eig_vects, tf.matmul(Lambda, eig_vects, transpose_b=True))
+    # form Φ^T M Σ M Φ = (M Φ)^T (Σ (M Φ))
+    kappa = tf.matmul(mp, sigma_mp, transpose_a=True)       # [L, L]
 
-    # Ensure symmetry
-    sigma_recon = (sigma_recon + tf.transpose(sigma_recon)) * 0.5
+    return kappa
 
-    return sigma_recon
+# @tf.function
+@tf.function
+def kappa_diag2sigma(kappa, eig_vects, mass_matrix):
+    """
+    Reconstruct the dense covariance matrix from spectral variances,
+    accounting for the mass matrix.
+    
+    Args:
+        kappa: tf.Tensor of shape (L,), spectral variances.
+        eig_vects: tf.Tensor of shape (N, L), the first L LBO eigenvectors Φ.
+        mass_matrix: tf.Tensor of shape (N,), the diagonal entries of M.
+    
+    Returns:
+        sigma_recon: tf.Tensor of shape (N, N), reconstructed Σ.
+    """
+    # compute sqrt and inv-sqrt of M
+    m_sqrt = tf.sqrt(mass_matrix)                             # [N]
+    m_inv_sqrt = tf.math.reciprocal(m_sqrt)                   # [N]
 
+    # weight eigenvectors by sqrt(M)
+    phiw = eig_vects * tf.expand_dims(m_sqrt, -1)             # [N, L]
+
+    # build mid: (M^{1/2}Φ) diag(kappa) (M^{1/2}Φ)^T
+    Lambda = tf.linalg.diag(kappa)                            # [L, L]
+    mid = tf.matmul(phiw, tf.matmul(Lambda, phiw, transpose_b=True))  # [N, N]
+
+    # un-weight by M^{-1/2} on both sides
+    sigma_recon = (m_inv_sqrt[:,None] * mid) * m_inv_sqrt[None,:]      # [N, N]
+
+    # ensure symmetry
+    return 0.5 * (sigma_recon + tf.transpose(sigma_recon))
+
+
+@tf.function
+def kappa_dense2sigma(kappa, eig_vects, mass_matrix):
+    """
+    Reconstruct the dense covariance matrix from full spectral covariance,
+    accounting for the mass matrix.
+    
+    Args:
+        kappa: tf.Tensor of shape (L, L), full spectral covariance.
+        eig_vects: tf.Tensor of shape (N, L), the first L LBO eigenvectors Φ.
+        mass_matrix: tf.Tensor of shape (N,), the diagonal entries of M.
+    
+    Returns:
+        sigma_recon: tf.Tensor of shape (N, N), reconstructed Σ.
+    """
+    # compute sqrt and inv-sqrt of M
+    m_sqrt = tf.sqrt(mass_matrix)                             # [N]
+    m_inv_sqrt = tf.math.reciprocal(m_sqrt)                   # [N]
+
+    # weight eigenvectors by sqrt(M)
+    phiw = eig_vects * tf.expand_dims(m_sqrt, -1)             # [N, L]
+
+    # mid = (M^{1/2}Φ) K (M^{1/2}Φ)^T
+    mid = tf.matmul(phiw, tf.matmul(kappa, phiw, transpose_a=True))  # [N, N]
+
+    # un-weight by M^{-1/2} on both sides
+    sigma_recon = (m_inv_sqrt[:,None] * mid) * m_inv_sqrt[None,:]     # [N, N]
+
+    # ensure symmetry
+    return 0.5 * (sigma_recon + tf.transpose(sigma_recon))
+
+
+# *****
 @tf.function
 def mds_embedding(distance_matrix, embedding_dim=10, eps=1e-3):
     """
