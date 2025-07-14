@@ -1,4 +1,18 @@
-class GPSpec(GPdistsM):
+import pandas as pd
+import numpy as np
+from .utils import format_data, format_paradigm, get_rsq, calculate_log_prob_t, calculate_log_prob_gauss_loc0, format_parameters
+import tensorflow as tf
+import tensorflow_probability as tfp
+from tensorflow_probability import distributions as tfd
+from tensorflow_probability import bijectors as tfb
+from tqdm import tqdm
+import math
+from timeit import default_timer as timer
+import copy
+
+from braincoder.bprf_mcmc import GPdistsM
+
+class GPSpecMM(GPdistsM):
     
     def __init__(self, n_vx, eig_vects, eig_vals, **kwargs):
         """

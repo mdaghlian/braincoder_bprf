@@ -339,7 +339,8 @@ class BPRF_hier(BPRF):
                 for Xkey in self.h_gp_function[gpkey].Xs.keys():
                     self.h_gp_function[gpkey].Xs[Xkey] = tf.gather(self.h_gp_function[gpkey].Xs[Xkey], idx, axis=0)
             if hasattr(self.h_gp_function[gpkey], 'eig_vects'):
-                self.h_gp_function[gpkey].eig_vects = tf.gather(self.h_gp_function[gpkey].eig_vects, idx, axis=0)
+                if len(self.h_gp_function[gpkey].eig_vects)>0:
+                    self.h_gp_function[gpkey].eig_vects = tf.gather(self.h_gp_function[gpkey].eig_vects, idx, axis=0)
                 # for eigkey in self.h_gp_function[gpkey].eig_vects.keys():
                 #     self.h_gp_function[gpkey].eig_vects[eigkey] = tf.gather(self.h_gp_function[gpkey].eig_vects[eigkey], idx, axis=0)
             if hasattr(self.h_gp_function[gpkey], 'mass_matrix'):
