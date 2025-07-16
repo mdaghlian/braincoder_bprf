@@ -7,6 +7,7 @@ from tensorflow_probability import distributions as tfd
 from tensorflow_probability import bijectors as tfb
 
 from .bprf_mcmc import *
+from .bprf_mcmc_GPs import *
 
 import copy
 class BPRF_hier(BPRF):
@@ -1012,7 +1013,7 @@ class BPRF_hier(BPRF):
             # [1] Mask fixed parameters 
             h_parameters = self.h_fix_update_fn(h_parameters)
             # [2] Make a sub selection
-            inducing_indices = self._return_inducing_idx(self.n_inducers)    
+            inducing_indices = self._return_inducing_idx(self.n_inducers)
             patch_parameters = tf.gather(pid_pars, inducing_indices, axis=0)
             # [2] Jacobian
             log_jac = log_jac_fn(h_parameters, patch_parameters)
