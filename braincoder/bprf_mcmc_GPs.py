@@ -110,6 +110,12 @@ class GPdists():
         if dists is None: 
             dists = self.dists
         gp_nugget = tf.cast(gp_nugget, dtype=self.dists_dtype)
+        cov_matrix = self._kernel_output(gp_lengthscale, gp_variance, dists)
+        # Add nugget term for numerical stability / noise 
+        return cov_matrix + tf.eye(cov_matrix.shape[0], dtype=self.dists_dtype) * tf.cast(self.eps + gp_nugget, dtype=self.dists_dtype)
+    
+    @tf.function
+    def _kernel_output(self, gp_lengthscale, gp_variance, dists):
         gp_variance = tf.cast(gp_variance, dtype=self.dists_dtype)
         gp_lengthscale = tf.cast(gp_lengthscale, dtype=self.dists_dtype)
 
@@ -126,9 +132,8 @@ class GPdists():
             cov_matrix = tf.square(gp_variance) * tf.exp(-dists / gp_lengthscale)
         else:
             raise ValueError("Unsupported kernel: {}".format(self.kernel))
-        # Add nugget term for numerical stability
-        return cov_matrix + tf.eye(cov_matrix.shape[0], dtype=self.dists_dtype) * tf.cast(self.eps + gp_nugget, dtype=self.dists_dtype)
-
+        return cov_matrix
+    
     def set_log_prob(self):
         """
         Set the log probability method based on whether parameters are fixed and the chosen method.
@@ -207,6 +212,66 @@ class GPdists():
         # Gather distances for the selected inducing points
         inducing_dists = tf.gather(tf.gather(self.dists, inducing_indices, axis=0), inducing_indices, axis=1)
         return inducing_indices, inducing_dists
+    
+
+    # ****************** PREDICTION ********************
+    def _return_sigma_for_pred(self, **kwargs):
+        '''
+        '''
+        gp_lengthscale = kwargs.pop('gp_lengthscale')
+        gp_variance = kwargs.pop('gp_variance')
+        gp_nugget = kwargs.pop('gp_nugget', 0.0)
+        dists = kwargs.pop('dists', None)
+        if dists is None:
+            dists = self.dists
+        # If dists is symetric - use standard method
+        if dists.shape[0] == dists.shape[1] and tf.reduce_all(tf.equal(dists, tf.transpose(dists))):
+            return self.return_sigma(gp_lengthscale, gp_variance, gp_nugget, dists=dists) 
+        else:
+            # If dists is not symmetric - need the kernel output (avoid the 'eye' )
+            return self._kernel_output(gp_lengthscale, gp_variance, dists)
+
+    def _predict(self, **kwargs):
+        par = kwargs.pop('par', None)
+        assert par is not None, "Parameter must be provided for prediction."
+        Xs = kwargs.pop('Xs', None)
+        dists = kwargs.pop('dists', None)
+        if (dists is None) & (Xs is not None):
+            dists = pairwise_euclidean_distance(Xs, Xs)
+        if dists is None:
+            dists = self.dists # [N X N]
+        dists_new = kwargs.pop('dists_new', None) # [M X M]
+        dists_old_new = kwargs.pop('dists_old_new', None) # [N X M]
+        if dists_new is None and dists_old_new is None:
+            assert Xs is not None, "Xs must be provided if dists_new or dists_old_new are not specified."
+            Xs_new = kwargs.pop('Xs_new', None)
+            assert Xs_new is not None, "Xs_new must be provided if dists_new or dists_old_new are not specified."
+            dists_new = pairwise_euclidean_distance(Xs_new,Xs_new)
+            dists_old_new = pairwise_euclidean_distance(Xs, Xs_new)
+            print(dists_old_new.shape)
+        
+        K = self.return_sigma(dists= dists,**kwargs).numpy()
+        K_s = self._return_sigma_for_pred(dists= dists_old_new, **kwargs).numpy()
+        K_ss = self._return_sigma_for_pred(dists=dists_new, **kwargs).numpy()
+        
+        # 2. Compute inverse of K (for stability you could use cholesky + solve)
+        L = np.linalg.cholesky(K)           # K = L Lᵀ        
+        # Solve for alpha = K^{-1} z via two triangular solves:
+        alpha = np.linalg.solve(L.T, np.linalg.solve(L, par))
+
+        # 3. Predictive mean: K_sᵀ α
+        z_mean = K_s.T @ alpha                 # shape (m,)
+
+        # 4. Predictive variance:
+        #    v = solve(L, K_s)   so that vᵀ v = K_sᵀ K^{-1} K_s
+        v = np.linalg.solve(L, K_s)
+        cov_new = K_ss - v.T @ v               # shape (m, m)
+        # numerical errors can make cov_new slightly non-PSD → clip
+        z_var = np.clip(np.diag(cov_new), 0, None)
+        z_std = np.sqrt(z_var)
+
+        return z_mean, z_std
+
 
 class GPdistsM():
     def __init__(self, n_vx, **kwargs):
@@ -1224,3 +1289,24 @@ def compute_euclidean_distance_matrix(X, eps=1e-6):
     #    Adding eps inside the square root ensures numerical stability (avoiding sqrt(0) issues).
     D_euc = tf.sqrt(tf.reduce_sum(tf.square(diff), axis=-1) + eps)
     return D_euc
+
+def pairwise_euclidean_distance(X1,X2):
+    """
+    Computes the pairwise Euclidean distance matrix 
+    
+    Args:
+        X1: A [n x d] tensor of embedded coordinates.
+        X2: A [m x d] tensor of embedded coordinates.
+        eps: A small number for numerical stability.
+        
+    Returns:
+        A [n x m] tensor of Euclidean distances.
+    """
+    # 1. Expand dimensions of X for broadcasting:
+    X1_expanded = X1[:,None, :]
+    X2_expanded = X2[None, :, :]
+    # 2. Compute pairwise differences:
+    diff = X1_expanded - X2_expanded
+    # 3. Compute the Euclidean distance matrix:
+    D_euc = np.sqrt(np.sum(diff**2, axis=-1))
+    return D_euc 
