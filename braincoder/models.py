@@ -22,6 +22,10 @@ class EncodingModel(object):
                  weights=None, omega=None, verbosity=logging.INFO):
 
         if paradigm is not None:
+
+            if paradigm.ndim == 1:
+                paradigm = paradigm[:, np.newaxis]
+
             self.stimulus = self._get_stimulus(n_dimensions=paradigm.shape[1])
             self.paradigm = self.stimulus.clean_paradigm(paradigm)
         else:
@@ -78,7 +82,9 @@ class EncodingModel(object):
         else:
             return pd.DataFrame(predictions.numpy(), index=paradigm.index, columns=weights.columns)
 
-    def simulate(self, paradigm=None, parameters=None, weights=None, noise=1.):
+    def simulate(self, paradigm=None, parameters=None, weights=None, noise=1.,
+                dof=None,
+                n_repeats=1):
 
         weights, weights_ = self._get_weights(weights)
         paradigm = self.get_paradigm(paradigm)
@@ -91,23 +97,32 @@ class EncodingModel(object):
 
         parameters = self._get_parameters(parameters)
 
-        if np.isscalar(noise):
-            simulated_data = self._simulate(
-                self.stimulus._generate_stimulus(paradigm_)[np.newaxis, ...],
-                parameters.values[np.newaxis, ...],
-                weights_, noise).numpy()[0]
+        stimulus = self.stimulus._generate_stimulus(paradigm_) 
+
+        stimulus = np.repeat(stimulus[np.newaxis, ...], n_repeats, axis=0)
+
+        # if np.isscalar(noise):
+        simulated_data = self._simulate(
+            stimulus,
+            parameters.values[np.newaxis, ...],
+            weights_, noise, dof).numpy()
+
+
+        # Collapse the first two dimensions
+        simulated_data = np.reshape(simulated_data, (n_repeats*paradigm.shape[0], simulated_data.shape[2]))
+
+        if n_repeats == 1:
+            index = pd.Index(paradigm.index, name='stimulus')
         else:
-            assert(noise.ndim == 2), 'noise should be either a scalar or a square covariance matrix'
-            pred = self.predict(paradigm, parameters, weights)
-            noise = ss.multivariate_normal(np.zeros(pred.shape[1]), cov=noise).rvs(len(pred)).astype(np.float32)
-            simulated_data = pred + noise
+            # index = pd.MultiIndex.from_product([paradigm.index, np.arange(n_repeats)], names=['stimulus', 'repeat'])
+            index = pd.MultiIndex.from_product([np.arange(n_repeats), paradigm.index], names=['repeat', 'stimulus'])
 
         if weights is None:
-            return pd.DataFrame(simulated_data, index=paradigm.index, columns=parameters.index)
+            return pd.DataFrame(simulated_data, index=index, columns=parameters.index)
         else:
-            return pd.DataFrame(simulated_data, index=paradigm.index, columns=weights.columns)
+            return pd.DataFrame(simulated_data, index=index, columns=weights.columns)
 
-    def _simulate(self, paradigm, parameters, weights, noise=1.):
+    def _simulate(self, paradigm, parameters, weights, noise=1., dof=None):
 
         n_batches = paradigm.shape[0]
         n_timepoints = paradigm.shape[1]
@@ -117,11 +132,26 @@ class EncodingModel(object):
         else:
             n_voxels = weights.shape[2]
 
-        noise = tf.random.normal(shape=(n_batches, n_timepoints, n_voxels),
-                                 mean=0.0,
-                                 stddev=noise,
-                                 dtype=tf.float32)
+        if dof is None:
+            if tf.experimental.numpy.isscalar(noise):
+                noise = tf.random.normal(shape=(n_batches, n_timepoints, n_voxels),
+                                        mean=0.0,
+                                        stddev=noise,
+                                        dtype=tf.float32)
+            else:
+                noise = noise.astype(np.float32)
+                mvn = tfd.MultivariateNormalTriL(tf.zeros(n_voxels, dtype=np.float32),  tf.linalg.cholesky(noise))
+                noise = mvn.sample((n_batches, n_timepoints))
+        else:
+            if tf.experimental.numpy.isscalar(noise):
+                dist = tfd.StudentT(df=dof, loc=0.0, scale=noise)
+                noise = dist.sample((n_batches, n_timepoints, n_voxels))
+            else:
+                noise = noise.astype(np.float32)
+                mvn = tfd.MultivariateStudentTLinearOperator(df=dof, loc=tf.zeros(n_voxels, dtype=np.float32), scale=tf.linalg.LinearOperatorLowerTriangular(noise))
+                noise = mvn.sample((n_batches, n_timepoints))
 
+        print(noise.shape)
         return self._predict(paradigm, parameters, weights) + noise
 
     def _gradient(self, stimuli, parameters):
@@ -1797,29 +1827,9 @@ class DifferenceOfGaussiansPRF2D(GaussianPRF2D):
     # srf factor is limited to be above 1
     parameter_labels = ['x', 'y', 'sd', 'baseline',
                         'amplitude', 'srf_amplitude', 'srf_size']
-    @tf.function
-    def _transform_parameters_forward(self, parameters):
-        return tf.concat([parameters[:, 0][:, tf.newaxis],
-                          parameters[:, 1][:, tf.newaxis],
-                          tf.math.softplus(parameters[:, 2][:, tf.newaxis]),
-                          parameters[:, 3][:, tf.newaxis],
-                          tf.math.softplus(parameters[:, 4][:, tf.newaxis]),
-                          tf.math.softplus(parameters[:, 5][:, tf.newaxis]),
-                          tf.math.softplus(parameters[:, 6][:, tf.newaxis]) + 1], axis=1)
 
-    @tf.function
-    def _transform_parameters_backward(self, parameters):
-        return tf.concat([parameters[:, 0][:, tf.newaxis],
-                          parameters[:, 1][:, tf.newaxis],
-                          tfp.math.softplus_inverse(
-                              parameters[:, 2][:, tf.newaxis]),
-                          parameters[:, 3][:, tf.newaxis],
-                          tfp.math.softplus_inverse(
-                              parameters[:, 4][:, tf.newaxis]),
-                          tfp.math.softplus_inverse(
-                              parameters[:, 5][:, tf.newaxis]),
-                          tfp.math.softplus_inverse(parameters[:, 6][:, tf.newaxis] - 1)], axis=1)
-
+    transformations = ['identity', 'identity', 'softplus', 'identity',
+                       'softplus', 'softplus', 'softplus']
     @tf.function
     def _get_rf(self, grid_coordinates, parameters):
 
