@@ -2398,6 +2398,32 @@ class ContrastSensitivity(EncodingModel):
     # def unpack_stimulus(self, stimulus):
     #     return np.reshape(stimulus, (-1, self.n_x, self.n_y))    
     
+class ContrastSensitivitySigmoid(ContrastSensitivity):
+    """
+    Inherits from ContrastSensitivity but uses a sigmoid function for the CRF
+    instead of the Naka-Rushton (Naka-Rushton) formulation.
+    """
+    def _apply_crf(self, stim_sequence, parameters, csf):
+        # stim_sequence: [n_samples, 2] with columns [SF, CON]
+        # parameters: [n_batches, n_populations, n_params]
+        # csf: contrast sensitivity filter
+        # Extract contrast (second column) and reshape for broadcasting
+        CON_seq = stim_sequence[:, 1][tf.newaxis, tf.newaxis, :]
+
+        # Sigmoid slope (crf_exp) and scale (amplitude) from parameters
+        crf_exp = parameters[:, :, 4, tf.newaxis]
+        amplitude = parameters[:, :, 5, tf.newaxis]
+        baseline = parameters[:, :, 6, tf.newaxis]
+
+        # Contrast threshold (midpoint of sigmoid)
+        cthresh = 100 / tf.clip_by_value(csf, 1e-1, 1e6)
+
+        # Sigmoid-based response: amplitude * sigmoid(slope * (contrast - threshold)) + baseline
+        sigmoid_input = crf_exp * (CON_seq - cthresh)
+        ncsf_resp = amplitude * tf.math.sigmoid(sigmoid_input) + baseline
+        return ncsf_resp
+
+
 
 class ContrastSensitivityWithHRF(HRFEncodingModel, ContrastSensitivity):
     def __init__(
