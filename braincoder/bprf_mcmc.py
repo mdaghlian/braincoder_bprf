@@ -32,7 +32,7 @@ class BPRF(object):
         self.n_model_params = len(self.model_labels) # length of model parameters only... 
         self.include_jacobian = kwargs.get('include_jacobian', True)  # Include the jacobian in the model?
         # We can also fit noise -> 
-        self.noise_method = kwargs.get('noise_method', 'fit_tdist')  # 'fit_normal' 'none'
+        self.noise_method = kwargs.get('noise_method', 'fit_normal')  # 'fit_normal' 'none'
         print(self.noise_method)
         assert self.noise_method in ('fit_tdist', 'fit_normal', 'none') 
         if self.noise_method=='fit_tdist':

@@ -2326,7 +2326,7 @@ class ContrastSensitivity(EncodingModel):
     def _transform_parameters_forward(self, parameters):
         # Loop through parameters & bijectors (forward)
         p_out = []
-        for i,p in enumerate(self.parameter_labels):
+        for i,p in enumerate(self.p_bijector.keys()): #parameter_labels):
             p_out.append(
                 self.p_bijector[p].forward(
                     parameters[:, i][:, tf.newaxis]
@@ -2337,7 +2337,7 @@ class ContrastSensitivity(EncodingModel):
     def _transform_parameters_backward(self, parameters):
         # Loop through parameters & bijectors (forward)
         p_out = []
-        for i,p in enumerate(self.parameter_labels):
+        for i,p in enumerate(self.p_bijector.keys()): #parameter_labels):
             p_out.append(
                 self.p_bijector[p].inverse(
                     parameters[:, i][:, tf.newaxis]
