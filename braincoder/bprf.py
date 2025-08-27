@@ -63,14 +63,6 @@ class BPRF(object):
         # MAP 
         self.MAP_parameters = [None] * self.data.shape[1]
         
-        # Used to select a sub set of vx to sample...
-        # 2-element seed for stateless RNG; will be incremented each call
-        self._seed = tf.Variable([0, 0], dtype=tf.int32, trainable=False)        
-        self.dists         = kwargs.get('dists', None)
-        if self.dists is not None:
-            self.dists = tf.convert_to_tensor(self.dists, dtype=tf.float32)
-        self._dists_idx = None
-
     def add_prior(self, pid, prior_type, **kwargs):
         ''' 
         Adds the prior to each parameter:
@@ -158,9 +150,6 @@ class BPRF(object):
         '''        
         # Ok lets map everything so we can fix some parameters
         # Are there any parameters to fix? 
-        if self.dists is not None:  
-            # If we are using "close" for inducer selection...      
-            self._dists_idx = tf.gather(tf.gather(self.dists, self.idx_to_fit, axis=0), self.idx_to_fit, axis=1)
 
         if (len(self.fixed_pars) != 0):
             k_check = list(self.fixed_pars.keys())
@@ -474,40 +463,6 @@ class BPRF(object):
         self.MAP_parameters = pd.concat(df_list).reindex(idx)
         print('MAP optimization finished.')    
 
-    @tf.function
-    def _return_inducing_idx(self, n_inducers):
-        if self.n_inducers is None:
-            # Return all indices if no inducing points are specified
-            return tf.range(self.n_vx_to_fit, dtype=tf.int32)
-        # increment the seed each call - necessary because otherwise when graph is drawn it doesn't change...
-        new_seed = self._seed.assign_add([1, 1])
-        # FOR DEBUGGING -> PRINT IT
-        # 2) print it for debugging
-        # tf.print("debug — new_seed:", new_seed)        
-        if self.inducer_selection == 'random':
-            # Randomly select indices for inducing points
-            inducing_indices = tf.random.experimental.stateless_shuffle(
-                tf.range(self.n_vx_to_fit),
-                seed=new_seed)[:n_inducers]
-            inducing_indices = tf.sort(inducing_indices)  # Keep them sorted for easier indexing
-
-        elif self.inducer_selection == 'close':
-            # centre_idx = np.random.randint(0, self.n_vx)
-            centre_idx = tf.random.stateless_uniform(
-                shape=[],
-                minval=0,
-                maxval=self.n_vx_to_fit,
-                dtype=tf.int32,
-                seed=new_seed
-            )
-            # Get the indices of the closest n_inducers points
-            _, inducing_indices = tf.math.top_k(-self._dists_idx[centre_idx, :], k=n_inducers)
-            inducing_indices = tf.sort(inducing_indices)  # Keep sorted
-
-        else:
-            raise ValueError(f"Unknown inducer selection method: {self.inducer_selection}")
-        
-        return inducing_indices
     def _create_log_prior_fn(self):
         @tf.function
         def log_prior_fn(parameters):
