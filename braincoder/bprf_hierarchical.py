@@ -20,8 +20,6 @@ class BPRF_hier(BPRF):
         Set up and run "bayesian" pRF analysis. This class contains:
         * model + stimulus/paradigm (from .models, used to generate predictions)
         * prior definitions (per parameter)        
-
-
         '''    
         super().__init__(model, data, **kwargs)
         # Do we want to fit our priors? 
@@ -39,9 +37,8 @@ class BPRF_hier(BPRF):
         # MAP
         self.h_MAP_parameters = None
         self._original_gp = None
-
                 
-    def h_add_param(self, pid, h_prior_to_apply='normal', **kwargs):
+    def h_add_param(self, pid, h_prior_to_apply, **kwargs):
         ''' Add the parameters for the hierarchical priors
         i.e., fit the prior across all vertices
 
@@ -67,77 +64,11 @@ class BPRF_hier(BPRF):
             # [3] add the priors for the new parameters
             # ... none for now...
             self.h_add_prior(pid=f'{pid}_loc', prior_type='none', **kwargs)
-            self.h_add_prior(pid=f'{pid}_scale', prior_type='none', **kwargs)
-        elif h_prior_to_apply=='gp_dists':
-            # Gaussian process based on geodesic distance
-            # -> Gaussian process generates a covariance matrix
-            self.h_labels[f'{pid}_gp_lengthscale'] = len(self.h_labels) 
-            self.h_labels[f'{pid}_gp_variance'] = len(self.h_labels)
-            self.h_gp_function[pid] = GPdists(
-                dists=kwargs.pop('dists'),
-                **kwargs
-            )
-
-            self.h_add_bijector(pid=f'{pid}_gp_lengthscale', bijector_type=tfb.Softplus())
-            self.h_add_bijector(pid=f'{pid}_gp_variance', bijector_type=tfb.Softplus())
-
-            # self.h_add_bijector(pid=f'{pid}_gp_lengthscale', bijector_type=tfb.Exp())
-            # self.h_add_bijector(pid=f'{pid}_gp_variance', bijector_type=tfb.Exp())
-
-            # [3] add the priors for the new parameters - make them very broad...
-            self.h_add_prior(
-                pid=f'{pid}_gp_lengthscale', 
-                prior_type='HalfNormal', 
-                distribution=tfd.HalfNormal(scale=100)
-                )
-            self.h_add_prior(
-                pid=f'{pid}_gp_variance', 
-                prior_type='HalfNormal', 
-                distribution=tfd.HalfNormal(scale=100)
-                )
+            self.h_add_prior(pid=f'{pid}_scale', prior_type='none', **kwargs)              
         
-        elif h_prior_to_apply=='gp_dists_full':
-            # Gaussian process based on geodesic distance
-            # include mean + nugget
-            # -> Gaussian process generates a covariance matrix
-            self.h_labels[f'{pid}_gp_lengthscale'] = len(self.h_labels) 
-            self.h_labels[f'{pid}_gp_variance'] = len(self.h_labels)
-            self.h_labels[f'{pid}_gp_mean'] = len(self.h_labels)
-            self.h_labels[f'{pid}_gp_nugget'] = len(self.h_labels)
-            self.h_gp_function[pid] = GPdists(
-                dists=kwargs.pop('dists'),
-                **kwargs
-            )
-            self.h_add_bijector(pid=f'{pid}_gp_lengthscale', bijector_type=tfb.Softplus())
-            self.h_add_bijector(pid=f'{pid}_gp_variance', bijector_type=tfb.Softplus())
-            self.h_add_bijector(pid=f'{pid}_gp_mean', bijector_type=tfb.Identity())
-            self.h_add_bijector(pid=f'{pid}_gp_nugget', bijector_type=tfb.Softplus())
-
-            # [3] add the priors for the new parameters
-            self.h_add_prior(
-                pid=f'{pid}_gp_lengthscale', 
-                prior_type='HalfNormal', 
-                distribution=tfd.HalfNormal(scale=20)
-                )
-            self.h_add_prior(
-                pid=f'{pid}_gp_variance', 
-                prior_type='HalfNormal', 
-                distribution=tfd.HalfNormal(scale=10)
-                )
-            self.h_add_prior(
-                pid=f'{pid}_gp_nugget', 
-                prior_type='HalfNormal', 
-                distribution=tfd.HalfNormal(scale=5)
-                )
-            self.h_add_prior(
-                pid=f'{pid}_gp_mean', 
-                prior_type='none', 
-                )                
-        elif h_prior_to_apply=='gp_dists_m':
-            # Gaussian process based on geodesic distance
-            # include... everything
-            # Need to have premade the GPDistsM object 
-            self.h_gp_function[pid] = kwargs.pop('gp_obj')
+        elif h_prior_to_apply=='gp':
+            # Gaussian process 
+            self.h_gp_function[pid] = kwargs.pop('gp')
             current_n_labels = len(self.h_labels)
             new_h_labels = []
             for k in self.h_gp_function[pid].pids_inv.keys():
