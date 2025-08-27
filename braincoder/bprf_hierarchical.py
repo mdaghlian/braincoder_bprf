@@ -6,8 +6,8 @@ import tensorflow_probability as tfp
 from tensorflow_probability import distributions as tfd
 from tensorflow_probability import bijectors as tfb
 
-from .bprf_mcmc import *
-from .bprf_mcmc_GPs import *
+from .bprf import *
+from .bprf_GPs import *
 
 import copy
 class BPRF_hier(BPRF):

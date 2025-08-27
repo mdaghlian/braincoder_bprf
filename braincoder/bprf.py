@@ -1,13 +1,11 @@
 import pandas as pd
 import numpy as np
-from .utils import format_data, format_paradigm, get_rsq, calculate_log_prob_t, calculate_log_prob_gauss_loc0, format_parameters
+from .utils import format_data, format_paradigm, get_rsq
 import tensorflow as tf
 import tensorflow_probability as tfp
 from tensorflow_probability import distributions as tfd
 from tensorflow_probability import bijectors as tfb
 from tqdm import tqdm
-import math
-from timeit import default_timer as timer
 import copy
 
 class BPRF(object):
@@ -20,8 +18,6 @@ class BPRF(object):
         Set up and run "bayesian" pRF analysis. This class contains:
         * model + stimulus/paradigm (from .models, used to generate predictions)
         * prior definitions (per parameter)        
-
-
         '''    
         self.model = copy.deepcopy(model)
         self.data = data.astype(np.float32)
@@ -33,7 +29,6 @@ class BPRF(object):
         self.include_jacobian = kwargs.get('include_jacobian', True)  # Include the jacobian in the model?
         # We can also fit noise -> 
         self.noise_method = kwargs.get('noise_method', 'fit_normal')  # 'fit_normal' 'none'
-        print(self.noise_method)
         assert self.noise_method in ('fit_tdist', 'fit_normal', 'none') 
         if self.noise_method=='fit_tdist':
             # Fit the t-distribution including dof, scale 
@@ -104,12 +99,9 @@ class BPRF(object):
         elif prior_type=='fixed':
             fixed_val = kwargs.get('fixed_val')
             self.p_prior[pid] = PriorFixed(fixed_val)
-        elif prior_type == 'gp_dists':
-            dists = kwargs.pop('dists')
-            fixed_params = kwargs.pop('fixed_params', 'fixed_all')
-            self.p_prior[pid] = GPdists(dists, fixed_params=fixed_params, **kwargs)
-        elif prior_type == 'gp_dists_m':
-            self.p_prior[pid] = kwargs.pop('gp_obj')
+        elif prior_type == 'gp':
+            gp = kwargs.pop('gp')
+            self.p_prior[pid] = gp
         else:
             self.p_prior[pid] = PriorGeneral(prior_type=prior_type, distribution=kwargs.get('distribution'))
     
@@ -132,13 +124,6 @@ class BPRF(object):
                     prior_type = 'fixed',
                     fixed_val = bounds[p][0],
                     )    
-            
-    
-    def sample_from_priors(self, n):
-        samples = []
-        for p in self.model_labels:
-            samples.append(self.p_prior[p].sampler(n))
-        return tf.stack(samples, axis=-1)
     
     def add_bijector(self, pid, bijector_type, **kwargs):
         ''' add transformations to parameters so that they are fit smoothly        
