@@ -178,10 +178,10 @@ class BPRF(object):
                 # Create the update values: a vector of length n_vx_to_fit with the fixed value.
                 updates_list.append(tf.convert_to_tensor(fix_value, dtype=tf.float32))
             # Concatenate all the indices and updates from each parameter fix.
-            self.fix_update_index = tf.concat(indices_list, axis=0)  # shape: [num_updates, 2]
-            self.fix_update_value = tf.concat(updates_list, axis=0)    # shape: [num_updates]            
+            fix_update_index = tf.concat(indices_list, axis=0)  # shape: [num_updates, 2]
+            fix_update_value = tf.concat(updates_list, axis=0)    # shape: [num_updates]            
             # Define the update function
-            self.fix_update_fn = FixUdateFn(self.fix_update_index, self.fix_update_value).update_fn             
+            self.fix_update_fn = FixUdateFn(fix_update_index, fix_update_value).update_fn             
 
             # Also ensure that priors & bijectors are correct
             for p in self.fixed_pars.keys():

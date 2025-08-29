@@ -562,7 +562,7 @@ class BPRF_hier(BPRF):
             f_parameters = self._bprf_transform_parameters_forward(f_parameters_unc)
             f_h_parameters = self._h_bprf_transform_parameters_forward(f_h_parameters_unc)
 
-            # [5] Compute the priors -> only passing inducing indices for the GP (is being used)
+            # [5] Compute the priors 
             log_prior = log_prior_fn(f_parameters, f_h_parameters)            
 
             # [6] Compute the log likelihood
@@ -676,7 +676,7 @@ class BPRF_hier(BPRF):
             for i,p in enumerate(self.model_labels):
                 estimated_p_dict[p] = p_opt_vars[i][ivx_loc]
             for p,v in self.fixed_pars.items():
-                estimated_p_dict[p] = estimated_p_dict[p]*0 + v[ivx_loc]
+                estimated_p_dict[p] = estimated_p_dict[p]*0 + v[ivx_fit]
             
             df = pd.DataFrame(estimated_p_dict, index=[ivx_fit]) # use map_sampler instead of mcmc_sampler
             df_list.append(df)
@@ -693,7 +693,7 @@ class BPRF_hier(BPRF):
     
     def _create_log_prior_fn(self):
         @tf.function
-        def log_prior_fn(parameters, h_parameters, inducing_indices):
+        def log_prior_fn(parameters, h_parameters):
             # Log-prior function for the model
             p_out = 0.0      
             for p in self.priors_to_loop:

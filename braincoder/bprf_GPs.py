@@ -45,8 +45,7 @@ class GP():
         self.pids = {}
         # Index of parameters to be passed...
         self.pids[0] = 'gpk_nugget' # Global nugget term
-        self.pids[1] = 'gpk_var'    # Global variance term
-        self.pids[2] = 'mfunc_mean' # Global mean term 
+        self.pids[1] = 'mfunc_mean' # Global mean term 
         self.pids_inv = {}
         self._update_pids_inv()
         self.return_log_prob = self._return_log_prob_unfixed # by default, return log prob unfixed...
@@ -192,9 +191,8 @@ class GP():
                 kernel_type=self.kernel_type[s]
             )
         
-        s_out *= tf.cast(kwargs['gpk_var'], dtype=self.gp_dtype)
         # Add the nugget term
-        s_out += tf.eye(self.n_vx, dtype=self.gp_dtype) * tf.cast(self.eps + kwargs[f'gpk_nugget'], dtype=self.gp_dtype)
+        s_out += tf.linalg.diag(tf.ones(self.n_vx, dtype=self.gp_dtype)) * tf.cast(self.eps + kwargs[f'gpk_nugget'], dtype=self.gp_dtype)
         return s_out        
         
     @tf.function
@@ -240,7 +238,7 @@ class GP():
     def set_log_prob_fixed(self,**kwargs):
         # Create a one off covariance matrix -> then use it to get probability each time...
         # Get cov matrix
-        self.cov_matrix = self._return_sigma(**kwargs)
+        self.cov_matrix = self._return_sigma_full(**kwargs)
         self.chol = tf.linalg.cholesky(tf.cast(self.cov_matrix, dtype=self.gp_dtype))
         # Get mean vector
         self.m_vect = self._return_mfunc(**kwargs)
@@ -252,14 +250,14 @@ class GP():
             allow_nan_stats=False,
         )
         self.return_log_prob = self._return_log_prob_fixed
+        
     @tf.function
     def _return_log_prob_nystrom(self, parameter, **kwargs):
         ''' Return the log probability using nystrom approximation
         '''
-        gpk_var = tf.cast(kwargs['gpk_var'], dtype=self.gp_dtype)
         gpk_nugget = tf.cast(kwargs['gpk_nugget'], dtype=self.gp_dtype)        
         m_vect = self._return_mfunc(**kwargs)        
-        parameter_dm = parameter - m_vect # remove mean function from parameter
+        parameter_dm = tf.cast(parameter - m_vect, self.gp_dtype) # remove mean function from parameter
 
         K_mm = tf.zeros((self.n_inducers,self.n_inducers), dtype=self.gp_dtype)
         K_nm = tf.zeros((self.n_vx,self.n_inducers), dtype=self.gp_dtype)
@@ -289,8 +287,6 @@ class GP():
                 dXs=tf.gather(self.dXs[s], self.inducer_idx, axis=1),
                 kernel_type=self.kernel_type[s]
             )
-        K_mm *= gpk_var
-        K_nm *= gpk_var
 
         # Add small jitter to K_mm for PD-ness
         K_mm += tf.cast(self.eps, self.gp_dtype) * tf.eye(self.n_inducers, dtype=self.gp_dtype)
@@ -329,7 +325,7 @@ class GP():
         log2pi = tf.math.log(2.0 * tf.constant(np.pi, dtype=self.gp_dtype))
         log_prob = -0.5 * (tf.cast(self.n_vx, self.gp_dtype) * log2pi + logdet_sigma + quad)
 
-        return tf.reshape(log_prob, [])  # scalar tensor
+        return tf.cast(tf.reshape(log_prob, []), tf.float32)  # scalar tensor
 
     @tf.function
     def _return_log_prob_unfixed(self, parameter, **kwargs):
