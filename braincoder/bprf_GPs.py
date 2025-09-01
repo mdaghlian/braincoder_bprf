@@ -34,6 +34,7 @@ class GP():
 
         self.stat_kernel_list = []
         self.lin_kernel_list = []
+        self.warp_kernel_list = []
         self.mfunc_list = []
         self.mfunc_bijector = tfb.Identity()
         self.Xs = {}
@@ -49,7 +50,7 @@ class GP():
         self.pids_inv = {}
         self._update_pids_inv()
         self.return_log_prob = self._return_log_prob_unfixed # by default, return log prob unfixed...
-        self.gp_prior_dist = []
+        self.gp_prior_dist = None
 
     def _update_pids_inv(self):
         self.pids_inv = {}
@@ -84,7 +85,7 @@ class GP():
         # then add any regressors...
         for m in self.mfunc_list:
             slopes = tf.stack([kwargs[f'mfunc{m}_slope{i}'] for i in range(self.Xs[m].shape[1])], axis=0)  # [D]
-            m_out += tf.reduce_sum(tf.cast(slopes, dtype=self.gp_dtype) * tf.transpose(self.Xs), axis=0) 
+            m_out += tf.reduce_sum(tf.cast(slopes, dtype=self.gp_dtype) * tf.transpose(self.Xs[m]), axis=0) 
         return self.mfunc_bijector(tf.cast(m_out, dtype=tf.float32))
     
     def add_mfunc_bijector(self, bijector_type, **kwargs):
@@ -138,21 +139,31 @@ class GP():
         # Update the inverse dictionary
         self._update_pids_inv()        
     
-    # -> add Linear kernels
-    def add_xid_linear_kernel(self, xid, **kwargs):
-        ''' add a kernel
-        '''
-        Xs = kwargs.get('Xs', None)
-        self.kernel_type[xid] = 'linear'
-        self.lin_kernel_list.append(xid)
+    # # -> add Linear kernels
+    # def add_xid_linear_kernel(self, xid, **kwargs):
+    #     ''' add a kernel
+    #     '''
+    #     Xs = kwargs.get('Xs', None)
+    #     self.kernel_type[xid] = 'linear'
+    #     self.lin_kernel_list.append(xid)
         
-        self.Xs[xid] = tf.expand_dims(tf.convert_to_tensor(Xs, dtype=self.gp_dtype), axis=1)
-        # Add a lengthscale & a variance
-        self.pids[len(self.pids)] = f'gpk{xid}_slope'
-        self.pids[len(self.pids)] = f'gpk{xid}_const'
+    #     self.Xs[xid] = tf.expand_dims(tf.convert_to_tensor(Xs, dtype=self.gp_dtype), axis=1)
+    #     # Add a lengthscale & a variance
+    #     self.pids[len(self.pids)] = f'gpk{xid}_slope'
+    #     self.pids[len(self.pids)] = f'gpk{xid}_const'
 
-        # Update the inverse dictionary
-        self._update_pids_inv()               
+    #     # Update the inverse dictionary
+    #     self._update_pids_inv()    
+    
+    def add_xid_warp_kernel(self, xid, Xs, **kwargs):
+        self.Xs[xid] = tf.convert_to_tensor(Xs, dtype=self.gp_dtype)
+        self.pids[len(self.pids)] = f'gpk{xid}_v'
+        # Distance for RBF type kernel comes from warped LBO
+        for i in range(self.Xs[xid].shape[1]):
+            self.pids[len(self.pids)] = f'gpk{xid}_w{i}' 
+        self.warp_kernel_list.append(xid)
+        self._update_pids_inv()
+                        
 
     def add_nystrom_approximation(self, n_inducers, inducer_idx=None):
         ''' Use nystrom approximation to speed up the GP
@@ -182,19 +193,43 @@ class GP():
                 Xs=self.Xs[s],
             )
         
-        # Add in any stationary kernels (e.g., RBF)
-        for s in self.stat_kernel_list:
-            s_out += self._return_sigma_xid_stationary(
-                gpk_l=kwargs[f'gpk{s}_l'],
-                gpk_v=kwargs[f'gpk{s}_v'],
-                dXs=self.dXs[s],
-                kernel_type=self.kernel_type[s]
+        # # Add in any stationary kernels (e.g., RBF)
+        # for s in self.stat_kernel_list:
+        #     s_out += self._return_sigma_xid_stationary(
+        #         gpk_l=kwargs[f'gpk{s}_l'],
+        #         gpk_v=kwargs[f'gpk{s}_v'],
+        #         dXs=self.dXs[s],
+        #         kernel_type=self.kernel_type[s]
+        #     )
+        for s in self.warp_kernel_list:
+            s_kernel_type = s.split('_')[-1]
+            dXs = self._return_warp_dXs(
+                s, **kwargs,
             )
-        
+            s_out += self._return_sigma_xid_stationary(
+                gpk_l=1.0,
+                gpk_v=kwargs[f'gpk{s}_v'],
+                dXs=dXs,
+                kernel_type=s_kernel_type
+            )            
         # Add the nugget term
         s_out += tf.linalg.diag(tf.ones(self.n_vx, dtype=self.gp_dtype)) * tf.cast(self.eps + kwargs[f'gpk_nugget'], dtype=self.gp_dtype)
         return s_out        
-        
+    
+    @tf.function
+    def _return_warp_dXs(self, xid, **kwargs):
+        # [1] Weighted sum of eigenvectors (LBOwarp)
+        wX = tf.stack(
+            [kwargs[f"gpk{xid}_w{i}"] for i in range(self.Xs[xid].shape[1])],
+            axis=0
+        )
+        wX = tf.cast(wX, dtype=self.gp_dtype)
+        # Warped distances
+        warp_X = tf.matmul(self.Xs[xid], wX) # [N, 1]
+        warp_X = tf.squeeze(warp_X, axis=-1) # [N,]            
+        warp_dXs = compute_euclidean_distance_matrix(warp_X[...,tf.newaxis])                
+        return warp_dXs 
+    
     @tf.function
     def _return_sigma_xid_stationary(self, gpk_l, gpk_v, dXs, kernel_type):
         """
@@ -220,20 +255,20 @@ class GP():
             frac2 = (5.0 * tf.square(dXs)) / (3.0 * tf.square(gpk_l))
             cov_matrix = tf.square(gpk_v) * (1 + frac1 + frac2) * tf.exp(-frac1)
         elif kernel_type == 'laplace':
-            cov_matrix = tf.square(gpk_l) * tf.exp(-dXs / gpk_l)
+            cov_matrix = tf.square(gpk_v) * tf.exp(-dXs / gpk_l)
         else:
             raise ValueError("Unsupported kernel: {}".format(kernel_type))
         # Add nugget term for numerical stability
         return cov_matrix 
     
-    @tf.function
-    def _return_sigma_xid_linear(self, gpk_slope, gpk_const, Xs):
-        '''linear kernel
-        '''
-        gpk_slope = tf.cast(gpk_slope, dtype=self.gp_dtype)
-        gpk_const = tf.cast(gpk_const, dtype=self.gp_dtype)        
-        cov_matrix = gpk_slope**2 * (Xs-gpk_const) * (tf.transpose(Xs) - gpk_const)
-        return cov_matrix
+    # @tf.function
+    # def _return_sigma_xid_linear(self, gpk_slope, gpk_const, Xs):
+    #     '''linear kernel
+    #     '''
+    #     gpk_slope = tf.cast(gpk_slope, dtype=self.gp_dtype)
+    #     gpk_const = tf.cast(gpk_const, dtype=self.gp_dtype)        
+    #     cov_matrix = gpk_slope**2 * (Xs-gpk_const) * (tf.transpose(Xs) - gpk_const)
+    #     return cov_matrix
 
     def set_log_prob_fixed(self,**kwargs):
         # Create a one off covariance matrix -> then use it to get probability each time...
@@ -242,7 +277,6 @@ class GP():
         self.chol = tf.linalg.cholesky(tf.cast(self.cov_matrix, dtype=self.gp_dtype))
         # Get mean vector
         self.m_vect = self._return_mfunc(**kwargs)
-        self.prec_matrix = tf.cast(tf.linalg.inv(self.cov_matrix), dtype=tf.float32)
 
         self.gp_prior_dist = tfd.MultivariateNormalTriL(
             loc=tf.squeeze(tf.cast(self.m_vect, dtype=tf.float32)), 
@@ -262,17 +296,17 @@ class GP():
         K_mm = tf.zeros((self.n_inducers,self.n_inducers), dtype=self.gp_dtype)
         K_nm = tf.zeros((self.n_vx,self.n_inducers), dtype=self.gp_dtype)
         # Add in any linear kernels
-        for s in self.lin_kernel_list:
-            K_mm += self._return_sigma_xid_linear(
-                gpk_slope=kwargs[f'gpk{s}_slope'],
-                gpk_const=kwargs[f'gpk{s}_const'],
-                Xs=tf.gather(self.Xs[s], self.inducer_idx, axis=0),
-            )
-            K_nm += self._return_sigma_xid_linear(
-                gpk_slope=kwargs[f'gpk{s}_slope'],
-                gpk_const=kwargs[f'gpk{s}_const'],
-                Xs=self.Xs[s],
-            )[:,self.inducer_idx]
+        # for s in self.lin_kernel_list:
+        #     K_mm += self._return_sigma_xid_linear(
+        #         gpk_slope=kwargs[f'gpk{s}_slope'],
+        #         gpk_const=kwargs[f'gpk{s}_const'],
+        #         Xs=tf.gather(self.Xs[s], self.inducer_idx, axis=0),
+        #     )
+        #     K_nm += self._return_sigma_xid_linear(
+        #         gpk_slope=kwargs[f'gpk{s}_slope'],
+        #         gpk_const=kwargs[f'gpk{s}_const'],
+        #         Xs=self.Xs[s],
+        #     )
         # Add in any stationary kernels (e.g., RBF)
         for s in self.stat_kernel_list:
             K_mm += self._return_sigma_xid_stationary(
@@ -287,6 +321,23 @@ class GP():
                 dXs=tf.gather(self.dXs[s], self.inducer_idx, axis=1),
                 kernel_type=self.kernel_type[s]
             )
+        for s in self.warp_kernel_list:
+            s_kernel_type = s.split('_')[-1]
+            warp_dXs = self._return_warp_dXs(
+                s, **kwargs,
+            )
+            K_mm += self._return_sigma_xid_stationary(
+                gpk_l=1.0,
+                gpk_v=kwargs[f'gpk{s}_v'],
+                dXs=tf.gather(tf.gather(warp_dXs, self.inducer_idx, axis=0), self.inducer_idx, axis=1),
+                kernel_type=s_kernel_type
+            )               
+            K_nm += self._return_sigma_xid_stationary(
+                gpk_l=1.0,
+                gpk_v=kwargs[f'gpk{s}_v'],
+                dXs=tf.gather(warp_dXs, self.inducer_idx, axis=1),
+                kernel_type=s_kernel_type
+            )   
 
         # Add small jitter to K_mm for PD-ness
         K_mm += tf.cast(self.eps, self.gp_dtype) * tf.eye(self.n_inducers, dtype=self.gp_dtype)
@@ -295,7 +346,7 @@ class GP():
         S = tf.matmul(tf.transpose(K_nm), K_nm)
 
         # M = K_mm + (1/nugget) * S  (m,m)
-        inv_sigma = tf.math.reciprocal(gpk_nugget)
+        inv_sigma = tf.math.reciprocal(gpk_nugget+self.eps)
         M = K_mm + inv_sigma * S
 
         # Cholesky decompositions for log-determinants and solves
