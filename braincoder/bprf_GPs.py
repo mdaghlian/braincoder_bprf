@@ -293,90 +293,38 @@ class GP():
         m_vect = self._return_mfunc(**kwargs)        
         parameter_dm = tf.cast(parameter - m_vect, self.gp_dtype) # remove mean function from parameter
 
-        K_mm = tf.zeros((self.n_inducers,self.n_inducers), dtype=self.gp_dtype)
-        K_nm = tf.zeros((self.n_vx,self.n_inducers), dtype=self.gp_dtype)
-        # Add in any linear kernels
-        # for s in self.lin_kernel_list:
-        #     K_mm += self._return_sigma_xid_linear(
-        #         gpk_slope=kwargs[f'gpk{s}_slope'],
-        #         gpk_const=kwargs[f'gpk{s}_const'],
-        #         Xs=tf.gather(self.Xs[s], self.inducer_idx, axis=0),
-        #     )
-        #     K_nm += self._return_sigma_xid_linear(
-        #         gpk_slope=kwargs[f'gpk{s}_slope'],
-        #         gpk_const=kwargs[f'gpk{s}_const'],
-        #         Xs=self.Xs[s],
-        #     )
-        # Add in any stationary kernels (e.g., RBF)
-        for s in self.stat_kernel_list:
-            K_mm += self._return_sigma_xid_stationary(
-                gpk_l=kwargs[f'gpk{s}_l'],
-                gpk_v=kwargs[f'gpk{s}_v'],
-                dXs=tf.gather(tf.gather(self.dXs[s], self.inducer_idx, axis=0), self.inducer_idx, axis=1),
-                kernel_type=self.kernel_type[s]
-            )
-            K_nm += self._return_sigma_xid_stationary(
-                gpk_l=kwargs[f'gpk{s}_l'],
-                gpk_v=kwargs[f'gpk{s}_v'],
-                dXs=tf.gather(self.dXs[s], self.inducer_idx, axis=1),
-                kernel_type=self.kernel_type[s]
-            )
-        for s in self.warp_kernel_list:
-            s_kernel_type = s.split('_')[-1]
-            warp_dXs = self._return_warp_dXs(
-                s, **kwargs,
-            )
-            K_mm += self._return_sigma_xid_stationary(
-                gpk_l=1.0,
-                gpk_v=kwargs[f'gpk{s}_v'],
-                dXs=tf.gather(tf.gather(warp_dXs, self.inducer_idx, axis=0), self.inducer_idx, axis=1),
-                kernel_type=s_kernel_type
-            )               
-            K_nm += self._return_sigma_xid_stationary(
-                gpk_l=1.0,
-                gpk_v=kwargs[f'gpk{s}_v'],
-                dXs=tf.gather(warp_dXs, self.inducer_idx, axis=1),
-                kernel_type=s_kernel_type
-            )   
+        K_full = self._return_sigma_full(**kwargs) # we do the nugget later, so have to remove it here...        
+        # might change this later...
+        K_full -= tf.linalg.diag(tf.ones(self.n_vx, dtype=self.gp_dtype)) * tf.cast(self.eps + kwargs[f'gpk_nugget'], dtype=self.gp_dtype)
+        A=tf.gather(tf.gather(K_full, self.inducer_idx, axis=0), self.inducer_idx, axis=1)
+        B=tf.gather(K_full, self.inducer_idx, axis=1)
+        # Add small jitter to A for PD-ness
+        A += tf.cast(self.eps, self.gp_dtype) * tf.eye(self.n_inducers, dtype=self.gp_dtype)
 
-        # Add small jitter to K_mm for PD-ness
-        K_mm += tf.cast(self.eps, self.gp_dtype) * tf.eye(self.n_inducers, dtype=self.gp_dtype)
+        # Build S = A + (1/nugget) B^T B  (m x m)
+        BtB = tf.matmul(tf.transpose(B), B)   # (m,m)
+        S = A + (1.0 / gpk_nugget) * BtB
 
-        # S = K_nm^T K_nm  (m, m)
-        S = tf.matmul(tf.transpose(K_nm), K_nm)
+        # Cholesky S
+        Ls = tf.linalg.cholesky(S) # (m,m)
+        # Solve S x = B^T y
+        Bt_y = tf.matmul(tf.transpose(B), tf.expand_dims(parameter_dm, -1))  # (m,1)
+        x = tf.linalg.cholesky_solve(Ls, Bt_y)                       # (m,1)
 
-        # M = K_mm + (1/nugget) * S  (m,m)
-        inv_sigma = tf.math.reciprocal(gpk_nugget+self.eps)
-        M = K_mm + inv_sigma * S
-
-        # Cholesky decompositions for log-determinants and solves
-        chol_M = tf.linalg.cholesky(M)                         # (m,m)
-        chol_Kmm = tf.linalg.cholesky(K_mm)                   # (m,m)
-
-        # logdet(Sigma) = n * log(nugget) + logdet(M) - logdet(K_mm)
-        # logdet of PD matrix from cholesky: 2 * sum(log(diag(chol)))
-        logdet_M = 2.0 * tf.reduce_sum(tf.math.log(tf.linalg.diag_part(chol_M)))
-        logdet_Kmm = 2.0 * tf.reduce_sum(tf.math.log(tf.linalg.diag_part(chol_Kmm)))
-        logdet_sigma = tf.cast(self.n_vx, self.gp_dtype) * tf.math.log(gpk_nugget) + logdet_M - logdet_Kmm
-
-        # Quadratic form:
-        # quad = f^T Sigma^{-1} f
-        # = (1/nugget) f^T f - (1/nugget^2) (K_nm^T f)^T M^{-1} (K_nm^T f)
-        fTf = tf.reduce_sum(parameter_dm * parameter_dm)
-        Kt_f = tf.matmul(tf.transpose(K_nm), tf.expand_dims(parameter_dm, -1))  # (m,1)
-
-        # Solve M v = Kt_f  via cholesky (stable)
-        v = tf.linalg.cholesky_solve(chol_M, Kt_f)   # (m,1)
-        # scalar c^T v
-        cTv = tf.squeeze(tf.matmul(tf.transpose(Kt_f), v), axis=[0,1])  # scalar
-
-        quad = inv_sigma * fTf - (inv_sigma * inv_sigma) * cTv
-
-        # Final log probability
-        log2pi = tf.math.log(2.0 * tf.constant(np.pi, dtype=self.gp_dtype))
-        log_prob = -0.5 * (tf.cast(self.n_vx, self.gp_dtype) * log2pi + logdet_sigma + quad)
-
-        return tf.cast(tf.reshape(log_prob, []), tf.float32)  # scalar tensor
+        # Compute quadratic term via Woodbury K^{-1} y = (1/sigma2) y - (1/sigma2^2) B x
+        Bx = tf.matmul(B, x)                                        # (n,1)
+        v = (1.0 / gpk_nugget) * tf.expand_dims(parameter_dm, -1) - (1.0 / (gpk_nugget * gpk_nugget)) * Bx
+        quad = tf.squeeze(tf.matmul(tf.transpose(tf.expand_dims(parameter_dm, -1)), v))  # scalar
+        # Log-determinant via determinant lemma:
+        # log|K| = n log sigma2 - log|A| + log|S|
+        La = tf.linalg.cholesky(A)
+        logdetA = 2.0 * tf.reduce_sum(tf.math.log(tf.linalg.diag_part(La)))
+        logdetS = 2.0 * tf.reduce_sum(tf.math.log(tf.linalg.diag_part(Ls)))
+        n_float = tf.cast(self.n_vx, self.gp_dtype)
+        logdetK = n_float * tf.math.log(gpk_nugget) - logdetA + logdetS        
+        log2pi = tf.math.log(2.0 * tf.constant(math.pi, dtype=self.gp_dtype))
+        logp = -0.5 * quad - 0.5 * logdetK - 0.5 * n_float * log2pi
+        return tf.cast(tf.reshape(logp, []), tf.float32)
 
     @tf.function
     def _return_log_prob_unfixed(self, parameter, **kwargs):
