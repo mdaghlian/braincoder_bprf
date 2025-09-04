@@ -183,24 +183,16 @@ class GP():
         ''' Putting all the kernels together - > return the full covariance matrix
         '''
         # Start covariance matrix from zero...
-        s_out = tf.zeros((self.n_vx,self.n_vx), dtype=self.gp_dtype)
+        s_out = tf.zeros((self.n_vx,self.n_vx), dtype=self.gp_dtype)        
         
-        # Add in any linear kernels
-        for s in self.lin_kernel_list:
-            s_out += self._return_sigma_xid_linear(
-                gpk_slope=kwargs[f'gpk{s}_slope'],
-                gpk_const=kwargs[f'gpk{s}_const'],
-                Xs=self.Xs[s],
+        # Add in any stationary kernels (e.g., RBF)
+        for s in self.stat_kernel_list:
+            s_out += self._return_sigma_xid_stationary(
+                gpk_l=kwargs[f'gpk{s}_l'],
+                gpk_v=kwargs[f'gpk{s}_v'],
+                dXs=self.dXs[s],
+                kernel_type=self.kernel_type[s]
             )
-        
-        # # Add in any stationary kernels (e.g., RBF)
-        # for s in self.stat_kernel_list:
-        #     s_out += self._return_sigma_xid_stationary(
-        #         gpk_l=kwargs[f'gpk{s}_l'],
-        #         gpk_v=kwargs[f'gpk{s}_v'],
-        #         dXs=self.dXs[s],
-        #         kernel_type=self.kernel_type[s]
-        #     )
         for s in self.warp_kernel_list:
             s_kernel_type = s.split('_')[-1]
             dXs = self._return_warp_dXs(
@@ -211,7 +203,14 @@ class GP():
                 gpk_v=kwargs[f'gpk{s}_v'],
                 dXs=dXs,
                 kernel_type=s_kernel_type
-            )            
+            )   
+        # # Add in any linear kernels
+        # for s in self.lin_kernel_list:
+        #     s_out += self._return_sigma_xid_linear(
+        #         gpk_slope=kwargs[f'gpk{s}_slope'],
+        #         gpk_const=kwargs[f'gpk{s}_const'],
+        #         Xs=self.Xs[s],
+        #     )
         # Add the nugget term
         s_out += tf.linalg.diag(tf.ones(self.n_vx, dtype=self.gp_dtype)) * tf.cast(self.eps + kwargs[f'gpk_nugget'], dtype=self.gp_dtype)
         return s_out        
@@ -339,7 +338,7 @@ class GP():
         # Get mean vector
         m_vect = self._return_mfunc(**kwargs)
         gp_prior_dist = tfd.MultivariateNormalTriL(
-            loc=tf.squeeze(tf.cast(m_vect, dtype=tf.float32)), #tf.fill([self.n_vx], tf.squeeze(m_vect)),
+            loc=tf.squeeze(tf.cast(m_vect, dtype=tf.float32)), 
             scale_tril=tf.cast(chol, dtype=tf.float32),
             allow_nan_stats=False,
         )
