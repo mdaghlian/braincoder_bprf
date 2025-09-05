@@ -5,30 +5,18 @@ from tensorflow.math import sigmoid
 from .utils import logit
 
 class HRFModel(object):
-
-    def __init__(self, unique_hrfs=False):
-        self.set_unique_hrfs(unique_hrfs)
-
     def set_unique_hrfs(self, unique_hrfs):
         self.unique_hrfs = unique_hrfs
+        self._convolve = self._convolve_unique if unique_hrfs else self._convolve_shared
 
-        if self.unique_hrfs:
-            self._convolve = self._convolve_unique
-        else:
-            self._convolve = self._convolve_shared
+    def __init__(self, unique_hrfs=False):
+        self.unique_hrfs = unique_hrfs
+        self._convolve = self._convolve_unique if unique_hrfs else self._convolve_shared
 
     @tf.function
     def convolve(self, timeseries, **kwargs):
-
         hrf = self.get_hrf(**kwargs)
-
-        if self.oversampling == 1:
-            return self._convolve(timeseries, hrf=hrf)
-
-        else:
-            upsampled_timeseries = self._upsample(timeseries)
-            cts = self._convolve(upsampled_timeseries, hrf=hrf)
-            return self._downsample(cts)
+        return self._convolve(timeseries, hrf=hrf)
 
     def _convolve_shared(self, timeseries, hrf):
         # timeseries: returns: n_batch x n_timepoints x n_units
@@ -72,19 +60,6 @@ class HRFModel(object):
 
         return tf.reshape(convolved, [1, n, m])
 
-    def _upsample(self, timeseries):
-        new_length = len(timeseries) * self.oversampling
-        timeseries_upsampled = tf.image.resize(timeseries[tf.newaxis, :, :, tf.newaxis],
-                                               [new_length, timeseries.shape[1]])
-
-        return tf.squeeze(timeseries_upsampled)
-
-    def _downsample(self, upsampled_timeseries):
-        new_length = len(upsampled_timeseries) // self.oversampling
-        timeseries_downsampled = tf.image.resize(upsampled_timeseries[tf.newaxis, :, :, tf.newaxis],
-                                                 [new_length, upsampled_timeseries.shape[1]])
-
-        return tf.squeeze(timeseries_downsampled)
 
 import tensorflow as tf
 import tensorflow_probability as tfp
@@ -152,7 +127,7 @@ def gamma_pdf_with_loc(t, a, d, dt, loc=0.0):
 
     return result
 
-def spm_hrf(t, a1=6., d1=1., a2=16., d2=1., c=1./6, dt=0.):
+def spm_hrf(t, a1=6., d1=1., a2=16., d2=1., c=1./6, highres_dt=0.1):
     """
     Compute SPM canonical HRF(s).
 
@@ -164,28 +139,78 @@ def spm_hrf(t, a1=6., d1=1., a2=16., d2=1., c=1./6, dt=0.):
     Returns:
         Tensor [T, M] normalized HRFs
     """
-    hrf1 = gamma_pdf_with_loc(t, a1, d1, dt, loc=dt)
-    hrf2 = gamma_pdf_with_loc(t, a2, d2, dt, loc=dt)
+    # All-TensorFlow version: compute at high-res, then interpolate to t using tfp.math.interp_regular_1d_grid
+    t_min = tf.reduce_min(t)
+    t_max = tf.reduce_max(t)
+    n_steps = tf.cast(tf.math.ceil((t_max - t_min) / highres_dt) + 1, tf.int32)
+    t_hr = t_min + tf.range(n_steps, dtype=tf.float32) * highres_dt  # [N]
+    t_hr_2d = tf.expand_dims(t_hr, 1)  # [N, 1]
 
-    hrf = hrf1 - c * hrf2
-    hrf_sum = tf.reduce_sum(hrf, axis=0, keepdims=True)
-    hrf_norm = hrf / hrf_sum
+    # Compute high-res HRF
+    hrf1_hr = gamma_pdf_with_loc(t_hr_2d, a1, d1, highres_dt, loc=highres_dt)
+    hrf2_hr = gamma_pdf_with_loc(t_hr_2d, a2, d2, highres_dt, loc=highres_dt)
+    hrf_hr = hrf1_hr - c * hrf2_hr  # [N, M]
+    hrf_hr_sum = tf.reduce_sum(hrf_hr, axis=0, keepdims=True)
+    hrf_hr_norm = hrf_hr / hrf_hr_sum  # [N, M]
 
-    return hrf_norm
+    # t: [T], a1/d1/a2/d2/c: scalars or [M]
+    t = tf.convert_to_tensor(t, dtype=tf.float32)
+    a1 = tf.convert_to_tensor(a1, dtype=tf.float32)
+    d1 = tf.convert_to_tensor(d1, dtype=tf.float32)
+    a2 = tf.convert_to_tensor(a2, dtype=tf.float32)
+    d2 = tf.convert_to_tensor(d2, dtype=tf.float32)
+    c = tf.convert_to_tensor(c, dtype=tf.float32)
+    # High-res grid
+    t_min = tf.reduce_min(t)
+    t_max = tf.reduce_max(t)
+    n_steps = tf.cast(tf.math.ceil((t_max - t_min) / highres_dt) + 1, tf.int32)
+    t_hr = t_min + tf.range(n_steps, dtype=tf.float32) * highres_dt  # [N]
+    t_hr_2d = tf.expand_dims(t_hr, 1)  # [N, 1]
+    # Let TF broadcasting handle param shapes: if any param is [M], output will be [N, M]
+    hrf1_hr = gamma_pdf_with_loc(t_hr_2d, a1, d1, highres_dt, loc=highres_dt)  # [N, M] or [N, 1]
+    hrf2_hr = gamma_pdf_with_loc(t_hr_2d, a2, d2, highres_dt, loc=highres_dt)  # [N, M] or [N, 1]
+    hrf_hr = hrf1_hr - c * hrf2_hr  # [N, M] or [N, 1]
+    hrf_hr /= tf.reduce_sum(hrf_hr, axis=0, keepdims=True)
+    # Interpolate: for each HRF, vectorized
+    t_query = tf.expand_dims(t, 1)  # [T, 1]
+    hrf_interp = tfp.math.interp_regular_1d_grid(
+        x=t_query,
+        x_ref_min=t_min,
+        x_ref_max=t_min + highres_dt * tf.cast(n_steps - 1, tf.float32),
+        y_ref=hrf_hr,
+        axis=0,
+        fill_value='constant_extension'
+    )  # [T, M] or [T, 1]
+    # Always return [T, M] (never [T, 1, M] or [T, 1])
+    if hrf_interp.shape.rank == 1:
+        hrf_interp = tf.expand_dims(hrf_interp, -1)
+    if hrf_interp.shape.rank == 3:
+        hrf_interp = tf.squeeze(hrf_interp, axis=1)
+    return hrf_interp
+
+
+def bounded_sigmoid_transform(min_val, max_val):
+    def forward(x):
+        return tf.sigmoid(x) * (max_val - min_val) + min_val
+    def backward(y):
+        y_scaled = (y - min_val) / (max_val - min_val)
+        return tf.math.log(y_scaled / (1.0 - y_scaled))
+    return (forward, backward)
+
 
 class SPMHRFModel(HRFModel):
+
 
     parameter_labels = ['hrf_delay', 'hrf_dispersion']
     n_parameters = 2
 
-    def __init__(self, tr, unique_hrfs=False, oversampling=1, time_length=32., onset=0.,
+    def __init__(self, tr, unique_hrfs=False, highres_dt=0.1, time_length=32., onset=0.,
                  delay=6., undershoot=16., dispersion=1.,
                  u_dispersion=1., ratio=0.167,
-                 min_hrf_delay=3.5, max_hrf_delay=8.0,
-                 min_dispersion=0.5, max_dispersion=3.0):
-
+                 min_hrf_delay=3., max_hrf_delay=7.0,
+                 min_dispersion=0.3, max_dispersion=2.0):
         self.tr = tr
-        self.oversampling = oversampling
+        self.highres_dt = highres_dt
         self.time_length = time_length
         self.onset = onset
         self.hrf_delay = delay
@@ -193,90 +218,66 @@ class SPMHRFModel(HRFModel):
         self.hrf_dispersion = dispersion
         self.u_dispersion = u_dispersion
         self.ratio = ratio
-
         self.min_hrf_delay = min_hrf_delay
         self.max_hrf_delay = max_hrf_delay
         self.min_dispersion = min_dispersion
         self.max_dispersion = max_dispersion
-
-        self.dt = self.tr / self.oversampling
+        self.dt = self.tr  # Use TR as time step unless oversampling is needed
         self.time_stamps = np.linspace(1e-4, self.time_length,
-                                  np.rint(float(self.time_length) / self.dt).astype(np.int32)).astype(np.float32)
+                                      np.rint(float(self.time_length) / self.dt).astype(np.int32)).astype(np.float32)
         self.time_stamps -= self.onset
-
-        # time x n_hrfs
-        self.time_stamps = self.time_stamps[:, np.newaxis]
-
+        # 1D time vector
+        self.transformations = [
+            bounded_sigmoid_transform(self.min_hrf_delay, self.max_hrf_delay),
+            bounded_sigmoid_transform(self.min_dispersion, self.max_dispersion)
+        ]
         super().__init__(unique_hrfs=unique_hrfs)
 
-    def get_hrf(self, hrf_delay=6., hrf_dispersion=1.):
+    def get_hrf(self, hrf_delay=None, hrf_dispersion=None):
+
+        if hrf_delay is None:
+            hrf_delay = self.hrf_delay
+
+        if hrf_dispersion is None:
+            hrf_dispersion = self.hrf_dispersion
+
         peak_shape = hrf_delay / hrf_dispersion + 1.
         undershoot_shape = self.undershoot / self.u_dispersion
         hrf = spm_hrf(self.time_stamps,
                       a1=peak_shape, d1=hrf_dispersion,
                       a2=undershoot_shape, d2=self.u_dispersion,
                       c=self.ratio,
-                      dt=self.dt)
+                      highres_dt=self.highres_dt)
         return hrf
 
-    def _transform_parameters_forward(self, parameters):
-        delay = parameters[:, 0][:, tf.newaxis]
-        dispersion = parameters[:, 1][:, tf.newaxis]
 
-        delay = tf.sigmoid(delay)
-        dispersion = tf.sigmoid(dispersion)
-
-        delay_range = self.max_hrf_delay - self.min_hrf_delay
-        dispersion_range = self.max_dispersion - self.min_dispersion
-
-        delay = delay * delay_range + self.min_hrf_delay
-        dispersion = dispersion * dispersion_range + self.min_dispersion
-
-        return tf.concat([delay, dispersion], axis=1)
-
-    @tf.function
-    def _transform_parameters_backward(self, parameters):
-        delay = parameters[:, 0][:, tf.newaxis]
-        dispersion = parameters[:, 1][:, tf.newaxis]
-
-        delay_range = self.max_hrf_delay - self.min_hrf_delay
-        dispersion_range = self.max_dispersion - self.min_dispersion
-
-        delay = (delay - self.min_hrf_delay) / delay_range
-        dispersion = (dispersion - self.min_dispersion) / dispersion_range
-
-        delay = tf.math.log(delay / (1.0 - delay))
-        dispersion = tf.math.log(dispersion / (1.0 - dispersion))
-
-        return tf.concat([delay, dispersion], axis=1)
 
 
 class SPMHRFDerivativeModel(HRFModel):
     parameter_labels = ['delay_weight', 'dispersion_weight']
     n_parameters = 2
 
-    def __init__(self, tr, unique_hrfs=False, oversampling=1, time_length=32., onset=0.,
+    def __init__(self, tr, unique_hrfs=False, highres_dt=0.1, time_length=32., onset=0.,
                  delay=6., dispersion=1., undershoot=16., u_dispersion=1., ratio=0.167,
                  max_weight=2.0):
-
         self.tr = tr
-        self.oversampling = oversampling
+        self.highres_dt = highres_dt
         self.time_length = time_length
         self.onset = onset
-
         self.delay = delay
         self.dispersion = dispersion
         self.undershoot = undershoot
         self.u_dispersion = u_dispersion
         self.ratio = ratio
-        self.max_weight = max_weight  # how much derivative can be mixed in
-
-        self.dt = self.tr / self.oversampling
+        self.max_weight = max_weight
         self.time_stamps = np.linspace(1e-4, self.time_length,
-                                       np.rint(float(self.time_length) / self.dt).astype(np.int32)).astype(np.float32)
+                                       np.rint(float(self.time_length) / self.tr).astype(np.int32)).astype(np.float32)
         self.time_stamps -= self.onset
-        self.time_stamps = self.time_stamps[:, np.newaxis]  # time x 1
-
+        self.time_stamps = self.time_stamps[:, np.newaxis]
+        self.transformations = [
+            bounded_sigmoid_transform(-self.max_weight, self.max_weight),
+            bounded_sigmoid_transform(-self.max_weight, self.max_weight)
+        ]
         super().__init__(unique_hrfs=unique_hrfs)
 
     def get_hrf(self, delay_weight=0., dispersion_weight=0.):
@@ -285,7 +286,7 @@ class SPMHRFDerivativeModel(HRFModel):
                            a1=self.delay / self.dispersion + 1., d1=self.dispersion,
                            a2=self.undershoot / self.u_dispersion, d2=self.u_dispersion,
                            c=self.ratio,
-                           dt=self.dt)
+                           highres_dt=self.highres_dt)
 
         # Small perturbations for numerical derivatives
         eps = 1e-2
@@ -295,7 +296,7 @@ class SPMHRFDerivativeModel(HRFModel):
                           a1=(self.delay + eps) / self.dispersion + 1., d1=self.dispersion,
                           a2=self.undershoot / self.u_dispersion, d2=self.u_dispersion,
                           c=self.ratio,
-                          dt=self.dt)
+                          highres_dt=self.highres_dt)
         derivative_delay = (d_delay - base_hrf) / eps
 
         # Dispersion derivative: ∂HRF/∂dispersion
@@ -303,7 +304,7 @@ class SPMHRFDerivativeModel(HRFModel):
                          a1=self.delay / (self.dispersion + eps) + 1., d1=self.dispersion + eps,
                          a2=self.undershoot / self.u_dispersion, d2=self.u_dispersion,
                          c=self.ratio,
-                         dt=self.dt)
+                         highres_dt=self.highres_dt)
         derivative_disp = (d_disp - base_hrf) / eps
 
         # Linear combination
@@ -313,16 +314,7 @@ class SPMHRFDerivativeModel(HRFModel):
 
         return hrf
 
-    def _transform_parameters_forward(self, parameters):
-        weights = tf.sigmoid(parameters)  # (n, 2), values in (0, 1)
-        weights = weights * 2 * self.max_weight - self.max_weight  # range [-max_weight, max_weight]
-        return weights
 
-    @tf.function
-    def _transform_parameters_backward(self, parameters):
-        weights = (parameters + self.max_weight) / (2 * self.max_weight)  # back to [0,1]
-        weights = tf.math.log(weights / (1.0 - weights))  # logit
-        return weights
 
 
 class CustomHRFModel(HRFModel):
