@@ -1898,6 +1898,9 @@ class ContrastSensitivity(EncodingModel):
             'amplitude'     : tfb.Softplus(),
             'baseline'     : tfb.Identity(),
         }
+        self.transformations = [(i.forward,i.inverse) for _,i in self.p_bijector.items()]        
+    def update_transformations(self):
+        self.transformations = [(i.forward,i.inverse) for _,i in self.p_bijector.items()]
 
     def get_csf_for_plot(self, SF_grid, CON_grid=np.array([1,1]), parameters=None):
         ''' Get the csf for a grid of SF and CON values '''
@@ -2041,74 +2044,8 @@ class ContrastSensitivity(EncodingModel):
         csf = self._asymetric_parabola(stim_sequence, parameters)
         ncsf_resp = self._apply_crf(stim_sequence, parameters, csf)
 
-        return ncsf_resp
-    @tf.function
-    def _transform_parameters_forward(self, parameters):
-        # Loop through parameters & bijectors (forward)
-        p_out = []
-        for i,p in enumerate(self.p_bijector.keys()): #parameter_labels):
-            p_out.append(
-                self.p_bijector[p].forward(
-                    parameters[:, i][:, tf.newaxis]
-                )
-            )
-        return tf.concat(p_out, axis=1)
-    @tf.function
-    def _transform_parameters_backward(self, parameters):
-        # Loop through parameters & bijectors (forward)
-        p_out = []
-        for i,p in enumerate(self.p_bijector.keys()): #parameter_labels):
-            p_out.append(
-                self.p_bijector[p].inverse(
-                    parameters[:, i][:, tf.newaxis]
-                    )             
-            )
-        return tf.concat(p_out, axis=1)        
-
-    # @tf.function
-    # def _transform_parameters_forward(self, parameters):
-    #     ''' Force amplidute to be positive '''
-    #     # Force them all to be positive (apart from baseline)
-    #     par_out = tf.concat([
-    #         tf.math.softplus(parameters[:, 0][:, tf.newaxis]),                # width_r
-    #         tf.math.softplus(parameters[:, 1][:, tf.newaxis]),                # SFp
-    #         tf.math.softplus(parameters[:, 2][:, tf.newaxis]),                # CSp
-    #         tf.math.softplus(parameters[:, 3][:, tf.newaxis]),                # width_l
-    #         tf.math.softplus(parameters[:, 4][:, tf.newaxis]),                # crf_exp
-    #         tf.math.softplus(parameters[:, 5][:, tf.newaxis]),                # amplitude
-    #         parameters[:, 6][:, tf.newaxis]],               # baseline
-    #         axis=1)        
-    #     return par_out
-    
-    # @tf.function
-    # def _transform_parameters_backward(self, parameters):
-    #     # Force them all to be positive (apart from baseline)
-    #     par_out = tf.concat([
-    #         tfp.math.softplus_inverse(parameters[:, 0][:, tf.newaxis]),                # width_r
-    #         tfp.math.softplus_inverse(parameters[:, 1][:, tf.newaxis]),                # SFp
-    #         tfp.math.softplus_inverse(parameters[:, 2][:, tf.newaxis]),                # CSp
-    #         tfp.math.softplus_inverse(parameters[:, 3][:, tf.newaxis]),                # width_l
-    #         tfp.math.softplus_inverse(parameters[:, 4][:, tf.newaxis]),                # crf_exp
-    #         tfp.math.softplus_inverse(parameters[:, 5][:, tf.newaxis]),                # amplitude
-    #         parameters[:, 6][:, tf.newaxis]],               # baseline
-    #         axis=1)
-    #     return par_out
-    # def get_pseudoWWT(self, remove_baseline=True):
-
-    #     parameters = self._get_parameters().copy()
-        
-    #     if remove_baseline:
-    #         parameters['baseline'] = np.float32(0.0)
-
-    #     csf = self.get_csf(parameters=parameters.astype(np.float32))
-
-    #     return csf # ?? hmm
-
-    # def to_linear_model(self):
-    #     return LinearModelWithBaseline(self.paradigm, self.data, self.parameters[['baseline']], weights=self.get_csf())
-
-    # def unpack_stimulus(self, stimulus):
-    #     return np.reshape(stimulus, (-1, self.n_x, self.n_y))    
+        return ncsf_resp  
+   
     
 class ContrastSensitivitySigmoid(ContrastSensitivity):
     """
@@ -2155,37 +2092,10 @@ class ContrastSensitivityWithHRF(HRFEncodingModel, ContrastSensitivity):
             self, hrf_model=hrf_model, flexible_hrf_parameters=flexible_hrf_parameters,             
             verbosity=logging.INFO, **kwargs
         )
-    
-    # def to_linear_model(self):
-    #     return LinearModelWithBaselineHRF(self.paradigm, self.data,
-    #                                       self.parameters[[
-    #                                           'baseline']], weights=self.get_rf().T,
-    #                                       hrf_model=self.hrf_model)
-
-    @tf.function
-    def _transform_parameters_forward(self, parameters):
-
+        self.flexible_hrf_parameters=flexible_hrf_parameters
+        if flexible_hrf_parameters:
+            self.transformations = self.transformations + self.hrf_model.transformations
+    def update_transformations(self):
+        self.transformations = [(i.forward,i.inverse) for _,i in self.p_bijector.items()]
         if self.flexible_hrf_parameters:
-            n_hrf_pars = len(self.hrf_model.parameter_labels)
-
-            encoding_pars = ContrastSensitivity._transform_parameters_forward(self, parameters[:, :-n_hrf_pars])
-            hrf_pars = self.hrf_model._transform_parameters_forward(parameters[:, -n_hrf_pars:])
-            
-            return tf.concat([encoding_pars, hrf_pars], axis=1)
-        else:
-            return ContrastSensitivity._transform_parameters_forward(self, parameters)
-
-    @tf.function
-    def _transform_parameters_backward(self, parameters):
-        
-        if self.flexible_hrf_parameters:
-            n_hrf_pars = len(self.hrf_model.parameter_labels)
-
-            encoding_pars = ContrastSensitivity._transform_parameters_backward(self, parameters[:, :-n_hrf_pars])
-            hrf_pars = self.hrf_model._transform_parameters_backward(parameters[:, -n_hrf_pars:])
-            
-
-
-            return tf.concat([encoding_pars, hrf_pars], axis=1)
-        else:
-            return ContrastSensitivity._transform_parameters_backward(self, parameters)        
+            self.transformations = self.transformations + self.hrf_model.transformations
