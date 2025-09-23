@@ -290,40 +290,53 @@ class GP():
         '''
         gpk_nugget = tf.cast(kwargs['gpk_nugget'], dtype=self.gp_dtype)        
         m_vect = self._return_mfunc(**kwargs)        
-        parameter_dm = tf.cast(parameter - m_vect, self.gp_dtype) # remove mean function from parameter
+        y = tf.cast(parameter - m_vect, self.gp_dtype) # remove mean function from parameter
 
-        K_full = self._return_sigma_full(**kwargs) # we do the nugget later, so have to remove it here...        
-        # might change this later...
-        K_full -= tf.linalg.diag(tf.ones(self.n_vx, dtype=self.gp_dtype)) * tf.cast(self.eps + kwargs[f'gpk_nugget'], dtype=self.gp_dtype)
-        A=tf.gather(tf.gather(K_full, self.inducer_idx, axis=0), self.inducer_idx, axis=1)
-        B=tf.gather(K_full, self.inducer_idx, axis=1)
-        # Add small jitter to A for PD-ness
-        A += tf.cast(self.eps, self.gp_dtype) * tf.eye(self.n_inducers, dtype=self.gp_dtype)
+        K_full = self._return_sigma_full(**kwargs)        
+        # For full calculation we include the nugget term
+        # - so have to remove it here
+        K_full = K_full - tf.linalg.diag(tf.ones(self.n_vx, dtype=self.gp_dtype)) * tf.cast(self.eps + kwargs[f'gpk_nugget'], dtype=self.gp_dtype)
+        
+        K_uu=tf.gather(tf.gather(K_full, self.inducer_idx, axis=0), self.inducer_idx, axis=1)
+        # Add small jitter to for PD-ness
+        K_uu += tf.cast(self.eps, self.gp_dtype) * tf.eye(self.n_inducers, dtype=self.gp_dtype)
 
-        # Build S = A + (1/nugget) B^T B  (m x m)
-        BtB = tf.matmul(tf.transpose(B), B)   # (m,m)
-        S = A + (1.0 / gpk_nugget) * BtB
+        K_vu=tf.gather(K_full, self.inducer_idx, axis=1)
 
-        # Cholesky S
-        Ls = tf.linalg.cholesky(S) # (m,m)
-        # Solve S x = B^T y
-        Bt_y = tf.matmul(tf.transpose(B), tf.expand_dims(parameter_dm, -1))  # (m,1)
-        x = tf.linalg.cholesky_solve(Ls, Bt_y)                       # (m,1)
+        # Build S = K_uu + (1/nugget) K_vu^T K_vu  (m x m)
+        K_vutK_vu = tf.matmul(tf.transpose(K_vu), K_vu)   # (m,m)
+        S = K_uu + (1.0 / gpk_nugget) * K_vutK_vu
 
-        # Compute quadratic term via Woodbury K^{-1} y = (1/sigma2) y - (1/sigma2^2) B x
-        Bx = tf.matmul(B, x)                                        # (n,1)
-        v = (1.0 / gpk_nugget) * tf.expand_dims(parameter_dm, -1) - (1.0 / (gpk_nugget * gpk_nugget)) * Bx
-        quad = tf.squeeze(tf.matmul(tf.transpose(tf.expand_dims(parameter_dm, -1)), v))  # scalar
-        # Log-determinant via determinant lemma:
-        # log|K| = n log sigma2 - log|A| + log|S|
-        La = tf.linalg.cholesky(A)
-        logdetA = 2.0 * tf.reduce_sum(tf.math.log(tf.linalg.diag_part(La)))
-        logdetS = 2.0 * tf.reduce_sum(tf.math.log(tf.linalg.diag_part(Ls)))
+        # --- Calculate the quadratic term: y^T * inv(K) * y ---
+        # According to the Woodbury identity
+        # First term: (1/tau^2) * y^T * y
+        quad_term_1 = (1.0 / gpk_nugget) * tf.reduce_sum(tf.square(y))
+
+        # Second term: -(1/tau^4) * y^T * K_vu * inv(S) * K_vu^T * y
+        chol_S = tf.linalg.cholesky(S)
+        K_vu_T_y = tf.matmul(tf.transpose(K_vu), tf.expand_dims(y, -1))
+        
+        # Solve S * x = K_vu^T * y -> x = inv(S) * K_vu^T * y
+        x_vec = tf.linalg.cholesky_solve(chol_S, K_vu_T_y)
+        
+        # Calculate K_vu * x_vec
+        K_vu_x = tf.matmul(K_vu, x_vec)
+        
+        quad_term_2 = tf.squeeze(tf.matmul(tf.transpose(
+            tf.expand_dims(y, -1)), (1.0 / (gpk_nugget*gpk_nugget)) * K_vu_x))    
+        quadratic_term = quad_term_1 - quad_term_2    
+        # --- Calculate the log-determinant term: log(|K|) ---
+        # log(|K|) = n * log(tau^2) + log(|S|) - log(|K_uu|)
+        chol_K_uu = tf.linalg.cholesky(K_uu)    
+        logdet_K_uu = 2.0 * tf.reduce_sum(tf.math.log(tf.linalg.diag_part(chol_K_uu)))
+        logdet_S = 2.0 * tf.reduce_sum(tf.math.log(tf.linalg.diag_part(chol_S)))    
         n_float = tf.cast(self.n_vx, self.gp_dtype)
-        logdetK = n_float * tf.math.log(gpk_nugget) - logdetA + logdetS        
-        log2pi = tf.math.log(2.0 * tf.constant(math.pi, dtype=self.gp_dtype))
-        logp = -0.5 * quad - 0.5 * logdetK - 0.5 * n_float * log2pi
-        return tf.cast(tf.reshape(logp, []), tf.float32)
+        logdet_K = n_float * tf.math.log(gpk_nugget) + logdet_S - logdet_K_uu
+        
+        # --- Combine terms to get the final log-probability ---
+        log2pi = tf.math.log(2.0 * tf.constant(math.pi, dtype=self.gp_dtype))    
+        log_prob = -0.5 * quadratic_term - 0.5 * logdet_K - 0.5 * n_float * log2pi    
+        return tf.cast(tf.reshape(log_prob, []), tf.float32)    
 
     @tf.function
     def _return_log_prob_unfixed(self, parameter, **kwargs):
