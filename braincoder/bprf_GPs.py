@@ -366,6 +366,233 @@ class GP():
         """
         return self.gp_prior_dist.log_prob(parameter)
 
+    def _predict(self, **kwargs):
+        ''' GP prediction
+        given new Xs (M x D), old Xs (N x D), parameters (N,), & hyperparameters for GP
+        return mean (M,), std (M,) for new Xs
+
+        Required kwargs:
+            - parameter : (N,) training observations
+
+        Optional kwargs (one of these must allow determination of M):
+            - Xs_new : (M, D) new input locations
+            - d_new_train : (M, N)  submatrix of distances between new & train (used for ALL stationary kernels
+                            unless per-kernel d_new_train_{xid} is provided)
+            - d_new_new   : (M, M)  distances between new & new (used for ALL stationary kernels unless per-kernel provided)
+            - d_new_train_{xid} : per-kernel (M,N) distances for stationary kernel xid
+            - d_new_new_{xid}   : per-kernel (M,M) distances for stationary kernel xid
+            - Xs_train : (N, D) training inputs (used to compute distances if not provided)
+            - mfunc_new : (M,) mean-function values at new points (if not provided we use the global mean or replicate training mean)
+
+        Returns:
+            mean_pred: (M,) tf.float32
+            std_pred:  (M,) tf.float32
+        '''
+        # --- basic tensors ---
+        if 'parameter' not in kwargs:
+            raise ValueError("Missing 'parameter' in kwargs (observations at training points).")
+        y = tf.convert_to_tensor(kwargs['parameter'], dtype=self.gp_dtype)
+        y = tf.reshape(y, [-1])
+        N = tf.shape(y)[0]
+
+        # helper: pairwise euclidean distances A (P,D) vs B (Q,D) -> (P,Q)
+        def pairwise_dists(A, B):
+            A = tf.cast(A, dtype=self.gp_dtype)
+            B = tf.cast(B, dtype=self.gp_dtype)
+            # (P,1,D) - (1,Q,D)
+            diff = tf.expand_dims(A, 1) - tf.expand_dims(B, 0)
+            d2 = tf.reduce_sum(tf.square(diff), axis=-1)
+            return tf.sqrt(tf.maximum(d2, tf.cast(0.0, self.gp_dtype)))
+
+        # Determine M from provided inputs
+        M = None
+        if 'd_new_train' in kwargs:
+            dnt = tf.convert_to_tensor(kwargs['d_new_train'], dtype=self.gp_dtype)
+            M = tf.shape(dnt)[0]
+        elif len(self.warp_kernel_list) > 0 and any([f"d_new_train_{s}" in kwargs for s in self.warp_kernel_list]):
+            # get M from any provided per-warp matrix
+            for s in self.warp_kernel_list:
+                key = f'd_new_train_{s}'
+                if key in kwargs:
+                    dnt = tf.convert_to_tensor(kwargs[key], dtype=self.gp_dtype)
+                    M = tf.shape(dnt)[0]
+                    break
+        elif 'Xs_new' in kwargs:
+            Xs_new = tf.convert_to_tensor(kwargs['Xs_new'], dtype=self.gp_dtype)
+            if len(Xs_new.shape) == 1:
+                Xs_new = tf.expand_dims(Xs_new, -1)
+            M = tf.shape(Xs_new)[0]
+        else:
+            raise ValueError("Cannot determine M (number of prediction points). Provide 'Xs_new' or 'd_new_train'.")
+
+        # Cast Xs_new / Xs_train if present
+        Xs_new = None
+        if 'Xs_new' in kwargs:
+            Xs_new = tf.convert_to_tensor(kwargs['Xs_new'], dtype=self.gp_dtype)
+            if len(Xs_new.shape) == 1:
+                Xs_new = tf.expand_dims(Xs_new, -1)
+        Xs_train = None
+        if 'Xs_train' in kwargs:
+            Xs_train = tf.convert_to_tensor(kwargs['Xs_train'], dtype=self.gp_dtype)
+            if len(Xs_train.shape) == 1:
+                Xs_train = tf.expand_dims(Xs_train, -1)
+            if tf.shape(Xs_train)[0] != N:
+                raise ValueError("Provided Xs_train must have same first-dimension length as 'parameter'.")
+
+        # --- build train covariance and mean (uses existing class functions) ---
+        K_train = self._return_sigma_full(**kwargs)  # (N,N), includes nugget
+        if tf.shape(K_train)[0] != N:
+            # sanity check
+            N_cov = tf.shape(K_train)[0]
+            if N_cov != N:
+                raise ValueError("Length of 'parameter' does not match GP covariance size.")
+        chol_K = tf.linalg.cholesky(K_train)
+        m_train = self._return_mfunc(**kwargs)
+        m_train = tf.reshape(tf.cast(m_train, dtype=self.gp_dtype), [-1])
+        y_minus_m = tf.reshape(tf.cast(y, dtype=self.gp_dtype) - m_train, [-1, 1])
+        alpha = tf.linalg.cholesky_solve(chol_K, y_minus_m)  # (N,1)
+
+        # --- build cross-covariance K_nN (M,N) and K_nn diag (M) or full (M,M) ---
+        K_nN = tf.zeros((M, N), dtype=self.gp_dtype)
+        K_nn = tf.zeros((M, M), dtype=self.gp_dtype)
+
+        # stationary kernels
+        for s in self.stat_kernel_list:
+            kernel_type = self.kernel_type.get(s, 'RBF')
+            l = tf.cast(kwargs[f'gpk{s}_l'], dtype=self.gp_dtype)
+            v = tf.cast(kwargs[f'gpk{s}_v'], dtype=self.gp_dtype)
+
+            # priority for distances:
+            # 1) per-kernel provided: d_new_train_{s}, d_new_new_{s}
+            # 2) global provided: d_new_train, d_new_new
+            # 3) compute from Xs_train & Xs_new (requires Xs_train & Xs_new)
+            key_nt = f'd_new_train_{s}'
+            key_nn = f'd_new_new_{s}'
+            if key_nt in kwargs:
+                d_new_train = tf.convert_to_tensor(kwargs[key_nt], dtype=self.gp_dtype)
+            elif 'd_new_train' in kwargs:
+                d_new_train = tf.convert_to_tensor(kwargs['d_new_train'], dtype=self.gp_dtype)
+            else:
+                if Xs_train is None or Xs_new is None:
+                    raise ValueError(f"Need distances or Xs for stationary kernel '{s}'. Provide '{key_nt}' or 'd_new_train' or both Xs_train & Xs_new.")
+                d_new_train = pairwise_dists(Xs_new, Xs_train)  # (M,N)
+
+            if key_nn in kwargs:
+                d_new_new = tf.convert_to_tensor(kwargs[key_nn], dtype=self.gp_dtype)
+            elif 'd_new_new' in kwargs:
+                d_new_new = tf.convert_to_tensor(kwargs['d_new_new'], dtype=self.gp_dtype)
+            else:
+                # if we have d_new_train we can compute d_new_new from Xs_new or from distances
+                if Xs_new is not None:
+                    d_new_new = pairwise_dists(Xs_new, Xs_new)
+                else:
+                    # approximate d_new_new as zeros on diagonal and large elsewhere (fallback)
+                    d_new_new = tf.zeros((M, M), dtype=self.gp_dtype)
+
+            # apply kernel formula
+            if kernel_type == 'RBF':
+                K_nN += (v**2) * tf.exp(-tf.square(d_new_train) / (2.0 * l**2))
+                K_nn += (v**2) * tf.exp(-tf.square(d_new_new) / (2.0 * l**2))
+            elif kernel_type == 'matern52':
+                sqrt5 = tf.cast(tf.sqrt(5.0), dtype=self.gp_dtype)
+                f1 = (sqrt5 * d_new_train) / l
+                f2 = (5.0 * tf.square(d_new_train)) / (3.0 * tf.square(l))
+                K_nN += (v**2) * (1.0 + f1 + f2) * tf.exp(-f1)
+
+                f1nn = (sqrt5 * d_new_new) / l
+                f2nn = (5.0 * tf.square(d_new_new)) / (3.0 * tf.square(l))
+                K_nn += (v**2) * (1.0 + f1nn + f2nn) * tf.exp(-f1nn)
+            elif kernel_type == 'laplace':
+                K_nN += (v**2) * tf.exp(-d_new_train / l)
+                K_nn += (v**2) * tf.exp(-d_new_new / l)
+            else:
+                raise ValueError(f"Unsupported stationary kernel: {kernel_type}")
+
+        # warp kernels (simpler: allow precomputed d_new_train_{s} else compute via stored self.Xs and weights)
+        for s in self.warp_kernel_list:
+            s_kernel_type = s.split('_')[-1]
+            key_nt = f'd_new_train_{s}'
+            key_nn = f'd_new_new_{s}'
+            if key_nt in kwargs:
+                d_new_train = tf.convert_to_tensor(kwargs[key_nt], dtype=self.gp_dtype)
+            else:
+                # compute warp projections
+                w_list = [kwargs[f"gpk{s}_w{i}"] for i in range(self.Xs[s].shape[1])]
+                w = tf.stack(w_list, axis=0)
+                w = tf.cast(w, dtype=self.gp_dtype)
+                X_train_s = tf.cast(self.Xs[s], dtype=self.gp_dtype)  # (N, Dw)
+                warp_train = tf.reshape(tf.matmul(X_train_s, w), [N])  # (N,)
+                if Xs_new is None:
+                    raise ValueError(f"Need 'Xs_new' to compute warp distances for kernel '{s}' or provide '{key_nt}'.")
+                warp_new = tf.reshape(tf.matmul(Xs_new, w), [tf.shape(Xs_new)[0]])
+                d_new_train = pairwise_dists(tf.expand_dims(warp_new, -1), tf.expand_dims(warp_train, -1))  # (M,N)
+
+            if key_nn in kwargs:
+                d_new_new = tf.convert_to_tensor(kwargs[key_nn], dtype=self.gp_dtype)
+            else:
+                if Xs_new is not None:
+                    # compute warp_new if not already
+                    if 'warp_new' not in locals():
+                        w_list = [kwargs[f"gpk{s}_w{i}"] for i in range(self.Xs[s].shape[1])]
+                        w = tf.stack(w_list, axis=0)
+                        w = tf.cast(w, dtype=self.gp_dtype)
+                        warp_new = tf.reshape(tf.matmul(Xs_new, w), [tf.shape(Xs_new)[0]])
+                    d_new_new = pairwise_dists(tf.expand_dims(warp_new, -1), tf.expand_dims(warp_new, -1))
+                else:
+                    d_new_new = tf.zeros((M, M), dtype=self.gp_dtype)
+
+            v = tf.cast(kwargs[f'gpk{s}_v'], dtype=self.gp_dtype)
+            l = tf.cast(1.0, dtype=self.gp_dtype)  # as used elsewhere for warp kernels
+            if s_kernel_type == 'RBF':
+                K_nN += (v**2) * tf.exp(-tf.square(d_new_train) / (2.0 * l**2))
+                K_nn += (v**2) * tf.exp(-tf.square(d_new_new) / (2.0 * l**2))
+            elif s_kernel_type == 'matern52':
+                sqrt5 = tf.cast(tf.sqrt(5.0), dtype=self.gp_dtype)
+                f1 = (sqrt5 * d_new_train) / l
+                f2 = (5.0 * tf.square(d_new_train)) / (3.0 * tf.square(l))
+                K_nN += (v**2) * (1.0 + f1 + f2) * tf.exp(-f1)
+
+                f1nn = (sqrt5 * d_new_new) / l
+                f2nn = (5.0 * tf.square(d_new_new)) / (3.0 * tf.square(l))
+                K_nn += (v**2) * (1.0 + f1nn + f2nn) * tf.exp(-f1nn)
+            elif s_kernel_type == 'laplace':
+                K_nN += (v**2) * tf.exp(-d_new_train / l)
+                K_nn += (v**2) * tf.exp(-d_new_new / l)
+            else:
+                raise ValueError(f"Unsupported warp kernel: {s_kernel_type}")
+
+        # small jitter for numerical stability on K_nn diagonal
+        K_nn += tf.cast(self.eps, dtype=self.gp_dtype) * tf.eye(M, dtype=self.gp_dtype)
+
+        # --- mean at new points ---
+        if 'mfunc_new' in kwargs:
+            m_new = tf.reshape(tf.cast(kwargs['mfunc_new'], dtype=self.gp_dtype), [-1, 1])
+        else:
+            # fallback: use global mean if present, otherwise repeat mean of training mean
+            if 'mfunc_mean' in kwargs:
+                global_mean = tf.cast(kwargs['mfunc_mean'], dtype=self.gp_dtype)
+                m_new = tf.ones([M, 1], dtype=self.gp_dtype) * global_mean
+            else:
+                # replicate mean of m_train
+                mean_train = tf.reduce_mean(m_train)
+                m_new = tf.ones([M, 1], dtype=self.gp_dtype) * mean_train
+
+        # --- predictive mean ---
+        pred_mean = m_new + tf.matmul(K_nN, alpha)  # (M,1)
+
+        # --- predictive variance (diagonal) ---
+        K_nN_T = tf.transpose(K_nN)  # (N,M)
+        solved = tf.linalg.cholesky_solve(chol_K, K_nN_T)  # (N,M)
+        cov_cond = K_nn - tf.matmul(K_nN, solved)  # (M,M)
+        var_pred = tf.linalg.diag_part(cov_cond)
+        var_pred = tf.maximum(var_pred, tf.cast(0.0, dtype=self.gp_dtype))
+        std_pred = tf.sqrt(var_pred)
+
+        pred_mean = tf.cast(tf.reshape(pred_mean, [M]), dtype=tf.float32)
+        std_pred = tf.cast(tf.reshape(std_pred, [M]), dtype=tf.float32)
+        return pred_mean, std_pred
+
+
 
 # ******* SUPPORTING FUNCTIONS *********
 @tf.function

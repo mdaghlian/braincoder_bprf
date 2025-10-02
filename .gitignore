@@ -57,3 +57,5 @@ test*.ipynb
 z_*
 *.pkl
 output_*/
+
+.vscode/*
