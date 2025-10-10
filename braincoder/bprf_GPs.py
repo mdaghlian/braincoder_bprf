@@ -364,7 +364,11 @@ class GP():
         Recompute covariance and Cholesky decomposition on the fly.
         Optionally uses random selection of n_inducers for sparse GP approximation.
         """
-        return self.gp_prior_dist.log_prob(parameter)
+        # stop the gradients
+        k_list = 0
+        for k in self.pids.keys():
+            k_list += kwargs[self.pids[k]]*0.0
+        return self.gp_prior_dist.log_prob(parameter)+k_list
 
     def _predict(self, **kwargs):
         ''' GP prediction

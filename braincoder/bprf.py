@@ -29,13 +29,17 @@ class BPRF(object):
         self.include_jacobian = kwargs.get('include_jacobian', True)  # Include the jacobian in the model?
         # We can also fit noise -> 
         self.noise_method = kwargs.get('noise_method', 'fit_normal')  # 'fit_normal' 'none'
-        assert self.noise_method in ('fit_tdist', 'fit_normal', 'none') 
+        assert self.noise_method in ('fit_tdist', 'fit_normal', 'fit_ar1', 'none') 
         if self.noise_method=='fit_tdist':
             # Fit the t-distribution including dof, scale 
             self.model_labels['noise_dof'] = len(self.model_labels) 
             self.model_labels['noise_scale'] = len(self.model_labels) 
         elif self.noise_method=='fit_normal':
             self.model_labels['noise_scale'] = len(self.model_labels)  
+        elif self.noise_method=='fit_ar1':
+            # Fit the t-distribution including dof, scale 
+            self.model_labels['noise_scale'] = len(self.model_labels)             
+            self.model_labels['noise_ar1'] = len(self.model_labels) 
         self.n_params = len(self.model_labels)
 
         # MCMC specific information
@@ -55,6 +59,12 @@ class BPRF(object):
         elif self.noise_method=='fit_normal':
             self.add_bijector(pid='noise_scale', bijector_type=tfb.Exp())
             self.add_prior(pid='noise_scale', prior_type='HalfNormal', distribution=tfd.HalfNormal(scale=1.0))                        
+        elif self.noise_method=='fit_ar1':
+            self.add_bijector(pid='noise_ar1', bijector_type='sigmoid', low=-1, high=1)
+            self.add_bijector(pid='noise_scale', bijector_type=tfb.Exp())
+            self.add_prior(pid='noise_ar1', prior_type='normal',loc=0.0, scale=10.0,)
+            self.add_prior(pid='noise_scale', prior_type='HalfNormal', distribution=tfd.HalfNormal(scale=1.0))
+
         # Per voxel (row in data) - save the output of the MCMC sampler 
         self.mcmc_sampler = [None] * self.data.shape[1]
         self.mcmc_stats = [None] * self.data.shape[1]

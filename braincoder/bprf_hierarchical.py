@@ -796,7 +796,27 @@ class BPRF_hier(BPRF):
                 # resid_ln_likelihood = resid_dist.log_prob(residuals)
                 resid_ln_likelihood = tf.reduce_sum(resid_ln_likelihood)       
                 return resid_ln_likelihood              
-        
+        elif self.noise_method == 'fit_ar1' :
+            @tf.function
+            def residual_ln_likelihood_fn(parameters, residuals):
+                noise_scale = parameters[:, self.model_labels['noise_scale']]  
+                noise_ar1 = parameters[:, self.model_labels['noise_ar1']]       
+                
+                innov = residuals[1:, ] - tf.expand_dims(noise_ar1, 0) * residuals[:-1,:]  
+                innov_ln = calculate_log_prob_gauss_loc0(
+                    data=innov,
+                    scale=parameters[:, self.model_labels['noise_scale']],
+                )  
+                innov_ln_sum = tf.reduce_sum(innov_ln, axis=0)
+                denom = 1.0 - noise_ar1 ** 2
+                init_scale = noise_scale / denom  
+                init_ln = calculate_log_prob_gauss_loc0(
+                    data=residuals[0,:],
+                    scale=init_scale,
+                )  
+                total_ln_per_row = innov_ln_sum + init_ln  
+                total_ln = tf.reduce_sum(total_ln_per_row) 
+                return total_ln            
         else: # self.noise_method == 'none': 
             # Do not fit the noise - assume it is normally distributed
             # -> calculate scale based on the standard deviation of the residuals 
