@@ -1952,9 +1952,24 @@ class ContrastSensitivity(EncodingModel):
         # Want the output to be n_batches x n_timepoints x n_voxels
         result = tf.transpose(result, [0, 2, 1])
         return result
+    def quick_sfmax(self, parameters, max_sfmax=50, **kwargs):
+        """calculate_sfmax    
+        aka high frequency cutoff. Useful summary statistic of whole CSF curve
+        set the sensitivity = 1, then solve for the corresponding SF. 
+        i.e., what is the highest possible SF we can detect    
+        Can be infinte (with low width_r), so we set a max value 
+        """
+        log10_CSp = np.log10(parameters['CSp'])
+        log10_SFp = np.log10(parameters['SFp'])
+        sfmax = 10**((np.sqrt(log10_CSp/(parameters['width_r']**2)) + log10_SFp))
+        if len(sfmax.shape)>=1:
+            sfmax[sfmax>max_sfmax] = max_sfmax
+        elif sfmax>max_sfmax:
+            sfmax = max_sfmax        
+        return sfmax
     
     def quick_aulcsf(self, parameters, **kwargs):
-        parameters = self._get_parameters(parameters=parameters)
+        # parameters = self._get_parameters(parameters=parameters)
         parameters = parameters.values[np.newaxis, ...]  
         SF_levels = kwargs.get('SF_levels', np.array([ 0.5,  1.,   3.,   6.,  12.,  18. ]))
         normalize_AUC = kwargs.get('normalize_AUC', True)
@@ -1971,7 +1986,7 @@ class ContrastSensitivity(EncodingModel):
         if not normalize_AUC:
             return aulcsf
         # Chung & Legge, normalized 
-        parameters = self._get_parameters(Chung_Legge_default)
+        parameters = Chung_Legge_default #self._get_parameters(Chung_Legge_default)
         parameters = parameters.values[np.newaxis, ...]    
         csf_curve = self._asymetric_parabola(
             stim_sequence = stim_sequence,
@@ -2005,11 +2020,6 @@ class ContrastSensitivity(EncodingModel):
         log_SFp     = log10(SFp_safe)
         log_CSp     = log10(CSp_safe)
 
-        # Logarithmic transformations
-        log_SF_seq  = log10(SF_seq_safe)
-        log_SFp     = log10(SFp_safe)
-        log_CSp     = log10(CSp_safe)
-        
         # Create the curves
         log_sf_diff = (log_SF_seq - log_SFp) ** 2
         L_curve = tf.math.pow(10.0, log_CSp - (log_sf_diff) * (width_l ** 2))
@@ -2023,7 +2033,7 @@ class ContrastSensitivity(EncodingModel):
         # Smooth transition instead of hard `tf.where`
         alpha = 50.0  # Adjust to control smoothness
         blend_factor = tf.math.sigmoid(alpha * (log_SF_seq - log_SFp))
-        csf = blend_factor * R_curve + (1 - blend_factor) * L_curve  
+        csf = blend_factor * L_curve + (1 - blend_factor) * R_curve  
               
         return csf 
 
