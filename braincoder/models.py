@@ -2033,7 +2033,7 @@ class ContrastSensitivity(EncodingModel):
         # Smooth transition instead of hard `tf.where`
         alpha = 50.0  # Adjust to control smoothness
         blend_factor = tf.math.sigmoid(alpha * (log_SF_seq - log_SFp))
-        csf = blend_factor * L_curve + (1 - blend_factor) * R_curve  
+        csf = blend_factor * R_curve + (1 - blend_factor) * L_curve  
               
         return csf 
 
