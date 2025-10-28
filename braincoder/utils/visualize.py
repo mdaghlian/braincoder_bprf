@@ -62,7 +62,42 @@ def quick_plot(model, parameters, data=None, color=None):
     return 
 
 
+def quick_plot2prf(model, parameters, data=None, color=None):
+    if isinstance(parameters, pd.Series):
+        parameters = parameters.to_frame().T
+    elif isinstance(parameters, dict):
+        parameters = pd.DataFrame(parameters)
+    elif isinstance(parameters, pd.DataFrame):
+        pass
+    rfp1 = np.concatenate([parameters['x'], parameters['y'], parameters['sd'], np.zeros_like(parameters['sd']), np.ones_like(parameters['sd'])])
+    rfp2 = np.concatenate([parameters['x'], parameters['y'], parameters['sd']*parameters['srf_size'], np.zeros_like(parameters['sd']), np.ones_like(parameters['sd'])])
+    # Reshape to be [1, 1, n_params, 1]
+    rfp1 = rfp1.reshape(1, 1, -1, 1).astype(np.float32)
+    rfp2 = rfp2.reshape(1, 1, -1, 1).astype(np.float32)
+    rf1 = model._get_rf(model.grid_coordinates, rfp1).numpy().reshape(model.n_x, model.n_y).T
+    rf2 = model._get_rf(model.grid_coordinates, rfp2).numpy().reshape(model.n_x, model.n_y).T
 
+    pred = model.predict(
+        paradigm=model.paradigm,
+        parameters=parameters, 
+    )
+    
+    # Matplotlib figure
+    fig, ax = plt.subplots(
+        1, 3, figsize=(10, 5),
+        width_ratios=[1,1, 4]
+        )
+    ax[0].imshow(rf1, cmap='gray', origin='lower')
+    ax[0].axis('off')
+    ax[0].set_title('RF1')
+    ax[1].imshow(rf2, cmap='gray', origin='lower')
+    ax[1].axis('off')
+    ax[1].set_title('RF2')
+    if data is not None:
+        ax[-1].plot(data.T, '--k', label='Data', alpha=0.5, )
+    ax[-1].plot(pred, '-', color=color, label='Prediction', alpha=0.5,)
+    ax[-1].legend()
+    return 
 
 def edit_pair_plot(axes, **kwargs):
     """

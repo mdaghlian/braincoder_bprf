@@ -1639,7 +1639,47 @@ class DifferenceOfGaussiansPRF2DWithHRF(HRFEncodingModel, DifferenceOfGaussiansP
         if flexible_hrf_parameters:
             self.transformations = self.transformations + self.hrf_model.transformations
 
- 
+class CompressiveSpatialGaussiansPRF2D(GaussianPRF2D):
+
+    # Amplitude is as a fraction of the positive amplitude and is limited to be within [0, 1]
+    # srf factor is limited to be above 1
+    parameter_labels = ['x', 'y', 'sd', 'baseline',
+                        'amplitude', 'exponent']
+    transformations = ['identity', 'identity', 'softplus', 'identity', 'softplus', 'softplus',
+                      ] 
+    
+    @tf.function
+    def _basis_predictions(self, paradigm, parameters):
+        mu_x = parameters[:, :, 0, tf.newaxis]
+        mu_y = parameters[:, :, 1, tf.newaxis]
+        sd = parameters[:, :, 2, tf.newaxis]
+
+        rf_parameters = tf.concat([mu_x, mu_y, sd, tf.zeros_like(mu_x), tf.ones_like(mu_x)], axis=2)
+        rf = self._get_rf(self.grid_coordinates, rf_parameters)
+
+        # From n_batches x n_voxels to 
+        # n_batches x n_timespoints x n_populations
+        baseline = parameters[:, :, 3][:, tf.newaxis, :] 
+        amplitude = parameters[:, :, 4][:, tf.newaxis, :] 
+        exponent = parameters[:, :, 5][:, tf.newaxis, :] 
+
+        activation = amplitude * (tf.tensordot(paradigm, rf, (2, 2))[:, :, 0, :]**exponent)+ baseline
+        return activation
+    
+class CompressiveSpatialGaussiansPRF2DWithHRF(HRFEncodingModel, CompressiveSpatialGaussiansPRF2D):
+
+    def __init__(self, grid_coordinates=None, paradigm=None, data=None, parameters=None,
+                 positive_image_values_only=True,
+                 weights=None, hrf_model=None, flexible_hrf_parameters=False, verbosity=logging.INFO, **kwargs):
+
+        CompressiveSpatialGaussiansPRF2D.__init__(self, grid_coordinates=grid_coordinates, paradigm=paradigm, data=data, parameters=parameters, weights=weights, verbosity=verbosity,
+                        positive_image_values_only=positive_image_values_only, **kwargs)
+
+        HRFEncodingModel.__init__(self, hrf_model=hrf_model, flexible_hrf_parameters=flexible_hrf_parameters, **kwargs)
+
+        if flexible_hrf_parameters:
+            self.transformations = self.transformations + self.hrf_model.transformations
+     
 
 class DivisiveNormalizationGaussianPRF2D(GaussianPRF2D):
     # Amplitude is as a fraction of the positive amplitude and is limited to be within [0, 1]
@@ -1854,6 +1894,7 @@ Chung_Legge_default = pd.DataFrame({
     'baseline': [0,], 
     'crf_exp' : [0,], 
 }).astype('float32')
+
 class ContrastSensitivity(EncodingModel):
     
     parameter_labels = [
@@ -1952,7 +1993,7 @@ class ContrastSensitivity(EncodingModel):
         # Want the output to be n_batches x n_timepoints x n_voxels
         result = tf.transpose(result, [0, 2, 1])
         return result
-    def quick_sfmax(self, parameters, max_sfmax=50, **kwargs):
+    def quick_sfmax(self, parameters, max_sfmax=5000, **kwargs):
         """calculate_sfmax    
         aka high frequency cutoff. Useful summary statistic of whole CSF curve
         set the sensitivity = 1, then solve for the corresponding SF. 
@@ -1972,6 +2013,10 @@ class ContrastSensitivity(EncodingModel):
         # parameters = self._get_parameters(parameters=parameters)
         parameters = parameters.values[np.newaxis, ...]  
         SF_levels = kwargs.get('SF_levels', np.array([ 0.5,  1.,   3.,   6.,  12.,  18. ]))
+        SF_levels = np.logspace(
+                np.log10(1.5), np.log10(18), 50
+            )
+        # kwargs.get('SF_levels', np.array([ 0.5,  1.,   3.,   6.,  12.,  18. ]))
         normalize_AUC = kwargs.get('normalize_AUC', True)
         stim_sequence = pd.DataFrame({'SF':SF_levels, 'CON':SF_levels*0}).astype('float32')
         log_SF_levels = np.log10(SF_levels)#.reshape(1,-1)
@@ -2057,31 +2102,47 @@ class ContrastSensitivity(EncodingModel):
         return ncsf_resp  
    
     
-class ContrastSensitivitySigmoid(ContrastSensitivity):
-    """
-    Inherits from ContrastSensitivity but uses a sigmoid function for the CRF
-    instead of the Naka-Rushton (Naka-Rushton) formulation.
-    """
-    def _apply_crf(self, stim_sequence, parameters, csf):
-        # stim_sequence: [n_samples, 2] with columns [SF, CON]
-        # parameters: [n_batches, n_populations, n_params]
-        # csf: contrast sensitivity filter
-        # Extract contrast (second column) and reshape for broadcasting
-        CON_seq = stim_sequence[:, 1][tf.newaxis, tf.newaxis, :]
+# class ContrastSensitivityLogSigmoidWith(ContrastSensitivityWithHRF):
+#     """
+#     Inherits from ContrastSensitivity but uses a sigmoid function for the CRF
+#     instead of the Naka-Rushton (Naka-Rushton) formulation.
+#     """
+#     def _apply_crf(self, stim_sequence, parameters, csf):
+#         # stim_sequence: [n_samples, 2] with columns [SF, CON]
+#         # parameters: [n_batches, n_populations, n_params]
+#         # csf: contrast sensitivity filter
+#         # Extract contrast (second column) and reshape for broadcasting
+#         CON_seq = stim_sequence[:, 1][tf.newaxis, tf.newaxis, :]
 
-        # Sigmoid slope (crf_exp) and scale (amplitude) from parameters
-        crf_exp = parameters[:, :, 4, tf.newaxis]
-        amplitude = parameters[:, :, 5, tf.newaxis]
-        baseline = parameters[:, :, 6, tf.newaxis]
+#         # Sigmoid slope (crf_exp) and scale (amplitude) from parameters
+#         crf_exp = parameters[:, :, 4, tf.newaxis]
+#         amplitude = parameters[:, :, 5, tf.newaxis]
+#         baseline = parameters[:, :, 6, tf.newaxis]
 
-        # Contrast threshold (midpoint of sigmoid)
-        cthresh = 100 / tf.clip_by_value(csf, 1e-1, 1e6)
+#         # Contrast threshold (midpoint of sigmoid)
+#         cthresh = 100 / tf.clip_by_value(csf, 1e-1, 1e6)
 
-        # Sigmoid-based response: amplitude * sigmoid(slope * (contrast - threshold)) + baseline
-        sigmoid_input = crf_exp * (CON_seq - cthresh)
-        ncsf_resp = amplitude * tf.math.sigmoid(sigmoid_input) + baseline
-        return ncsf_resp
+#         # Sigmoid-based response: amplitude * sigmoid(slope * (contrast - threshold)) + baseline
+#         sigmoid_input = crf_exp * (CON_seq - cthresh)
+#         ncsf_resp = amplitude * tf.math.sigmoid(sigmoid_input) + baseline
+#         return ncsf_resp
 
+#     def _apply_crf(self, stim_sequence, parameters, csf):
+
+#         CON_seq = stim_sequence[:, 1][tf.newaxis, tf.newaxis, :]
+
+#         # Sigmoid slope (crf_exp) and scale (amplitude) from parameters
+#         crf_exp = parameters[:, :, 4, tf.newaxis]
+#         amplitude = parameters[:, :, 5, tf.newaxis]
+#         baseline = parameters[:, :, 6, tf.newaxis]
+
+#         # Contrast threshold (midpoint of sigmoid)
+#         cthresh = 100 / tf.clip_by_value(csf, 1e-1, 1e6)
+
+#         # Sigmoid-based response: amplitude * sigmoid(slope * (contrast - threshold)) + baseline
+#         sigmoid_input = crf_exp * (CON_seq - cthresh)
+#         ncsf_resp = amplitude * tf.math.sigmoid(sigmoid_input) + baseline
+#         return ncsf_resp
 
 
 class ContrastSensitivityWithHRF(HRFEncodingModel, ContrastSensitivity):
@@ -2109,3 +2170,194 @@ class ContrastSensitivityWithHRF(HRFEncodingModel, ContrastSensitivity):
         self.transformations = [(i.forward,i.inverse) for _,i in self.p_bijector.items()]
         if self.flexible_hrf_parameters:
             self.transformations = self.transformations + self.hrf_model.transformations
+
+
+# class ContrastSensitivityTruncatedLogWithHrf(ContrastSensitivityWithHRF):    
+    # parameter_labels = [
+    #     'width_r',      # 0
+    #     'SFp',          # 1
+    #     'CSp',          # 2
+    #     'lowSFtrunk',    # 3
+    #     'crf_exp',      # 4
+    #     'amplitude',    # 5
+    #     'baseline',     # 6
+    #     ]
+    # stimulus_type = ContrastSensitivityStimulus
+
+    # def __init__(self, data=None, parameters=None,  
+    #                 SF_seq=None, CON_seq=None,               
+    #                 weights=None, omega=None, allow_neg_amplitudes=False, bounds=None, 
+    #                 verbosity=logging.INFO, 
+    #                 **kwargs):
+    #     self.data = data
+    #     self.parameters = format_parameters(parameters)
+    #     self.weights = weights
+    #     self.omega = omega
+    #     grid = np.vstack([SF_seq, CON_seq]).T
+    #     self.stim_sequence = pd.DataFrame(
+    #         grid, columns=['SF', 'CON']).astype('float32')
+    #     self._stim_sequence = self.stim_sequence.values
+    #     self.n_SF = len(self.stim_sequence['SF'].unique())
+    #     self.n_CON = len(self.stim_sequence['CON'].unique())
+
+    #     self.stimulus = self.stimulus_type()
+    #     self.paradigm = self.stimulus.clean_paradigm(self.stim_sequence)
+
+    #     if omega is not None:
+    #         self.omega_chol = np.linalg.cholesky(omega)
+    #     self.n_params = len(self.parameter_labels)
+    #     self.p_bijector = {
+    #         'width_r' : tfb.Softplus(),
+    #         'SFp'     : tfb.Softplus(),
+    #         'CSp'     : tfb.Softplus(),
+    #         'lowSFtrunc' : tfb.Softplus(),
+    #         'crf_exp'     : tfb.Softplus(),
+    #         'amplitude'     : tfb.Softplus(),
+    #         'baseline'     : tfb.Identity(),
+    #     }
+    #     self.transformations = [(i.forward,i.inverse) for _,i in self.p_bijector.items()]        
+    # def update_transformations(self):
+    #     self.transformations = [(i.forward,i.inverse) for _,i in self.p_bijector.items()]
+
+    # def get_csf_for_plot(self, SF_grid, CON_grid=np.array([1,1]), parameters=None):
+    #     ''' Get the csf for a grid of SF and CON values '''
+    #     if len(SF_grid.shape) == 1:
+    #         SF_grid, CON_grid = np.meshgrid(SF_grid, CON_grid)
+    #     SF_grid, CON_grid = SF_grid.flatten(), CON_grid.flatten()
+    #     grid = np.vstack([SF_grid, CON_grid]).T
+    #     stim_sequence = pd.DataFrame(
+    #         grid, columns=['SF', 'CON']).astype('float32')
+    #     stim_sequence = stim_sequence.values
+
+    #     parameters = self._get_parameters(parameters)
+    #     parameters = parameters.values[np.newaxis, ...]
+
+    #     csf = self._get_csf(stim_sequence, parameters).numpy()[0]
+        
+    #     return csf, SF_grid, CON_grid
+    
+    # def get_csf_curve(self, SF_values, parameters=None):
+    #     ''' Get the csf for a grid of SF and CON values '''
+    #     CON_values = np.ones_like(SF_values)
+    #     stim_sequence = pd.DataFrame({
+    #         'SF' : SF_values,
+    #         'CON' : CON_values,
+    #         },
+    #     ).astype('float32')
+    #     stim_sequence = stim_sequence.values
+    #     parameters = self._get_parameters(parameters)
+    #     parameters = parameters.values[np.newaxis, ...]
+
+    #     csf = self._truncparabola(stim_sequence, parameters).numpy()[0]
+
+        
+    #     return csf
+
+
+    # @tf.function
+    # def _basis_predictions(self, paradigm, parameters):
+    #     # paradigm: n_batches x n_timepoints x n_stimulus_features
+    #     # parameters:: n_batches x n_voxels x n_parameters
+
+    #     # norm: n_batches x n_timepoints x n_voxels
+
+    #     # output: n_batches x n_timepoints x n_voxels
+    #     csf = self._get_csf(paradigm[0], parameters)
+
+    #     baseline = parameters[:, :, 6, tf.newaxis]
+    #     result = csf + baseline
+    #     # Want the output to be n_batches x n_timepoints x n_voxels
+    #     result = tf.transpose(result, [0, 2, 1])
+    #     return result
+    # def quick_sfmax(self, parameters, max_sfmax=50, **kwargs):
+    #     """calculate_sfmax    
+    #     aka high frequency cutoff. Useful summary statistic of whole CSF curve
+    #     set the sensitivity = 1, then solve for the corresponding SF. 
+    #     i.e., what is the highest possible SF we can detect    
+    #     Can be infinte (with low width_r), so we set a max value 
+    #     """
+    #     log10_CSp = np.log10(parameters['CSp'])
+    #     log10_SFp = np.log10(parameters['SFp'])
+    #     sfmax = 10**((np.sqrt(log10_CSp/(parameters['width_r']**2)) + log10_SFp))
+    #     if len(sfmax.shape)>=1:
+    #         sfmax[sfmax>max_sfmax] = max_sfmax
+    #     elif sfmax>max_sfmax:
+    #         sfmax = max_sfmax        
+    #     return sfmax
+    
+    # def quick_aulcsf(self, parameters, **kwargs):
+    #     # parameters = self._get_parameters(parameters=parameters)
+    #     parameters = parameters.values[np.newaxis, ...]  
+    #     SF_levels = kwargs.get('SF_levels', np.array([ 0.5,  1.,   3.,   6.,  12.,  18. ]))
+    #     normalize_AUC = kwargs.get('normalize_AUC', True)
+    #     stim_sequence = pd.DataFrame({'SF':SF_levels, 'CON':SF_levels*0}).astype('float32')
+    #     log_SF_levels = np.log10(SF_levels)#.reshape(1,-1)
+    #     # Generate grid to make the CSF     
+    #     csf_curve = self._truncparabola(
+    #         stim_sequence = stim_sequence,
+    #         parameters = parameters
+    #         ).numpy()
+    #     logcsf_curve = np.log10(csf_curve)    
+    #     logcsf_curve[logcsf_curve<0] = 0 # Cannot have negative logCSF
+    #     aulcsf = np.trapz(logcsf_curve.T, x=log_SF_levels, axis=0) 
+    #     return aulcsf
+
+    # @tf.function
+    # def _truncparabola(self, stim_sequence, parameters):
+    #     # n_batches x n_populations x  n_grid_spaces
+    #     SF_seq = stim_sequence[:, 0][tf.newaxis, tf.newaxis, :]
+
+    #     # Unpack parameters with broadcasting                
+    #     # n_batches x n_populations x n_grid_spaces (broadcast)
+    #     width_r = parameters[:, :, 0, tf.newaxis]
+    #     SFp = parameters[:, :, 1, tf.newaxis]
+    #     CSp = parameters[:, :, 2, tf.newaxis]
+    #     lowSFtrunc = parameters[:, :, 3, tf.newaxis]        
+        
+    #     # Safeguard against log of non-positive values
+    #     SF_seq_safe = tf.maximum(SF_seq, 1e-8)
+    #     SFp_safe = tf.maximum(SFp, 1e-8)
+    #     CSp_safe = tf.maximum(CSp, 1e-8)
+    #     lowSFtrunc = tf.maximum(lowSFtrunc, 1e-8) # linear 
+
+    #     # Logarithmic transformations
+    #     log_SF_seq  = log10(SF_seq_safe)
+    #     log_SFp     = log10(SFp_safe)
+    #     log_CSp     = log10(CSp_safe)
+        
+    #     K = log10(0.5)
+    #     logWidth = (10**width_r)*log10(2)/2
+
+    #     logP = log_CSp + K * ((1/logWidth) * (log_SF_seq-log_SFp))
+        
+    #     truncHalf = CSp-lowSFtrunc
+
+    #     left_condition = tf.math.logical_and(tf.less(logP, truncHalf), tf.less(log_SF_seq, log_SFp))
+    #     leftCSF = tf.cast(left_condition, dtype=logP.dtype) * truncHalf
+
+    #     # rightCSF
+    #     right_condition = tf.math.logical_or(tf.greater_equal(logP, truncHalf), tf.greater(log_SF_seq, log_SFp))
+    #     rightCSF = tf.cast(right_condition, dtype=logP.dtype) * logP
+
+    #     # logCSF
+    #     csf = leftCSF + rightCSF              
+    #     return csf 
+
+    # @tf.function
+    # def _apply_crf(self, stim_sequence, parameters,csf):
+    #     # n_batches x n_populations x  n_grid_spaces
+    #     CON_seq = stim_sequence[:, 1][tf.newaxis, tf.newaxis, :]    
+    #     # n_batches x n_populations x n_grid_spaces (broadcast)        
+    #     crf_exp = parameters[:, :, 4, tf.newaxis]
+    #     amplitude = parameters[:, :, 5, tf.newaxis]        
+    #     # Contrast sensitivity
+    #     cthresh = 100 / tf.clip_by_value(csf, 1e-1, 1e6) # Prevent extremes prev 1e-6...
+    #     ncsf_resp = ((CON_seq ** crf_exp) / (CON_seq ** crf_exp + cthresh ** crf_exp)) * amplitude
+    #     return ncsf_resp    
+    
+    # @tf.function
+    # def _get_csf(self, stim_sequence, parameters):
+    #     csf = self._asymetric_parabola(stim_sequence, parameters)
+    #     ncsf_resp = self._apply_crf(stim_sequence, parameters, csf)
+
+    #     return ncsf_resp  
