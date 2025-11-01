@@ -882,8 +882,16 @@ class BPRF_hier(BPRF):
         self.n_params = len(self.model_labels)
         self.h_prep_for_fitting(**kwargs)
         self.h_n_params = len(self.h_labels)
-        pid_pars = pid_pars.values.astype(np.float32) # These stay the same...
-        pid_pars = tf.convert_to_tensor(pid_pars[vx_bool], dtype=tf.float32, name=pid)         
+
+        if not isinstance(pid, list):
+            pid = [pid]
+        pid_pars_tf = {}
+        for p in pid:
+            pid_pars_tf[p] = tf.convert_to_tensor(
+                    pid_pars[p].values.astype(np.float32)[vx_bool], dtype=tf.float32, name=p
+                )
+        # pid_pars = pid_pars.values.astype(np.float32) # These stay the same...
+        # pid_pars = tf.convert_to_tensor(pid_pars[vx_bool], dtype=tf.float32, name=pid)         
         h_init_pars = self.sort_h_parameters(h_init_pars)
         h_init_pars = format_parameters(h_init_pars)
         h_init_pars = h_init_pars.values.astype(np.float32)
@@ -897,17 +905,17 @@ class BPRF_hier(BPRF):
             return p_out 
         if self.include_jacobian:
             @tf.function
-            def log_jac_fn(h_parameters, parameters):
+            def log_jac_fn(h_parameters): #, parameters):
                 p_out = 0.0
                 for h in self.h_priors_to_loop:
                     p_out += tf.reduce_sum(self.h_bijector[h].forward_log_det_jacobian(
                         h_parameters[:,self.h_labels[h]], 
                         event_ndims=0,
                     ))                
-                    p_out += tf.reduce_sum(self.p_bijector[pid].forward_log_det_jacobian(
-                        parameters, 
-                        event_ndims=0,
-                    ))                        
+                    # p_out += tf.reduce_sum(self.p_bijector[pid].forward_log_det_jacobian(
+                    #     parameters, 
+                    #     event_ndims=0,
+                    # ))                        
                 return p_out
         else:
             @tf.function
@@ -919,23 +927,24 @@ class BPRF_hier(BPRF):
             # [1] Mask fixed parameters 
             h_parameters = self.h_fix_update_fn(h_parameters)
             # [2] Jacobian
-            log_jac = log_jac_fn(h_parameters, pid_pars)
+            log_jac = log_jac_fn(h_parameters) #, pid_pars)
             # [3] Bijector (h parameter only, other are fixed)
             h_parameters = self._h_bprf_transform_parameters_forward(h_parameters)
             # [4] Prior (h parameters )
             log_prior = log_prior_fn(h_parameters)            
             # [5] Apply gp to parameters
-
-            if self.h_prior_to_apply[pid]=='gp':
-                gpkwargs = {}
-                for k in self.h_labels:
-                    if pid in k:
-                        gpkwargs[k.split(f'{pid}_')[-1]] = h_parameters[:, self.h_labels[k]]
-                gp_likelihood = self.h_gp_function[pid].return_log_prob(
-                    parameter=pid_pars,**gpkwargs,
-                )                     
-            else:
-                raise AssertionError
+            gp_likelihood = 0.0
+            for p in pid: 
+                if self.h_prior_to_apply[p]=='gp':
+                    gpkwargs = {}
+                    for k in self.h_labels:
+                        if p in k:
+                            gpkwargs[k.split(f'{p}_')[-1]] = h_parameters[:, self.h_labels[k]]
+                    gp_likelihood += tf.reduce_sum(self.h_gp_function[p].return_log_prob(
+                        parameter=pid_pars_tf[p],**gpkwargs,
+                    ))                     
+                else:
+                    raise AssertionError
             return tf.reduce_sum(log_prior + gp_likelihood + log_jac)
 
         # -> make sure we are in the correct dtype
