@@ -5,6 +5,12 @@ from tensorflow.math import sigmoid
 from .utils import logit
 
 class HRFModel(object):
+    """Base class that handles HRF generation and convolution with predictions.
+
+    Subclasses implement ``get_hrf`` (not shown here) while this class exposes
+    shared/voxel-specific convolution strategies that operate on TensorFlow
+    tensors compatible with the encoding models.
+    """
     def set_unique_hrfs(self, unique_hrfs):
         self.unique_hrfs = unique_hrfs
         self._convolve = self._convolve_unique if unique_hrfs else self._convolve_shared
@@ -188,18 +194,12 @@ def spm_hrf(t, a1=6., d1=1., a2=16., d2=1., c=1./6, highres_dt=0.1):
         hrf_interp = tf.squeeze(hrf_interp, axis=1)
     return hrf_interp
 
-
-def bounded_sigmoid_transform(min_val, max_val):
-    def forward(x):
-        return tf.sigmoid(x) * (max_val - min_val) + min_val
-    def backward(y):
-        y_scaled = (y - min_val) / (max_val - min_val)
-        return tf.math.log(y_scaled / (1.0 - y_scaled))
-    return (forward, backward)
-
-
 class SPMHRFModel(HRFModel):
+    """Canonical SPM-style HRF parameterized by delay/dispersion bounds.
 
+    Provides TF-friendly HRF sampling plus helper attributes so encoding models
+    can expose HRF parameters alongside the main receptive-field parameters.
+    """
 
     parameter_labels = ['hrf_delay', 'hrf_dispersion']
     n_parameters = 2
@@ -227,10 +227,7 @@ class SPMHRFModel(HRFModel):
                                       np.rint(float(self.time_length) / self.dt).astype(np.int32)).astype(np.float32)
         self.time_stamps -= self.onset
         # 1D time vector
-        self.transformations = [
-            bounded_sigmoid_transform(self.min_hrf_delay, self.max_hrf_delay),
-            bounded_sigmoid_transform(self.min_dispersion, self.max_dispersion)
-        ]
+
         super().__init__(unique_hrfs=unique_hrfs)
 
     def get_hrf(self, hrf_delay=None, hrf_dispersion=None):
@@ -250,7 +247,36 @@ class SPMHRFModel(HRFModel):
                       highres_dt=self.highres_dt)
         return hrf
 
+    def _transform_parameters_forward(self, parameters):
+        delay = parameters[:, 0][:, tf.newaxis]
+        dispersion = parameters[:, 1][:, tf.newaxis]
 
+        delay = tf.sigmoid(delay)
+        dispersion = tf.sigmoid(dispersion)
+
+        delay_range = self.max_hrf_delay - self.min_hrf_delay
+        dispersion_range = self.max_dispersion - self.min_dispersion
+
+        delay = delay * delay_range + self.min_hrf_delay
+        dispersion = dispersion * dispersion_range + self.min_dispersion
+
+        return tf.concat([delay, dispersion], axis=1)
+
+    @tf.function
+    def _transform_parameters_backward(self, parameters):
+        delay = parameters[:, 0][:, tf.newaxis]
+        dispersion = parameters[:, 1][:, tf.newaxis]
+
+        delay_range = self.max_hrf_delay - self.min_hrf_delay
+        dispersion_range = self.max_dispersion - self.min_dispersion
+
+        delay = (delay - self.min_hrf_delay) / delay_range
+        dispersion = (dispersion - self.min_dispersion) / dispersion_range
+
+        delay = tf.math.log(delay / (1.0 - delay))
+        dispersion = tf.math.log(dispersion / (1.0 - dispersion))
+
+        return tf.concat([delay, dispersion], axis=1)
 
 
 class SPMHRFDerivativeModel(HRFModel):
@@ -314,7 +340,16 @@ class SPMHRFDerivativeModel(HRFModel):
 
         return hrf
 
+    def _transform_parameters_forward(self, parameters):
+        weights = tf.sigmoid(parameters)  # (n, 2), values in (0, 1)
+        weights = weights * 2 * self.max_weight - self.max_weight  # range [-max_weight, max_weight]
+        return weights
 
+    @tf.function
+    def _transform_parameters_backward(self, parameters):
+        weights = (parameters + self.max_weight) / (2 * self.max_weight)  # back to [0,1]
+        weights = tf.math.log(weights / (1.0 - weights))  # logit
+        return weights
 
 
 class CustomHRFModel(HRFModel):
