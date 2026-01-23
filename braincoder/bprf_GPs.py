@@ -268,6 +268,8 @@ class GP():
     #     gpk_const = tf.cast(gpk_const, dtype=self.gp_dtype)        
     #     cov_matrix = gpk_slope**2 * (Xs-gpk_const) * (tf.transpose(Xs) - gpk_const)
     #     return cov_matrix
+    def set_log_prob_univariate(self, **kwargs):
+        self.return_log_prob = self._return_log_prob_univariate
 
     def set_log_prob_fixed(self,**kwargs):
         # Create a one off covariance matrix -> then use it to get probability each time...
@@ -369,6 +371,17 @@ class GP():
         for k in self.pids.keys():
             k_list += kwargs[self.pids[k]]*0.0
         return self.gp_prior_dist.log_prob(parameter)+k_list
+
+    def _return_log_prob_univariate(self, parameter, **kwargs):
+        gpk_nugget = tf.cast(kwargs['gpk_nugget'], dtype=self.gp_dtype)
+        m_vect = self._return_mfunc(**kwargs)
+        prior_dist = tfd.Normal(
+            loc=0.0, 
+            scale=gpk_nugget        
+        
+        )
+        return prior_dist.log_prob(parameter-m_vect)
+
 
     def _predict(self, **kwargs):
         ''' GP prediction
@@ -597,6 +610,128 @@ class GP():
         return pred_mean, std_pred
 
 
+class GPSpec(GP):
+    '''
+    Special instance, using spectral methods...
+    '''
+    def __init__(self, n_vx, eig_vects, eig_vals, **kwargs):
+        super().__init__(n_vx, **kwargs)
+        self.eig_vals = tf.convert_to_tensor(eig_vals, dtype=self.gp_dtype)
+        self.eig_vects = tf.convert_to_tensor(eig_vects, dtype=self.gp_dtype)
+        self.mass_matrix = kwargs.get('mass_matrix', None)
+        if self.mass_matrix is None:
+            self.mass_matrix = tf.ones([self.n_vx], dtype=self.gp_dtype)
+        else:
+            self.mass_matrix = tf.constant(self.mass_matrix, dtype=self.gp_dtype)   # [V]
+        self.mass_matrix_sqrt = tf.sqrt(self.mass_matrix)  # useful for computations
+        self.n_lbo = eig_vects.shape[-1]
+        self.spec_kernel_list = []
+        self.pids[2] = 'gpk_var'  
+        self.pids_inv = {}
+        self._update_pids_inv()
+    
+    # *** KERNELS ***
+    # -> add Spectral kernels (based on LBO)
+    def add_xid_kappa_kernel(self, xid, **kwargs):
+        ''' CHANGED - may alter original as well
+        '''
+        self.kernel_type[xid] = kwargs.get('kernel_type', 'spec_exp')                
+        # if spectral, expect precomputed eigenpairs
+        if self.kernel_type[xid] == 'spec_exp':
+            self.pids[len(self.pids)] = f'gpk{xid}_kappa_l'
+            self.pids[len(self.pids)] = f'gpk{xid}_kappa_v'
+        elif self.kernel_type[xid] == 'spec_heat':
+            self.pids[len(self.pids)] = f'gpk{xid}_kappa_t'
+        elif self.kernel_type[xid] == 'spec_ratquad':
+            self.pids[len(self.pids)] = f'gpk{xid}_kappa_alpha'
+            self.pids[len(self.pids)] = f'gpk{xid}_kappa_beta'
+        else:
+            raise ValueError(f"Unknown kernel type: {self.kernel_type[xid]}.")
+        self.spec_kernel_list.append(xid)
+        self._update_pids_inv()
+    
+    @tf.function
+    def _return_kappa(self, **kwargs):
+        ''' To return the (L,) tensor (for diagonal)'''
+        
+        k_out = tf.zeros(self.n_lbo, dtype=self.gp_dtype)            
+        
+        for s in self.spec_kernel_list:
+            spec_kwargs = {i.replace(s,''):k for i,k in kwargs.items() if 'kappa' in i}
+            k_out += self._return_kappa_xid_spectral(
+                eig_vals=self.eig_vals,
+                kernel_type=self.kernel_type[s],
+                mass_matrix_sqrt=self.mass_matrix_sqrt,  # FIXED: Added missing comma
+                **spec_kwargs,
+            )
+        k_out *= tf.cast(kwargs['gpk_var'], dtype=self.gp_dtype)    
+        return k_out
+    
+    @tf.function
+    def _return_kappa_xid_spectral(self, eig_vals, kernel_type, mass_matrix_sqrt, **kwargs):
+        """
+        Compute spectral kernel values based on eigenvalues.
+        You need to implement this based on your specific kernel formulations.
+        """
+        print(kwargs)
+        if kernel_type == 'spec_exp':
+            # Example: exponential kernel in spectral domain
+            kappa_l = tf.cast(kwargs['gpk_kappa_l'], self.gp_dtype)
+            kappa_v = tf.cast(kwargs['gpk_kappa_v'], self.gp_dtype)
+            return kappa_v * tf.exp(-kappa_l * eig_vals)
+        
+        elif kernel_type == 'spec_heat':
+            # Example: heat kernel
+            kappa_t = tf.cast(kwargs['gpk_kappa_t'], self.gp_dtype)
+            return tf.exp(-kappa_t * eig_vals)
+        
+        elif kernel_type == 'spec_ratquad':
+            # Example: rational quadratic kernel
+            alpha = tf.cast(kwargs['gpk_kappa_alpha'], self.gp_dtype)
+            beta = tf.cast(kwargs['gpk_kappa_beta'], self.gp_dtype)
+            return (1.0 + eig_vals / (2.0 * alpha * beta)) ** (-alpha)
+        
+        else:
+            raise ValueError(f"Unknown kernel type: {kernel_type}")
+    
+    @tf.function
+    def _return_log_prob_unfixed(self, parameter, **kwargs):
+        """
+        Compute log probability using spectral representation.
+        """
+        gp_nugget = tf.cast(self.eps + kwargs[f'gpk_nugget'], dtype=self.gp_dtype)
+        
+        # [1] Get mean function
+        m_vect = self._return_mfunc(**kwargs)
+        # -> demean 
+        dm_parameter = parameter - m_vect      
+        
+        # Project y into the spectral domain: z = Phi^T y
+        # Including mass matrix
+        yw = tf.cast(dm_parameter, self.gp_dtype) * self.mass_matrix_sqrt
+        phiw = self.eig_vects * self.mass_matrix_sqrt[..., tf.newaxis]
+        proj_dm_parameter = tf.tensordot(phiw, yw, axes=[[0], [0]])  # [M]
+        
+        # Compute residual norm^2: r = y - Phi z
+        y_recon = tf.tensordot(phiw, proj_dm_parameter, axes=[[1], [0]])  # [N]
+        r2 = tf.reduce_sum((yw - y_recon) ** 2)  # FIXED: Use yw instead of dm_parameter
+        
+        # Get kappa
+        kappa = self._return_kappa(**kwargs) 
+        gp_prior_dist = tfd.MultivariateNormalDiag(
+            loc=tf.zeros(self.n_lbo, dtype=self.gp_dtype), 
+            scale_diag=tf.sqrt(kappa+gp_nugget)
+        )
+        log_prob = gp_prior_dist.log_prob(proj_dm_parameter)
+        
+        # Residual treated as iid noise: ||r||^2 / (2 σ2_obs) + const
+        n_residual = tf.cast(self.n_vx - self.n_lbo, self.gp_dtype)
+        lr = -0.5 * (
+            r2 / gp_nugget + 
+            n_residual * tf.math.log(2 * tf.constant(np.pi, dtype=self.gp_dtype) * gp_nugget)
+        )
+        
+        return log_prob + lr 
 
 # ******* SUPPORTING FUNCTIONS *********
 @tf.function

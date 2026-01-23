@@ -2102,48 +2102,6 @@ class ContrastSensitivity(EncodingModel):
         return ncsf_resp  
    
     
-# class ContrastSensitivityLogSigmoidWith(ContrastSensitivityWithHRF):
-#     """
-#     Inherits from ContrastSensitivity but uses a sigmoid function for the CRF
-#     instead of the Naka-Rushton (Naka-Rushton) formulation.
-#     """
-#     def _apply_crf(self, stim_sequence, parameters, csf):
-#         # stim_sequence: [n_samples, 2] with columns [SF, CON]
-#         # parameters: [n_batches, n_populations, n_params]
-#         # csf: contrast sensitivity filter
-#         # Extract contrast (second column) and reshape for broadcasting
-#         CON_seq = stim_sequence[:, 1][tf.newaxis, tf.newaxis, :]
-
-#         # Sigmoid slope (crf_exp) and scale (amplitude) from parameters
-#         crf_exp = parameters[:, :, 4, tf.newaxis]
-#         amplitude = parameters[:, :, 5, tf.newaxis]
-#         baseline = parameters[:, :, 6, tf.newaxis]
-
-#         # Contrast threshold (midpoint of sigmoid)
-#         cthresh = 100 / tf.clip_by_value(csf, 1e-1, 1e6)
-
-#         # Sigmoid-based response: amplitude * sigmoid(slope * (contrast - threshold)) + baseline
-#         sigmoid_input = crf_exp * (CON_seq - cthresh)
-#         ncsf_resp = amplitude * tf.math.sigmoid(sigmoid_input) + baseline
-#         return ncsf_resp
-
-#     def _apply_crf(self, stim_sequence, parameters, csf):
-
-#         CON_seq = stim_sequence[:, 1][tf.newaxis, tf.newaxis, :]
-
-#         # Sigmoid slope (crf_exp) and scale (amplitude) from parameters
-#         crf_exp = parameters[:, :, 4, tf.newaxis]
-#         amplitude = parameters[:, :, 5, tf.newaxis]
-#         baseline = parameters[:, :, 6, tf.newaxis]
-
-#         # Contrast threshold (midpoint of sigmoid)
-#         cthresh = 100 / tf.clip_by_value(csf, 1e-1, 1e6)
-
-#         # Sigmoid-based response: amplitude * sigmoid(slope * (contrast - threshold)) + baseline
-#         sigmoid_input = crf_exp * (CON_seq - cthresh)
-#         ncsf_resp = amplitude * tf.math.sigmoid(sigmoid_input) + baseline
-#         return ncsf_resp
-
 
 class ContrastSensitivityWithHRF(HRFEncodingModel, ContrastSensitivity):
     def __init__(
@@ -2170,6 +2128,79 @@ class ContrastSensitivityWithHRF(HRFEncodingModel, ContrastSensitivity):
         self.transformations = [(i.forward,i.inverse) for _,i in self.p_bijector.items()]
         if self.flexible_hrf_parameters:
             self.transformations = self.transformations + self.hrf_model.transformations
+
+
+
+class ContrastSensitivityExp(ContrastSensitivityWithHRF):
+    """
+    Inherits from ContrastSensitivity but experimental
+    """
+    def _apply_crf(self, stim_sequence, parameters, csf):
+        # stim_sequence: [n_samples, 2] with columns [SF, CON]
+        # parameters: [n_batches, n_populations, n_params]
+        # csf: contrast sensitivity filter
+        # Extract contrast (second column) and reshape for broadcasting
+        CON_seq = stim_sequence[:, 1][tf.newaxis, tf.newaxis, :]
+
+        # Sigmoid slope (crf_exp) and scale (amplitude) from parameters
+        crf_exp = parameters[:, :, 4, tf.newaxis]
+        amplitude = parameters[:, :, 5, tf.newaxis]
+        baseline = parameters[:, :, 6, tf.newaxis]
+
+        # Contrast threshold (midpoint of sigmoid)
+        cthresh = 100 / tf.clip_by_value(csf, 1e-1, 1e6)
+
+        cs = tf.math.sqrt(CON_seq)
+        # cs = tf.clip_by_value(cs, 0, 99999999)
+        ncsf_resp = amplitude * (csf * cs) + baseline
+        return ncsf_resp
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 # class ContrastSensitivityTruncatedLogWithHrf(ContrastSensitivityWithHRF):    

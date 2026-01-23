@@ -301,6 +301,13 @@ class BPRF(object):
         for i, grad in enumerate(gradients):
             print(f'Gradient for parameter {i}: {grad.numpy()}')
 
+        if kwargs.get('return_mcmc_stuff', False):
+            mcmc_stuff = {
+                'target_log_prob_fn': target_log_prob_fn,
+                'initial_state' : initial_state, 
+                'bj' : self.p_bijector_list,
+            }
+            return mcmc_stuff
         # CALLING GILLES' "sample_hmc" from .utils.mcmc
         # quick test - does it work?
         initial_ll = target_log_prob_fn(*initial_state)
@@ -433,7 +440,11 @@ class BPRF(object):
         @tf.function
         def neg_log_posterior_fn():
             return -log_posterior_fn(tf.stack(opt_vars, axis=-1))
-        
+        if kwargs.get('return_mp', False): 
+            return {
+                'nll' :log_posterior_fn, 
+                'opt_vars' : opt_vars, #tf.stack(opt_vars, axis=-1)
+            }
         # **** quick test **** 
         initial_ll = neg_log_posterior_fn()
         print(f'initial neg ll={initial_ll}')                    
@@ -458,19 +469,15 @@ class BPRF(object):
         # Extract optimized parameters
         # -> transform parameters forward after fitting
         opt_vars = [self.p_bijector_list[i](ov) for i,ov in enumerate(opt_vars)]
-        optimized_samples = [var.numpy() for var in opt_vars]
-        df_list = []
-        # Save optimized parameters
-        for ivx_loc,ivx_fit in enumerate(idx):
-            estimated_p_dict = {}
-            for i,p in enumerate(self.model_labels):
-                estimated_p_dict[p] = optimized_samples[i][ivx_loc]
-            for p,v in self.fixed_pars.items():
-                estimated_p_dict[p] = estimated_p_dict[p]*0 + v[ivx_fit]
-            
-            df = pd.DataFrame(estimated_p_dict, index=[ivx_fit]) # use map_sampler instead of mcmc_sampler
-            df_list.append(df)
-        self.MAP_parameters = pd.concat(df_list).reindex(idx)
+        # to numpy 
+        opt_np = np.stack([var.numpy() for var in opt_vars], axis=1)
+        # include vx not fit... 
+        full_pars = init_pars.copy()
+        full_pars[idx,:] = opt_np
+        self.MAP_parameters = pd.DataFrame(
+                    data=full_pars,
+                    columns=self.model_labels,
+                )
         print('MAP optimization finished.')    
 
     def _create_log_prior_fn(self):
