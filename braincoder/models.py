@@ -1780,12 +1780,12 @@ class DifferenceOfGaussiansPRF2DWithHRF(HRFEncodingModel, DifferenceOfGaussiansP
             self.transformations = self.transformations + self.hrf_model.transformations
 
 class CompressiveSpatialGaussiansPRF2D(GaussianPRF2D):
-
+    from .hrf import bounded_sigmoid_transform
     # Amplitude is as a fraction of the positive amplitude and is limited to be within [0, 1]
     # srf factor is limited to be above 1
     parameter_labels = ['x', 'y', 'sd', 'baseline',
                         'amplitude', 'exponent']
-    transformations = ['identity', 'identity', 'softplus', 'identity', 'softplus', 'softplus',
+    transformations = ['identity', 'identity', 'softplus', 'identity', 'identity', 'softplus'
                       ] 
     
     @tf.function
