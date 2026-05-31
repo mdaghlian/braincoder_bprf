@@ -1,10 +1,11 @@
 import tensorflow as tf
 import tensorflow_probability as tfp
+from tensorflow_probability import bijectors as tfb
 import logging
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
-from ..utils import norm, format_data, format_paradigm, format_parameters, format_weights, logit, restrict_radians, lognormalpdf_n, von_mises_pdf, lognormal_pdf_mode_fwhm, norm2d
+from ..utils import norm, format_data, format_paradigm, format_parameters, format_weights, logit, log10, restrict_radians, lognormalpdf_n, von_mises_pdf, lognormal_pdf_mode_fwhm, norm2d
 from tensorflow_probability import distributions as tfd
 from ..utils.math import aggressive_softplus, aggressive_softplus_inverse, norm
 import scipy.stats as ss
@@ -24,11 +25,9 @@ class GaussianPRF(EncodingModel):
         """Configure Gaussian pRF with optional stimulus amplitude modeling."""
 
         if allow_neg_amplitudes:
-            self._transform_parameters_forward = self._transform_parameters_forward1
-            self._transform_parameters_backward = self._transform_parameters_backward1
+            self.transformations = ['identity', 'aggressive_softplus', 'identity', 'identity']
         else:
-            self._transform_parameters_forward = self._transform_parameters_forward2
-            self._transform_parameters_backward = self._transform_parameters_backward2
+            self.transformations = ['identity', 'aggressive_softplus', 'aggressive_softplus', 'identity']
 
         self.stimulus_type = self._get_stimulus_type(model_stimulus_amplitude=model_stimulus_amplitude)
         self._basis_predictions = self._get_basis_predictions(model_stimulus_amplitude=model_stimulus_amplitude)
@@ -56,7 +55,7 @@ class GaussianPRF(EncodingModel):
 
         paradigm = self.get_paradigm(paradigm)
         parameters = self._get_parameters(parameters)
-
+            
         paradigm_ = self._get_paradigm(paradigm)[np.newaxis, ...]
         parameters_ = parameters.values[np.newaxis, ...] if parameters is not None else None
 
@@ -156,7 +155,7 @@ class GaussianPRF(EncodingModel):
     @tf.function
     def _transform_parameters_forward1(self, parameters):
         return tf.concat([parameters[:, 0][:, tf.newaxis],
-                          aggressive_softplus(parameters[:, 1][:, tf.newaxis]),
+                          aggressive_softplus(parameters[:, 1][:, tf.newaxis]), 
                           parameters[:, 2][:, tf.newaxis],
                           parameters[:, 3][:, tf.newaxis]], axis=1)
 
@@ -195,12 +194,12 @@ class VonMisesPRF(GaussianPRF):
     stimulus_type = OneDimensionalRadialStimulus
 
     def __init__(self, paradigm=None, data=None, parameters=None,
-                 weights=None, omega=None, allow_neg_amplitudes=False,
+                 weights=None, omega=None, allow_neg_amplitudes=False, 
                  model_stimulus_amplitude=False,
                  **kwargs):
 
         super().__init__(paradigm=paradigm, data=data, parameters=parameters,
-                            weights=weights, omega=omega, allow_neg_amplitudes=allow_neg_amplitudes,
+                            weights=weights, omega=omega, allow_neg_amplitudes=allow_neg_amplitudes, 
                             model_stimulus_amplitude=model_stimulus_amplitude,
                             **kwargs)
 
@@ -210,10 +209,6 @@ class VonMisesPRF(GaussianPRF):
             return OneDimensionalRadialStimulusWithAmplitude
         else:
             return OneDimensionalRadialStimulus
-
-    def _get_stimulus(self, **kwargs):
-        """Instantiate the radial stimulus (ignores n_dimensions — always 1D)."""
-        return self.stimulus_type()
 
     @tf.function
     def _basis_predictions_without_amplitude(self, paradigm, parameters):
@@ -286,34 +281,11 @@ class LogGaussianPRF(GaussianPRF):
                           verbosity=verbosity, model_stimulus_amplitude=model_stimulus_amplitude,
                           **kwargs)
 
-    @tf.function
-    def _transform_parameters_forward1(self, parameters):
-        return tf.concat([tf.math.softplus(parameters[:, 0][:, tf.newaxis]),
-                          tf.math.softplus(parameters[:, 1][:, tf.newaxis]),
-                          parameters[:, 2][:, tf.newaxis],
-                          parameters[:, 3][:, tf.newaxis]], axis=1)
+        if allow_neg_amplitudes:
+            self.transformations = ['softplus', 'softplus', 'identity', 'identity']
+        else:
+            self.transformations = ['softplus', 'softplus', 'softplus', 'identity']
 
-    @tf.function
-    def _transform_parameters_backward1(self, parameters):
-        return tf.concat([tfp.math.softplus_inverse(parameters[:, 0][:, tf.newaxis]),
-                          tfp.math.softplus_inverse(
-                              parameters[:, 1][:, tf.newaxis]),
-                          parameters[:, 2][:, tf.newaxis],
-                          parameters[:, 3][:, tf.newaxis]], axis=1)
-    @tf.function
-    def _transform_parameters_forward2(self, parameters):
-        return tf.concat([tf.math.softplus(parameters[:, 0][:, tf.newaxis]),
-                          tf.math.softplus(parameters[:, 1][:, tf.newaxis]),
-                          tf.math.softplus(parameters[:, 2][:, tf.newaxis]),
-                          parameters[:, 3][:, tf.newaxis]], axis=1)
-
-    @tf.function
-    def _transform_parameters_backward2(self, parameters):
-        return tf.concat([tfp.math.softplus_inverse(parameters[:, 0][:, tf.newaxis]),
-                          tfp.math.softplus_inverse(
-                              parameters[:, 1][:, tf.newaxis]),
-                          tfp.math.softplus_inverse(parameters[:, 2][:, tf.newaxis]),
-                          parameters[:, 3][:, tf.newaxis]], axis=1)
     @tf.function
     def _basis_predictions_without_amplitude_n(self, paradigm, parameters):
         """Log-normal tuning (mu/sd) without external amplitude modulation."""
@@ -346,38 +318,12 @@ class LogGaussianPRF(GaussianPRF):
                     parameters[:, tf.newaxis, :, 1]) * \
             parameters[:, tf.newaxis, :, 2] * paradigm[..., tf.newaxis, 1] + parameters[:, tf.newaxis, :, 3]
 
-class GaussianPRFWithHRF(HRFEncodingModel, GaussianPRF):
+class GaussianPRFWithHRF(GaussianPRF, HRFEncodingModel):
     """Combine Gaussian pRF spatial tuning with an explicit HRF convolution."""
 
-    def __init__(self, paradigm=None, data=None, parameters=None,
-                 weights=None, omega=None, hrf_model=None,
-                 flexible_hrf_parameters=False, allow_neg_amplitudes=False,
-                 model_stimulus_amplitude=False, verbosity=logging.INFO, **kwargs):
-        GaussianPRF.__init__(self, paradigm=paradigm, data=data, parameters=parameters,
-                             weights=weights, omega=omega,
-                             allow_neg_amplitudes=allow_neg_amplitudes,
-                             model_stimulus_amplitude=model_stimulus_amplitude,
-                             verbosity=verbosity, **kwargs)
-        HRFEncodingModel.__init__(self, hrf_model=hrf_model,
-                                  flexible_hrf_parameters=flexible_hrf_parameters, **kwargs)
 
-
-class LogGaussianPRFWithHRF(HRFEncodingModel, LogGaussianPRF):
+class LogGaussianPRFWithHRF(LogGaussianPRF, HRFEncodingModel):
     """Log-Gaussian tuning plus HRF parameters."""
-
-    def __init__(self, paradigm=None, data=None, parameters=None,
-                 weights=None, omega=None, hrf_model=None,
-                 flexible_hrf_parameters=False, allow_neg_amplitudes=False,
-                 model_stimulus_amplitude=False, parameterisation='mu_sd_natural',
-                 verbosity=logging.INFO, **kwargs):
-        LogGaussianPRF.__init__(self, paradigm=paradigm, data=data, parameters=parameters,
-                                weights=weights, omega=omega,
-                                allow_neg_amplitudes=allow_neg_amplitudes,
-                                model_stimulus_amplitude=model_stimulus_amplitude,
-                                parameterisation=parameterisation,
-                                verbosity=verbosity, **kwargs)
-        HRFEncodingModel.__init__(self, hrf_model=hrf_model,
-                                  flexible_hrf_parameters=flexible_hrf_parameters, **kwargs)
 
 
 class AlphaGaussianPRF(GaussianPRF):
@@ -399,38 +345,10 @@ class AlphaGaussianPRF(GaussianPRF):
                           verbosity=verbosity, model_stimulus_amplitude=model_stimulus_amplitude,
                           **kwargs)
 
-    @tf.function
-    def _transform_parameters_forward1(self, parameters):
-        return tf.concat([tf.math.softplus(parameters[:, 0][:, tf.newaxis]),
-                          tf.math.softplus(parameters[:, 1][:, tf.newaxis]),
-                          parameters[:, 2][:, tf.newaxis],
-                          parameters[:, 3][:, tf.newaxis],
-                          parameters[:, 4][:, tf.newaxis]], axis=1)
-
-    @tf.function
-    def _transform_parameters_backward1(self, parameters):
-        return tf.concat([tfp.math.softplus_inverse(parameters[:, 0][:, tf.newaxis]),
-                          tfp.math.softplus_inverse(
-                              parameters[:, 1][:, tf.newaxis]),
-                          parameters[:, 2][:, tf.newaxis],
-                          parameters[:, 3][:, tf.newaxis],
-                          parameters[:, 4][:, tf.newaxis]], axis=1)
-    @tf.function
-    def _transform_parameters_forward2(self, parameters):
-        return tf.concat([tf.math.softplus(parameters[:, 0][:, tf.newaxis]),
-                          tf.math.softplus(parameters[:, 1][:, tf.newaxis]),
-                          parameters[:, 2][:, tf.newaxis],
-                          tf.math.softplus(parameters[:, 3][:, tf.newaxis]),
-                          parameters[:, 4][:, tf.newaxis]], axis=1)
-
-    @tf.function
-    def _transform_parameters_backward2(self, parameters):
-        return tf.concat([tfp.math.softplus_inverse(parameters[:, 0][:, tf.newaxis]),
-                          tfp.math.softplus_inverse(
-                              parameters[:, 1][:, tf.newaxis]),
-                          parameters[:, 2][:, tf.newaxis],
-                          tfp.math.softplus_inverse(parameters[:, 3][:, tf.newaxis]),
-                          parameters[:, 4][:, tf.newaxis]], axis=1)
+        if allow_neg_amplitudes:
+            self.transformations = ['softplus', 'softplus', 'identity', 'identity', 'identity']
+        else:
+            self.transformations = ['softplus', 'softplus', 'identity', 'softplus', 'identity']
 
     @tf.function
     def _basis_predictions_without_amplitude(self, paradigm, parameters):
@@ -480,7 +398,7 @@ class GaussianPRFOnGaussianSignal(GaussianPRF):
             paradigm = paradigm[['mu', 'sd']]
 
         self.stimulus_grid = stimulus_grid.astype(np.float32)
-
+    
         super().__init__(paradigm=paradigm, data=data, parameters=parameters,
                          weights=weights, omega=omega, allow_neg_amplitudes=allow_neg_amplitudes,
                          verbosity=logging.INFO, **kwargs)
@@ -496,5 +414,6 @@ class GaussianPRFOnGaussianSignal(GaussianPRF):
         input_stimulus = norm(self.stimulus_grid[:, tf.newaxis, tf.newaxis, tf.newaxis],  #grid to evaluate on
                         paradigm[tf.newaxis, ..., 0, tf.newaxis],
                         paradigm[tf.newaxis, ..., 1, tf.newaxis])
-
+        
         return tf.reduce_sum(rf_field * input_stimulus, axis=0)
+

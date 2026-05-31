@@ -1,10 +1,11 @@
 import tensorflow as tf
 import tensorflow_probability as tfp
+from tensorflow_probability import bijectors as tfb
 import logging
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
-from ..utils import norm, format_data, format_paradigm, format_parameters, format_weights, logit, restrict_radians, lognormalpdf_n, von_mises_pdf, lognormal_pdf_mode_fwhm, norm2d
+from ..utils import norm, format_data, format_paradigm, format_parameters, format_weights, logit, log10, restrict_radians, lognormalpdf_n, von_mises_pdf, lognormal_pdf_mode_fwhm, norm2d
 from tensorflow_probability import distributions as tfd
 from ..utils.math import aggressive_softplus, aggressive_softplus_inverse, norm
 import scipy.stats as ss
@@ -13,6 +14,8 @@ from patsy import dmatrix, build_design_matrices
 from .base import EncodingModel, HRFEncodingModel
 
 class GaussianPointPRF2D(EncodingModel):
+    # parameter_labels set in __init__ depending on correlated_response
+    # transformations must be set in __init__ as well
 
     def __init__(self, paradigm=None, data=None, parameters=None,
                  weights=None, omega=None, allow_neg_amplitudes=False, verbosity=logging.INFO,
@@ -27,11 +30,15 @@ class GaussianPointPRF2D(EncodingModel):
             self.parameter_labels = ['mu_x', 'mu_y', 'sd_x', 'sd_y', 'amplitude', 'baseline']
 
         if allow_neg_amplitudes:
-            self._transform_parameters_forward = self._transform_parameters_forward1
-            self._transform_parameters_backward = self._transform_parameters_backward1
+            if correlated_response:
+                self.transformations = ['identity', 'identity', 'softplus', 'softplus', 'softplus', 'identity', 'identity']
+            else:
+                self.transformations = ['identity', 'identity', 'softplus', 'softplus', 'identity', 'identity']
         else:
-            self._transform_parameters_forward = self._transform_parameters_forward2
-            self._transform_parameters_backward = self._transform_parameters_backward2
+            if correlated_response:
+                self.transformations = ['identity', 'identity', 'softplus', 'softplus', 'softplus', 'softplus', 'identity']
+            else:
+                self.transformations = ['identity', 'identity', 'softplus', 'softplus', 'softplus', 'identity']
 
         self.stimulus_type = self._get_stimulus_type(model_stimulus_amplitude=model_stimulus_amplitude)
         self._basis_predictions = self._get_basis_predictions(model_stimulus_amplitude=model_stimulus_amplitude)
@@ -174,82 +181,11 @@ class GaussianPointPRF2D(EncodingModel):
                 'First initialize WWT for a specific stimulus range using init_pseudoWWT!')
 
 
-    def _transform_parameters_forward1(self, parameters):
 
-        if self.correlated_response:
-            return tf.concat([parameters[:, 0][:, tf.newaxis],
-                              parameters[:, 1][:, tf.newaxis],
-                              tf.math.softplus(parameters[:, 2][:, tf.newaxis]),
-                              tf.math.softplus(parameters[:, 3][:, tf.newaxis]),
-                              tf.math.softplus(parameters[:, 4][:, tf.newaxis]) * 2 - 1,
-                              parameters[:, 5][:, tf.newaxis],
-                              parameters[:, 6][:, tf.newaxis]], axis=1)
-        else:
-            return tf.concat([parameters[:, 0][:, tf.newaxis],
-                             parameters[:, 1][:, tf.newaxis],
-                             tf.math.softplus(parameters[:, 2][:, tf.newaxis]),
-                             tf.math.softplus(parameters[:, 3][:, tf.newaxis]),
-                             parameters[:, 4][:, tf.newaxis],
-                             parameters[:, 5][:, tf.newaxis]], axis=1)
-
-    def _transform_parameters_backward1(self, parameters):
-
-        if self.correlated_response:
-            return tf.concat([parameters[:, 0][:, tf.newaxis],
-                              parameters[:, 1][:, tf.newaxis],
-                                tfp.math.softplus_inverse(parameters[:, 2][:, tf.newaxis]),
-                                tfp.math.softplus_inverse(parameters[:, 3][:, tf.newaxis]),
-                                tfp.math.softplus_inverse((parameters[:, 4][:, tf.newaxis] + 1) / 2.),
-                                parameters[:, 5][:, tf.newaxis],
-                                parameters[:, 6][:, tf.newaxis]], axis=1)
-
-        else:
-            return tf.concat([parameters[:, 0][:, tf.newaxis],
-                             parameters[:, 1][:, tf.newaxis],
-                             tfp.math.softplus_inverse(parameters[:, 2][:, tf.newaxis]),
-                             tfp.math.softplus_inverse(parameters[:, 3][:, tf.newaxis]),
-                             parameters[:, 4][:, tf.newaxis],
-                             parameters[:, 5][:, tf.newaxis]], axis=1)
-
-
-    def _transform_parameters_forward2(self, parameters):
-
-        if self.correlated_response:
-            return tf.concat([parameters[:, 0][:, tf.newaxis],
-                              parameters[:, 1][:, tf.newaxis],
-                              tf.math.softplus(parameters[:, 2][:, tf.newaxis]),
-                              tf.math.softplus(parameters[:, 3][:, tf.newaxis]),
-                              tf.math.softplus(parameters[:, 4][:, tf.newaxis]) * 2 - 1,
-                              tf.math.softplus(parameters[:, 5][:, tf.newaxis]),
-                              parameters[:, 6][:, tf.newaxis]], axis=1)
-        else:
-            return tf.concat([parameters[:, 0][:, tf.newaxis],
-                             parameters[:, 1][:, tf.newaxis],
-                             tf.math.softplus(parameters[:, 2][:, tf.newaxis]),
-                             tf.math.softplus(parameters[:, 3][:, tf.newaxis]),
-                             tf.math.softplus(parameters[:, 4][:, tf.newaxis]),
-                             parameters[:, 5][:, tf.newaxis]], axis=1)
-
-    def _transform_parameters_backward2(self, parameters):
-
-        if self.correlated_response:
-            return tf.concat([parameters[:, 0][:, tf.newaxis],
-                              parameters[:, 1][:, tf.newaxis],
-                                tfp.math.softplus_inverse(parameters[:, 2][:, tf.newaxis]),
-                                tfp.math.softplus_inverse(parameters[:, 3][:, tf.newaxis]),
-                                tfp.math.softplus_inverse((parameters[:, 4][:, tf.newaxis] + 1) / 2.),
-                                tfp.math.softplus_inverse(parameters[:, 5][:, tf.newaxis]),
-                                parameters[:, 6][:, tf.newaxis]], axis=1)
-
-        else:
-            return tf.concat([parameters[:, 0][:, tf.newaxis],
-                             parameters[:, 1][:, tf.newaxis],
-                             tfp.math.softplus_inverse(parameters[:, 2][:, tf.newaxis]),
-                             tfp.math.softplus_inverse(parameters[:, 3][:, tf.newaxis]),
-                             tfp.math.softplus_inverse(parameters[:, 4][:, tf.newaxis]),
-                             parameters[:, 5][:, tf.newaxis]], axis=1)
 
 class GaussianMixturePRF2D(EncodingModel):
+    # parameter_labels set in __init__ depending on same_rfs
+    # transformations must be set in __init__ as well
 
     def __init__(self, paradigm=None, data=None, parameters=None,
                  weights=None, omega=None, allow_neg_amplitudes=False, verbosity=logging.INFO,
@@ -258,11 +194,15 @@ class GaussianMixturePRF2D(EncodingModel):
                  **kwargs):
 
         if allow_neg_amplitudes:
-            self._transform_parameters_forward = self._transform_parameters_forward1
-            self._transform_parameters_backward = self._transform_parameters_backward1
+            if same_rfs:
+                self.transformations = ['identity', 'softplus', 'sigmoid', 'softplus', 'identity']
+            else:
+                self.transformations = ['identity', 'identity', 'softplus', 'softplus', 'sigmoid', 'softplus', 'identity']
         else:
-            self._transform_parameters_forward = self._transform_parameters_forward2
-            self._transform_parameters_backward = self._transform_parameters_backward2
+            if same_rfs:
+                self.transformations = ['identity', 'softplus', 'sigmoid', 'softplus', 'identity']
+            else:
+                self.transformations = ['identity', 'identity', 'softplus', 'softplus', 'sigmoid', 'softplus', 'identity']
 
         self.stimulus_type = self._get_stimulus_type()
 
@@ -349,85 +289,13 @@ class GaussianMixturePRF2D(EncodingModel):
     def get_WWT(self):
         return self.get_pseudoWWT()
 
-    @tf.function
-    def _transform_parameters_forward1(self, parameters):
 
-        if self.same_rfs:
-            return tf.concat([parameters[:, 0][:, tf.newaxis], # mu
-                            tf.math.softplus(parameters[:, 1][:, tf.newaxis]), # sd
-                            tf.math.sigmoid(parameters[:, 2][:, tf.newaxis]), # weight
-                            tf.math.softplus(parameters[:, 3][:, tf.newaxis]), # amplitude
-                            parameters[:, 4][:, tf.newaxis]], # baseline
-                            axis=1)
-
-        else:
-            return tf.concat([parameters[:, 0][:, tf.newaxis],                      #mu_1
-                            parameters[:, 1][:, tf.newaxis],
-                            tf.math.softplus(parameters[:, 2][:, tf.newaxis]),    #sd_1
-                            tf.math.softplus(parameters[:, 3][:, tf.newaxis]),    #sd_2
-                            tf.math.sigmoid(parameters[:, 4][:, tf.newaxis]),
-                            parameters[:, 5][:, tf.newaxis],
-                            parameters[:, 6][:, tf.newaxis]], axis=1)
-
-    @tf.function
-    def _transform_parameters_backward1(self, parameters):
-        if self.same_rfs:
-            return tf.concat([parameters[:, 0][:, tf.newaxis], # mu
-                            tfp.math.softplus_inverse(parameters[:, 1][:, tf.newaxis]), # sd
-                            logit(parameters[:, 2][:, tf.newaxis]), # weight
-                            tfp.math.softplus_inverse(parameters[:, 3][:, tf.newaxis]), # amplitude
-                            parameters[:, 4][:, tf.newaxis]], # baseline
-                            axis=1)
-        else:
-            return tf.concat([parameters[:, 0][:, tf.newaxis],
-                            parameters[:, 1][:, tf.newaxis],
-                            tfp.math.softplus_inverse(
-                                parameters[:, 2][:, tf.newaxis]),
-                            tfp.math.softplus_inverse(
-                                parameters[:, 3][:, tf.newaxis]),
-                            logit(parameters[:, 4][:, tf.newaxis]),
-                            parameters[:, 5][:, tf.newaxis],
-                            parameters[:, 6][:, tf.newaxis]], axis=1)
-
-
-    @tf.function
-    def _transform_parameters_forward2(self, parameters):
-        if self.same_rfs:
-            return tf.concat([parameters[:, 0][:, tf.newaxis],                      # mu
-                              tf.math.softplus(parameters[:, 1][:, tf.newaxis]),    # sd
-                              tf.math.sigmoid(parameters[:, 2][:, tf.newaxis]),     # weight
-                              tf.math.softplus(parameters[:, 3][:, tf.newaxis]),    # amplitude
-                              parameters[:, 4][:, tf.newaxis]], axis=1)            # baseline
-        else:
-            return tf.concat([parameters[:, 0][:, tf.newaxis],                      # mu_1
-                              parameters[:, 1][:, tf.newaxis],                      # mu_2
-                              tf.math.softplus(parameters[:, 2][:, tf.newaxis]),    # sd_1
-                              tf.math.softplus(parameters[:, 3][:, tf.newaxis]),    # sd_2
-                              tf.math.sigmoid(parameters[:, 4][:, tf.newaxis]),     # weight
-                              tf.math.softplus(parameters[:, 5][:, tf.newaxis]),    # amplitude
-                              parameters[:, 6][:, tf.newaxis]], axis=1)            # baseline
-
-    @tf.function
-    def _transform_parameters_backward2(self, parameters):
-        if self.same_rfs:
-            return tf.concat([parameters[:, 0][:, tf.newaxis],                      # mu
-                              tfp.math.softplus_inverse(parameters[:, 1][:, tf.newaxis]),    # sd
-                              logit(parameters[:, 2][:, tf.newaxis]),               # weight
-                              tfp.math.softplus_inverse(parameters[:, 3][:, tf.newaxis]),    # amplitude
-                              parameters[:, 4][:, tf.newaxis]], axis=1)            # baseline
-        else:
-            return tf.concat([parameters[:, 0][:, tf.newaxis],                      # mu_1
-                              parameters[:, 1][:, tf.newaxis],                      # mu_2
-                              tfp.math.softplus_inverse(parameters[:, 2][:, tf.newaxis]),    # sd_1
-                              tfp.math.softplus_inverse(parameters[:, 3][:, tf.newaxis]),    # sd_2
-                              logit(parameters[:, 4][:, tf.newaxis]),               # weight
-                              tfp.math.softplus_inverse(parameters[:, 5][:, tf.newaxis]),    # amplitude
-                              parameters[:, 6][:, tf.newaxis]], axis=1)            # baseline
 
 class GaussianPRF2D(EncodingModel):
 
     parameter_labels = ['x', 'y', 'sd', 'baseline', 'amplitude']
     stimulus_type = ImageStimulus
+    transformations = ['identity', 'identity', 'softplus', 'identity', 'identity']
 
     def __init__(self, grid_coordinates=None, paradigm=None, data=None, parameters=None,
                  weights=None, omega=None, positive_image_values_only=True, verbosity=logging.INFO, **kwargs):
@@ -467,7 +335,7 @@ class GaussianPRF2D(EncodingModel):
         grid_coordinates = self.grid_coordinates.values
 
         parameters = self._get_parameters(parameters)
-        parameters = self.parameters.values[np.newaxis, ...]
+        parameters = parameters.values[np.newaxis, ...] # MD CHANGED!!!
 
         rf = self._get_rf(grid_coordinates, parameters).numpy()[0]
 
@@ -515,30 +383,13 @@ class GaussianPRF2D(EncodingModel):
         if normalize:
             norm = sd * tf.sqrt(2 * np.pi) / self.pixel_area
             gauss = gauss / norm
-
+        
         return gauss
-
-    @tf.function
-    def _transform_parameters_forward(self, parameters):
-        return tf.concat([parameters[:, 0][:, tf.newaxis],
-                          parameters[:, 1][:, tf.newaxis],
-                          tf.math.softplus(parameters[:, 2][:, tf.newaxis]),
-                          parameters[:, 3][:, tf.newaxis],
-                          parameters[:, 4][:, tf.newaxis]], axis=1)
-
-    @tf.function
-    def _transform_parameters_backward(self, parameters):
-        return tf.concat([parameters[:, 0][:, tf.newaxis],
-                          parameters[:, 1][:, tf.newaxis],
-                          tfp.math.softplus_inverse(
-                              parameters[:, 2][:, tf.newaxis]),
-                          parameters[:, 3][:, tf.newaxis],
-                          parameters[:, 4][:, tf.newaxis]], axis=1)
 
     def get_pseudoWWT(self, remove_baseline=True):
 
         parameters = self._get_parameters().copy()
-
+        
         if remove_baseline:
             parameters['baseline'] = np.float32(0.0)
 
@@ -547,7 +398,6 @@ class GaussianPRF2D(EncodingModel):
         return rf.dot(rf.T)
 
     def to_linear_model(self):
-        from .linear import LinearModelWithBaseline
         return LinearModelWithBaseline(self.paradigm, self.data, self.parameters[['baseline']], weights=self.get_rf().T)
 
     def unpack_stimulus(self, stimulus):
@@ -556,6 +406,7 @@ class GaussianPRF2D(EncodingModel):
 class GaussianPRF2DAngle(GaussianPRF2D):
 
     parameter_labels = ['theta', 'ecc', 'sd', 'baseline', 'amplitude']
+    transformations = ['identity', 'softplus', 'softplus', 'identity', 'identity']
 
     @tf.function
     def _get_rf(self, grid_coordinates, parameters):
@@ -574,26 +425,7 @@ class GaussianPRF2DAngle(GaussianPRF2D):
 
         return (tf.exp(-((x-mu_x)**2 + (y-mu_y)**2)/(2*sd**2))) * amplitude
 
-    @tf.function
-    def _transform_parameters_forward(self, parameters):
-        return tf.concat([parameters[:, 0][:, tf.newaxis],
-                          tf.math.softplus(parameters[:, 1][:, tf.newaxis]),
-                          tf.math.softplus(parameters[:, 2][:, tf.newaxis]),
-                          parameters[:, 3][:, tf.newaxis],
-                          parameters[:, 4][:, tf.newaxis]], axis=1)
-
-    @tf.function
-    def _transform_parameters_backward(self, parameters):
-        return tf.concat([restrict_radians(parameters[:, 0][:, tf.newaxis]),
-                          tfp.math.softplus_inverse(
-                              parameters[:, 1][:, tf.newaxis]),
-                          tfp.math.softplus_inverse(
-                              parameters[:, 2][:, tf.newaxis]),
-                          parameters[:, 3][:, tf.newaxis],
-                          parameters[:, 4][:, tf.newaxis]], axis=1)
-
     def to_linear_model(self):
-        from .linear import LinearModelWithBaseline
         return LinearModelWithBaseline(self.paradigm, self.data, self.parameters[['baseline']], weights=self.get_rf().T)
 
     def unpack_stimulus(self, stimulus):
@@ -620,31 +452,13 @@ class GaussianPRF2DWithHRF(HRFEncodingModel, GaussianPRF2D):
                                positive_image_values_only=positive_image_values_only, **kwargs)
         HRFEncodingModel.__init__(self, hrf_model=hrf_model, flexible_hrf_parameters=flexible_hrf_parameters, **kwargs)
 
+        if self.flexible_hrf_parameters:
+            self.transformations = self.transformations + self.hrf_model.transformations
+
     def to_linear_model(self):
-        from .linear import LinearModelWithBaselineHRF
         return LinearModelWithBaselineHRF(self.paradigm, self.data,
                                           self.parameters[['baseline']], weights=self.get_rf().T,
                                           hrf_model=self.hrf_model)
-
-    @tf.function
-    def _transform_parameters_forward(self, parameters):
-        if self.flexible_hrf_parameters:
-            n_hrf_pars = len(self.hrf_model.parameter_labels)
-            encoding_pars = GaussianPRF2D._transform_parameters_forward(self, parameters[:, :-n_hrf_pars])
-            hrf_pars = self.hrf_model._transform_parameters_forward(parameters[:, -n_hrf_pars:])
-            return tf.concat([encoding_pars, hrf_pars], axis=1)
-        else:
-            return GaussianPRF2D._transform_parameters_forward(self, parameters)
-
-    @tf.function
-    def _transform_parameters_backward(self, parameters):
-        if self.flexible_hrf_parameters:
-            n_hrf_pars = len(self.hrf_model.parameter_labels)
-            encoding_pars = GaussianPRF2D._transform_parameters_backward(self, parameters[:, :-n_hrf_pars])
-            hrf_pars = self.hrf_model._transform_parameters_backward(parameters[:, -n_hrf_pars:])
-            return tf.concat([encoding_pars, hrf_pars], axis=1)
-        else:
-            return GaussianPRF2D._transform_parameters_backward(self, parameters)
 
 class GaussianPRF2DAngleWithHRF(HRFEncodingModel, GaussianPRF2DAngle):
 
@@ -659,7 +473,6 @@ class GaussianPRF2DAngleWithHRF(HRFEncodingModel, GaussianPRF2DAngle):
         self.hrf_model = hrf_model
 
     def to_linear_model(self):
-        from .linear import LinearModelWithBaselineHRF
         return LinearModelWithBaselineHRF(self.paradigm, self.data,
                                           self.parameters[[
                                               'baseline']], weights=self.get_rf().T,
@@ -680,9 +493,9 @@ class DifferenceOfGaussiansPRF2D(GaussianPRF2D):
     # srf factor is limited to be above 1
     parameter_labels = ['x', 'y', 'sd', 'baseline',
                         'amplitude', 'srf_amplitude', 'srf_size']
-
-    transformations = ['identity', 'identity', 'softplus', 'identity',
-                       'softplus', 'softplus', 'softplus']
+    transformations = ['identity', 'identity', 'softplus', 'identity', 'softplus', 'softplus',
+                       (lambda x: tf.math.softplus(x) + 1, lambda x: tfp.math.softplus_inverse(x) -1), # srf_size needs to be > 1.
+                      ] 
     @tf.function
     def _get_rf(self, grid_coordinates, parameters):
 
@@ -698,6 +511,7 @@ class DifferenceOfGaussiansPRF2D(GaussianPRF2D):
         standard_prf = super()._get_rf(grid_coordinates, parameters)
 
         srf_pars = tf.concat([mu_x, mu_y, sd*srf_size, tf.zeros_like(mu_x), srf_amplitude*amplitude*srf_size], axis=2)
+        print(parameters.shape, srf_pars.shape)
         sprf = super()._get_rf(grid_coordinates, srf_pars)
 
         return standard_prf - sprf
@@ -714,63 +528,61 @@ class DifferenceOfGaussiansPRF2DWithHRF(HRFEncodingModel, DifferenceOfGaussiansP
 
         HRFEncodingModel.__init__(self, hrf_model=hrf_model, flexible_hrf_parameters=flexible_hrf_parameters, **kwargs)
 
+        if flexible_hrf_parameters:
+            self.transformations = self.transformations + self.hrf_model.transformations
+
+class CompressiveSpatialGaussiansPRF2D(GaussianPRF2D):
+    from ..hrf import bounded_sigmoid_transform
+    # Amplitude is as a fraction of the positive amplitude and is limited to be within [0, 1]
+    # srf factor is limited to be above 1
+    parameter_labels = ['x', 'y', 'sd', 'baseline',
+                        'amplitude', 'exponent']
+    transformations = ['identity', 'identity', 'softplus', 'identity', 'identity', 'softplus'
+                      ] 
+    
     @tf.function
-    def _transform_parameters_forward(self, parameters):
+    def _basis_predictions(self, paradigm, parameters):
+        mu_x = parameters[:, :, 0, tf.newaxis]
+        mu_y = parameters[:, :, 1, tf.newaxis]
+        sd = parameters[:, :, 2, tf.newaxis]
 
-        if self.flexible_hrf_parameters:
-            n_hrf_pars = len(self.hrf_model.parameter_labels)
+        rf_parameters = tf.concat([mu_x, mu_y, sd, tf.zeros_like(mu_x), tf.ones_like(mu_x)], axis=2)
+        rf = self._get_rf(self.grid_coordinates, rf_parameters)
 
-            encoding_pars = DifferenceOfGaussiansPRF2D._transform_parameters_forward(self, parameters[:, :-n_hrf_pars])
-            hrf_pars = self.hrf_model._transform_parameters_forward(parameters[:, -n_hrf_pars:])
+        # From n_batches x n_voxels to 
+        # n_batches x n_timespoints x n_populations
+        baseline = parameters[:, :, 3][:, tf.newaxis, :] 
+        amplitude = parameters[:, :, 4][:, tf.newaxis, :] 
+        exponent = parameters[:, :, 5][:, tf.newaxis, :] 
 
-            return tf.concat([encoding_pars, hrf_pars], axis=1)
-        else:
-            return DifferenceOfGaussiansPRF2D._transform_parameters_forward(self, parameters)
+        activation = amplitude * (tf.tensordot(paradigm, rf, (2, 2))[:, :, 0, :]**exponent)+ baseline
+        return activation
+    
+class CompressiveSpatialGaussiansPRF2DWithHRF(HRFEncodingModel, CompressiveSpatialGaussiansPRF2D):
 
-    @tf.function
-    def _transform_parameters_backward(self, parameters):
+    def __init__(self, grid_coordinates=None, paradigm=None, data=None, parameters=None,
+                 positive_image_values_only=True,
+                 weights=None, hrf_model=None, flexible_hrf_parameters=False, verbosity=logging.INFO, **kwargs):
 
-        if self.flexible_hrf_parameters:
-            n_hrf_pars = len(self.hrf_model.parameter_labels)
+        CompressiveSpatialGaussiansPRF2D.__init__(self, grid_coordinates=grid_coordinates, paradigm=paradigm, data=data, parameters=parameters, weights=weights, verbosity=verbosity,
+                        positive_image_values_only=positive_image_values_only, **kwargs)
 
-            encoding_pars = DifferenceOfGaussiansPRF2D._transform_parameters_backward(self, parameters[:, :-n_hrf_pars])
-            hrf_pars = self.hrf_model._transform_parameters_backward(parameters[:, -n_hrf_pars:])
+        HRFEncodingModel.__init__(self, hrf_model=hrf_model, flexible_hrf_parameters=flexible_hrf_parameters, **kwargs)
 
-            return tf.concat([encoding_pars, hrf_pars], axis=1)
-        else:
-            return DifferenceOfGaussiansPRF2D._transform_parameters_backward(self, parameters)
+        if flexible_hrf_parameters:
+            self.transformations = self.transformations + self.hrf_model.transformations
+     
 
 class DivisiveNormalizationGaussianPRF2D(GaussianPRF2D):
     # Amplitude is as a fraction of the positive amplitude and is limited to be within [0, 1]
     # srf factor is limited to be above 1
-    parameter_labels = ['x', 'y', 'sd',
+    parameter_labels = ['x', 'y', 'sd', 
                         'rf_amplitude', 'srf_amplitude', 'srf_size',
                         'neural_baseline', 'surround_baseline']
-
-    @tf.function
-    def _transform_parameters_forward(self, parameters):
-        return tf.concat([parameters[:, 0][:, tf.newaxis], # x
-                          parameters[:, 1][:, tf.newaxis], # y
-                          tf.math.softplus(parameters[:, 2][:, tf.newaxis]), # sd
-                          parameters[:, 3][:, tf.newaxis], # rf_amplitude
-                          tf.math.softplus(parameters[:, 4][:, tf.newaxis]), # srf_amplitude
-                          tf.math.softplus(parameters[:, 5][:, tf.newaxis]) + 1, # srf_size
-                          tf.math.softplus(parameters[:, 6][:,tf.newaxis]), # neural_baseline
-                          tf.math.softplus(parameters[:, 7][:,tf.newaxis]), # surround_baseline
-                          ], axis=1)
-
-    @tf.function
-    def _transform_parameters_backward(self, parameters):
-        return tf.concat([parameters[:, 0][:, tf.newaxis],
-                          parameters[:, 1][:, tf.newaxis],
-                          tfp.math.softplus_inverse(
-                              parameters[:, 2][:, tf.newaxis]),
-                          parameters[:, 3][:, tf.newaxis],
-                          tfp.math.softplus_inverse(
-                              parameters[:, 4][:, tf.newaxis]),
-                          tfp.math.softplus_inverse(parameters[:, 5][:, tf.newaxis] - 1),
-                          tfp.math.softplus_inverse(parameters[:, 6][:, tf.newaxis]),
-                          tfp.math.softplus_inverse(parameters[:, 7][:, tf.newaxis])], axis=1)
+    transformations = ['identity', 'identity', 'softplus',
+                       'identity', 'softplus',
+                       (lambda x: tf.math.softplus(x) + 1, lambda x: tfp.math.softplus_inverse(x) -1), # srf_size
+                       'softplus', 'softplus',]
 
 
     @tf.function
@@ -796,12 +608,12 @@ class DivisiveNormalizationGaussianPRF2D(GaussianPRF2D):
         srf = self._get_rf(self.grid_coordinates, srf_parameters)
 
 
-        # From n_batches x n_voxels to
+        # From n_batches x n_voxels to 
         # n_batches x n_timespoints x n_populations
-        rf_amplitude = parameters[:, :, 3][:, tf.newaxis, :]
-        srf_amplitude = parameters[:, :, 4][:, tf.newaxis, :]
-        neural_baseline = parameters[:, :, 6][:, tf.newaxis, :]
-        surround_baseline = parameters[:, :, 7][:, tf.newaxis, :]
+        rf_amplitude = parameters[:, :, 3][:, tf.newaxis, :] 
+        srf_amplitude = parameters[:, :, 4][:, tf.newaxis, :] 
+        neural_baseline = parameters[:, :, 6][:, tf.newaxis, :] 
+        surround_baseline = parameters[:, :, 7][:, tf.newaxis, :] 
 
         neural_activation = rf_amplitude * tf.tensordot(paradigm, rf, (2, 2))[:, :, 0, :] + neural_baseline
         normalization = (srf_amplitude * rf_amplitude) * tf.tensordot(paradigm, srf, (2, 2))[:, :, 0, :] + surround_baseline
@@ -812,10 +624,16 @@ class DivisiveNormalizationGaussianPRF2D(GaussianPRF2D):
 
 class DivisiveNormalizationGaussianPRF2DWithHRF(HRFEncodingModel, DivisiveNormalizationGaussianPRF2D):
 
-    parameter_labels = ['x', 'y', 'sd',
+    parameter_labels = ['x', 'y', 'sd', 
                         'rf_amplitude', 'srf_amplitude', 'srf_size',
                         'neural_baseline', 'surround_baseline',
                         'bold_baseline']
+
+    transformations = ['identity', 'identity', 'softplus',
+                       'identity', 'softplus',
+                       (lambda x: tf.math.softplus(x) + 1, lambda x: tfp.math.softplus_inverse(x) -1), # srf_size
+                       'softplus', 'softplus',
+                       'identity']
 
     def __init__(self, grid_coordinates=None, paradigm=None, data=None, parameters=None,
                  positive_image_values_only=True,
@@ -826,43 +644,13 @@ class DivisiveNormalizationGaussianPRF2DWithHRF(HRFEncodingModel, DivisiveNormal
 
         HRFEncodingModel.__init__(self, hrf_model=hrf_model, flexible_hrf_parameters=flexible_hrf_parameters, **kwargs)
 
-    @tf.function
-    def _transform_parameters_forward(self, parameters):
+        if flexible_hrf_parameters:
+            self.transformations = self.transformations + self.hrf_model.transformations
 
-        if self.flexible_hrf_parameters:
-            n_hrf_pars = len(self.hrf_model.parameter_labels)
-
-            encoding_pars = DivisiveNormalizationGaussianPRF2D._transform_parameters_forward(self, parameters[:, :-n_hrf_pars-1])
-            bold_baseline = parameters[:, -n_hrf_pars-1][:, tf.newaxis]
-            hrf_pars = self.hrf_model._transform_parameters_forward(parameters[:, -n_hrf_pars-1:])
-
-            return tf.concat([encoding_pars, bold_baseline, hrf_pars], axis=1)
-        else:
-            encoding_pars1 = DivisiveNormalizationGaussianPRF2D._transform_parameters_forward(self, parameters[:, :-1])
-            bold_baseline = parameters[:, -1:]
-            return tf.concat([encoding_pars1, bold_baseline], axis=1)
-
-    @tf.function
-    def _transform_parameters_backward(self, parameters):
-
-        if self.flexible_hrf_parameters:
-            n_hrf_pars = len(self.hrf_model.parameter_labels)
-
-            encoding_pars = DivisiveNormalizationGaussianPRF2D._transform_parameters_backward(self, parameters[:, :-n_hrf_pars-1])
-            bold_baseline = parameters[:, -n_hrf_pars-1][:, tf.newaxis]
-            hrf_pars = self.hrf_model._transform_parameters_backward(parameters[:, -n_hrf_pars:])
-            return tf.concat([encoding_pars, bold_baseline, hrf_pars], axis=1)
-
-        else:
-            encoding_pars1 =  DivisiveNormalizationGaussianPRF2D._transform_parameters_backward(self, parameters[:, :-1])
-            bold_baseline = parameters[:, -1:]
-            return tf.concat([encoding_pars1, bold_baseline], axis=1)
-
-
-    @tf.function
+    # @tf.function
     def _predict(self, paradigm, parameters, weights):
 
-
+        
         pre_convolve_parameters = parameters[..., :8]
         pre_convolve = DivisiveNormalizationGaussianPRF2D._predict(self, paradigm, pre_convolve_parameters, weights)
 
@@ -883,3 +671,5 @@ class DivisiveNormalizationGaussianPRF2DWithHRF(HRFEncodingModel, DivisiveNormal
         pred_convolved = self.hrf_model.convolve(pre_convolve, **kwargs) + bold_baseline
 
         return pred_convolved
+
+

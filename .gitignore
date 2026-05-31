@@ -54,3 +54,8 @@ sg_execution_times.rst
 .DS_store
 
 test*.ipynb
+z_*
+*.pkl
+output_*/
+
+.vscode/*

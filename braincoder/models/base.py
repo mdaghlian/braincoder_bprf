@@ -1,13 +1,13 @@
 import tensorflow as tf
 import tensorflow_probability as tfp
+from tensorflow_probability import bijectors as tfb
 import logging
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
-from ..utils import norm, format_data, format_paradigm, format_parameters, format_weights, logit, restrict_radians, lognormalpdf_n, von_mises_pdf, lognormal_pdf_mode_fwhm, norm2d
+from ..utils import norm, format_data, format_paradigm, format_parameters, format_weights, logit, log10, restrict_radians, lognormalpdf_n, von_mises_pdf, lognormal_pdf_mode_fwhm, norm2d
 from tensorflow_probability import distributions as tfd
 from ..utils.math import aggressive_softplus, aggressive_softplus_inverse, norm
-import pandas as pd
 import scipy.stats as ss
 from ..stimuli import Stimulus, OneDimensionalRadialStimulus, OneDimensionalGaussianStimulus, OneDimensionalStimulusWithAmplitude, OneDimensionalRadialStimulusWithAmplitude, ImageStimulus, TwoDimensionalStimulus
 from patsy import dmatrix, build_design_matrices
@@ -21,6 +21,49 @@ class EncodingModel(object):
     optionally ``_predict``) to become drop-in replacements across the
     fitting/decoding stack.
     """
+
+    def _transform_parameters_forward(self, parameters):
+        if not hasattr(self, 'transformations'):
+            raise NotImplementedError("Model must define 'transformations' as a list of transforms or provide a custom implementation.")
+        out = []
+        for i, t in enumerate(self.transformations):
+            param = parameters[:, i][:, tf.newaxis]
+            # Tuple: (forward, backward)
+            if isinstance(t, tuple) and len(t) == 2:
+                out.append(t[0](param))
+            elif t == 'identity':
+                out.append(param)
+            elif t == 'softplus':
+                out.append(tf.math.softplus(param))
+            elif t == 'sigmoid':
+                out.append(tf.math.sigmoid(param))
+            elif t == 'aggressive_softplus':
+                out.append(aggressive_softplus(param))
+            else:
+                raise NotImplementedError(f"Unknown transform: {t}")
+        return tf.concat(out, axis=1)
+
+    def _transform_parameters_backward(self, parameters):
+        if not hasattr(self, 'transformations'):
+            raise NotImplementedError("Model must define 'transformations' as a list of transforms or provide a custom implementation.")
+        import tensorflow_probability as tfp
+        out = []
+        for i, t in enumerate(self.transformations):
+            param = parameters[:, i][:, tf.newaxis]
+            # Tuple: (forward, backward)
+            if isinstance(t, tuple) and len(t) == 2:
+                out.append(t[1](param))
+            elif t == 'identity':
+                out.append(param)
+            elif t == 'softplus':
+                out.append(tfp.math.softplus_inverse(param))
+            elif t == 'sigmoid':
+                out.append(tf.math.log(param / (1 - param)))
+            elif t == 'aggressive_softplus':
+                out.append(aggressive_softplus_inverse(param))
+            else:
+                raise NotImplementedError(f"Unknown transform: {t}")
+        return tf.concat(out, axis=1)
 
     parameter_labels = None
     stimulus_type = Stimulus
@@ -73,23 +116,21 @@ class EncodingModel(object):
     def _get_stimulus_type(self, **kwargs):
         """Return the ``Stimulus`` subclass used to clean/generate paradigms."""
         return self.stimulus_type
-
+    
     def _get_stimulus(self, **kwargs):
         """Instantiate the configured ``Stimulus`` type."""
         return self.stimulus_type(**kwargs)
-
+    
     def predict(self, paradigm=None, parameters=None, weights=None):
         """Return pandas predictions for the provided paradigm/parameters."""
 
         weights, weights_ = self._get_weights(weights)
-
+        
         paradigm = self.get_paradigm(paradigm)
         paradigm_ = self._get_paradigm(paradigm)[np.newaxis, ...]
-
         parameters = self._get_parameters(parameters)
-
+        
         parameters_ = parameters.values[np.newaxis, ...] if parameters is not None else None
-
         predictions = self._predict(paradigm_, parameters_, weights_)[0]
 
         if weights is None:
@@ -113,7 +154,7 @@ class EncodingModel(object):
 
         parameters = self._get_parameters(parameters)
 
-        stimulus = self.stimulus._generate_stimulus(paradigm_)
+        stimulus = self.stimulus._generate_stimulus(paradigm_) 
 
         stimulus = np.repeat(stimulus[np.newaxis, ...], n_repeats, axis=0)
 
@@ -174,14 +215,14 @@ class EncodingModel(object):
     def _gradient(self, stimuli, parameters):
         """Compute d(predictions)/d(stimuli) using TF Jacobians."""
         stimuli = tf.convert_to_tensor(stimuli)
-
+        
         with tf.GradientTape() as tape:
             tape.watch(stimuli)
             predictions = self._predict(stimuli, parameters)
-
+        
         # Compute the Jacobian, expected to result in [1, n, m, 1, n, 1]
         jacobians = tape.jacobian(predictions, stimuli)
-
+        
         # Correct handling of the Jacobian to transform [1, n, m, 1, n, 1] to [1, n, m]
         # Sum over redundant dimensions, specifically the input's batch and spatial dimensions (since we want derivative w.r.t. each input independently)
         gradients = tf.reduce_sum(jacobians, axis=[-2, -1])
@@ -213,7 +254,6 @@ class EncodingModel(object):
 
     def to_discrete_model(self, grid, parameters=None, weights=None):
         """Return a ``DiscreteModel`` evaluated on ``grid`` stimulus coordinates."""
-        from .linear import DiscreteModel
 
         grid = np.array(grid, dtype=np.float32)[:, np.newaxis]
         parameters = format_parameters(parameters)
@@ -332,7 +372,7 @@ class EncodingModel(object):
 
                               normalize=False).numpy()
 
-
+        
         if stimulus_range.shape[-1] == 1:
             ll = pd.DataFrame(ll.T, index=time_index, columns=pd.Index(
                 stimulus_range[:, 0, 0], name='stimulus'))
@@ -520,7 +560,7 @@ class EncodingModel(object):
 
     def get_paradigm(self, paradigm):
         """Return the cleaned paradigm DataFrame, falling back to stored one."""
-
+            
         if paradigm is None:
             if self.paradigm is not None:
                 return self.paradigm
@@ -533,7 +573,7 @@ class EncodingModel(object):
 
     def _get_paradigm(self, paradigm):
         """Tensor-ready paradigm (np.array) used inside TF functions."""
-
+            
         if paradigm is None:
             paradigm = self.get_paradigm(paradigm)
 
@@ -571,7 +611,7 @@ class EncodingRegressionModel(EncodingModel):
 
         super().__init__(paradigm=base_paradigm, data=data, parameters=parameters,
                          weights=weights, omega=omega, verbosity=logging.INFO, **kwargs)
-
+        
 
         # If baseline_parameter_values is not provided, use empty dictionary
         baseline_parameter_values = baseline_parameter_values or {}
@@ -727,15 +767,15 @@ class EncodingRegressionModel(EncodingModel):
         # we use log likelihood to correct for very small numbers
         ll = residual_dist.log_prob(residuals).numpy()
         ll = pd.DataFrame(ll, index=pd.MultiIndex.from_frame(stimulus_range), columns=data.index).T
-
+        
         if normalize:
             # Subtract max for numerical stability before exponentiating
             ll = ll.sub(ll.max(axis=1), axis=0)
-
+        
         ll = np.exp(ll)
 
         return ll
-
+        
 
 
 class HRFEncodingModel(object):
@@ -805,7 +845,7 @@ class HRFEncodingModel(object):
 
         if 'amplitude' in self.parameter_labels:
             pred_convolved *= parameters[:, :, amplitude_idx][:, tf.newaxis, :]
-
+        
         if 'baseline' in self.parameter_labels:
             pred_convolved += parameters[:, :, baseline_idx][:, tf.newaxis, :]
 
@@ -815,3 +855,4 @@ class HRFEncodingModel(object):
     def _predict_no_hrf(self, paradigm, parameters, weights):
         """Bypass HRF convolution; useful for diagnostics/debugging."""
         return EncodingModel._predict(self, paradigm, parameters, weights)
+

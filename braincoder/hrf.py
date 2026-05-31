@@ -194,6 +194,14 @@ def spm_hrf(t, a1=6., d1=1., a2=16., d2=1., c=1./6, highres_dt=0.1):
         hrf_interp = tf.squeeze(hrf_interp, axis=1)
     return hrf_interp
 
+def bounded_sigmoid_transform(min_val, max_val):
+    def forward(x):
+        return tf.sigmoid(x) * (max_val - min_val) + min_val
+    def backward(y):
+        y_scaled = (y - min_val) / (max_val - min_val)
+        return tf.math.log(y_scaled / (1.0 - y_scaled))
+    return (forward, backward)
+
 class SPMHRFModel(HRFModel):
     """Canonical SPM-style HRF parameterized by delay/dispersion bounds.
 
@@ -227,7 +235,10 @@ class SPMHRFModel(HRFModel):
                                       np.rint(float(self.time_length) / self.dt).astype(np.int32)).astype(np.float32)
         self.time_stamps -= self.onset
         # 1D time vector
-
+        self.transformations = [
+            bounded_sigmoid_transform(self.min_hrf_delay, self.max_hrf_delay),
+            bounded_sigmoid_transform(self.min_dispersion, self.max_dispersion)
+        ]
         super().__init__(unique_hrfs=unique_hrfs)
 
     def get_hrf(self, hrf_delay=None, hrf_dispersion=None):

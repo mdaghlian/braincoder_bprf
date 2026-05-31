@@ -1,18 +1,21 @@
 import tensorflow as tf
 import tensorflow_probability as tfp
+from tensorflow_probability import bijectors as tfb
 import logging
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
-from ..utils import norm, format_data, format_paradigm, format_parameters, format_weights, logit, restrict_radians, lognormalpdf_n, von_mises_pdf, lognormal_pdf_mode_fwhm, norm2d
+from ..utils import norm, format_data, format_paradigm, format_parameters, format_weights, logit, log10, restrict_radians, lognormalpdf_n, von_mises_pdf, lognormal_pdf_mode_fwhm, norm2d
 from tensorflow_probability import distributions as tfd
 from ..utils.math import aggressive_softplus, aggressive_softplus_inverse, norm
 import scipy.stats as ss
 from ..stimuli import Stimulus, OneDimensionalRadialStimulus, OneDimensionalGaussianStimulus, OneDimensionalStimulusWithAmplitude, OneDimensionalRadialStimulusWithAmplitude, ImageStimulus, TwoDimensionalStimulus
 from patsy import dmatrix, build_design_matrices
-from .base import EncodingModel, HRFEncodingModel
+from .base import EncodingModel, EncodingRegressionModel, HRFEncodingModel
 
 class DiscreteModel(EncodingModel):
+    # parameter_labels set in __init__
+    # transformations not needed (identity)
 
     def __init__(self, paradigm=None, data=None, parameters=None,
                  weights=None, verbosity=logging.INFO):
@@ -39,8 +42,9 @@ class LinearModel(EncodingModel):
     (e.g., when estimating weights for design-matrix regressors).  No free
     parameters are tracked, so attempts to set ``parameters`` raise ``ValueError``.
     """
-
+    
     parameter_labels = []
+    transformations = []
 
     def __init__(self, paradigm=None, data=None, parameters=None,
                  weights=None, omega=None, verbosity=logging.INFO, **kwargs):
@@ -75,6 +79,7 @@ class LinearModelWithBaseline(EncodingModel):
     """Linear encoding model that adds a voxel-specific baseline parameter."""
 
     parameter_labels = ['baseline']
+    transformations = ['identity']
 
     @tf.function
     def _predict(self, paradigm, parameters, weights=None):

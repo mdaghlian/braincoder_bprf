@@ -21,7 +21,6 @@ class Stimulus(object):
     def clean_paradigm(self, paradigm):
 
         if (not isinstance(paradigm, pd.DataFrame)) and (paradigm is not None):
-
             if isinstance(paradigm, pd.Series):
                 paradigm = paradigm.to_frame()
                 paradigm.columns = self.dimension_labels
@@ -155,3 +154,16 @@ class ImageStimulus(Stimulus):
 
     def generate_empty_stimulus(self, size):
         return np.ones((size, len(self.dimension_labels)), dtype=np.float32) * 1e-6
+
+
+# *********************************************************************************************************************
+
+class ContrastSensitivityStimulus(Stimulus):
+    
+    def __init__(self):
+        # Bijectors apply reversible transformations to the stimulus
+        self.dimension_labels = ['SF', 'CON']
+        self.bijectors = [
+            tfp.bijectors.Identity(name=label) for label in self.dimension_labels
+        ]
+        # Inheriting the rest from the basic stimulus class should work        

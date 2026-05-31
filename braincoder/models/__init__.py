@@ -5,8 +5,10 @@ from .prf_1d import (GaussianPRF, RegressionGaussianPRF, VonMisesPRF, LogGaussia
 from .prf_2d import (GaussianPointPRF2D, GaussianMixturePRF2D, GaussianPRF2D,
                      GaussianPRF2DAngle, GaussianPRF2DWithHRF, GaussianPRF2DAngleWithHRF,
                      DifferenceOfGaussiansPRF2D, DifferenceOfGaussiansPRF2DWithHRF,
+                     CompressiveSpatialGaussiansPRF2D, CompressiveSpatialGaussiansPRF2DWithHRF,
                      DivisiveNormalizationGaussianPRF2D, DivisiveNormalizationGaussianPRF2DWithHRF)
 from .linear import DiscreteModel, LinearModel, LinearModelWithBaseline, LinearModelWithBaselineHRF
+from .csf import ContrastSensitivity, ContrastSensitivityWithHRF, ContrastSensitivityExp, Chung_Legge_default
 
 __all__ = [
     'EncodingModel', 'EncodingRegressionModel', 'HRFEncodingModel',
@@ -16,6 +18,9 @@ __all__ = [
     'GaussianPointPRF2D', 'GaussianMixturePRF2D', 'GaussianPRF2D',
     'GaussianPRF2DAngle', 'GaussianPRF2DWithHRF', 'GaussianPRF2DAngleWithHRF',
     'DifferenceOfGaussiansPRF2D', 'DifferenceOfGaussiansPRF2DWithHRF',
+    'CompressiveSpatialGaussiansPRF2D', 'CompressiveSpatialGaussiansPRF2DWithHRF',
     'DivisiveNormalizationGaussianPRF2D', 'DivisiveNormalizationGaussianPRF2DWithHRF',
     'DiscreteModel', 'LinearModel', 'LinearModelWithBaseline', 'LinearModelWithBaselineHRF',
+    'ContrastSensitivity', 'ContrastSensitivityWithHRF', 'ContrastSensitivityExp',
+    'Chung_Legge_default',
 ]
