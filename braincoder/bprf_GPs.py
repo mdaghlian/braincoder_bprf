@@ -625,6 +625,7 @@ class GPSpec(GP):
             self.mass_matrix = tf.constant(self.mass_matrix, dtype=self.gp_dtype)   # [V]
         self.mass_matrix_sqrt = tf.sqrt(self.mass_matrix)  # useful for computations
         self.n_lbo = eig_vects.shape[-1]
+        self.phiw = self.eig_vects * self.mass_matrix_sqrt[..., tf.newaxis]  # [N, M], precomputed
         self.spec_kernel_list = []
         self.pids[2] = 'gpk_var'  
         self.pids_inv = {}
@@ -673,7 +674,6 @@ class GPSpec(GP):
         Compute spectral kernel values based on eigenvalues.
         You need to implement this based on your specific kernel formulations.
         """
-        print(kwargs)
         if kernel_type == 'spec_exp':
             # Example: exponential kernel in spectral domain
             kappa_l = tf.cast(kwargs['gpk_kappa_l'], self.gp_dtype)
@@ -706,15 +706,13 @@ class GPSpec(GP):
         # -> demean 
         dm_parameter = parameter - m_vect      
         
-        # Project y into the spectral domain: z = Phi^T y
-        # Including mass matrix
+        # Project y into the spectral domain: z = Phi_w^T y_w
         yw = tf.cast(dm_parameter, self.gp_dtype) * self.mass_matrix_sqrt
-        phiw = self.eig_vects * self.mass_matrix_sqrt[..., tf.newaxis]
-        proj_dm_parameter = tf.tensordot(phiw, yw, axes=[[0], [0]])  # [M]
-        
-        # Compute residual norm^2: r = y - Phi z
-        y_recon = tf.tensordot(phiw, proj_dm_parameter, axes=[[1], [0]])  # [N]
-        r2 = tf.reduce_sum((yw - y_recon) ** 2)  # FIXED: Use yw instead of dm_parameter
+        proj_dm_parameter = tf.linalg.matvec(self.phiw, yw, transpose_a=True)  # [M]
+
+        # Residual norm^2 via identity: ||y_w - Phi_w z||^2 = ||y_w||^2 - ||z||^2
+        # (valid when Phi_w^T Phi_w = I, i.e. Phi^T M Phi = I)
+        r2 = tf.reduce_sum(yw ** 2) - tf.reduce_sum(proj_dm_parameter ** 2)
         
         # Get kappa
         kappa = self._return_kappa(**kwargs) 
