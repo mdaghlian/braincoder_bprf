@@ -8,7 +8,7 @@ from .prf_2d import (GaussianPointPRF2D, GaussianMixturePRF2D, GaussianPRF2D,
                      CompressiveSpatialGaussiansPRF2D, CompressiveSpatialGaussiansPRF2DWithHRF,
                      DivisiveNormalizationGaussianPRF2D, DivisiveNormalizationGaussianPRF2DWithHRF)
 from .linear import DiscreteModel, LinearModel, LinearModelWithBaseline, LinearModelWithBaselineHRF
-from .csf import ContrastSensitivity, ContrastSensitivityWithHRF, ContrastSensitivityExp, Chung_Legge_default
+from .csf import ContrastSensitivity, ContrastSensitivityWithHRF, ContrastSensitivityExp, Chung_Legge_default, CRF, CRFWithHRF
 
 __all__ = [
     'EncodingModel', 'EncodingRegressionModel', 'HRFEncodingModel',
@@ -23,4 +23,5 @@ __all__ = [
     'DiscreteModel', 'LinearModel', 'LinearModelWithBaseline', 'LinearModelWithBaselineHRF',
     'ContrastSensitivity', 'ContrastSensitivityWithHRF', 'ContrastSensitivityExp',
     'Chung_Legge_default',
+    'CRF', 'CRFWithHRF',
 ]
