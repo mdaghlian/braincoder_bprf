@@ -492,6 +492,9 @@ class GPSpec(GP):
         self.mass_matrix_sqrt = tf.sqrt(self.mass_matrix)
         self.phiw = self.eig_vects * self.mass_matrix_sqrt[..., tf.newaxis]     # [N, M]
         self.gram = tf.matmul(self.phiw, self.phiw, transpose_a=True)            # [M, M] (= I on the full mesh)
+        # orthonormal basis (e.g. LBO eigenvectors on exactly these vertices): the M x M system is diagonal,
+        # so the log prob costs O(N M) with no Cholesky
+        self.orthonormal = bool(np.max(np.abs(self.gram.numpy() - np.eye(self.n_lbo))) < 1e-6)
 
     def positive_pids(self):
         pos = super().positive_pids() | {'gpk_var'}
@@ -551,12 +554,18 @@ class GPSpec(GP):
         y = tf.cast(tf.reshape(parameter, [-1]), self.gp_dtype) - self._return_mfunc(**kwargs)
         yw = y * self.mass_matrix_sqrt
         z = tf.linalg.matvec(self.phiw, yw, transpose_a=True)                 # [M]
-        ks = tf.sqrt(self._return_kappa(**kwargs))                            # [M]
+        kappa = self._return_kappa(**kwargs)                                  # [M]
+        n = tf.cast(self.n_vx, self.gp_dtype)
+        if self.orthonormal:      # A = I + diag(kappa) / s2
+            a = 1.0 + kappa / s2
+            quad = (tf.reduce_sum(tf.square(yw)) - tf.reduce_sum(kappa * tf.square(z) / a) / s2) / s2
+            logdet = n * tf.math.log(s2) + tf.reduce_sum(tf.math.log(a))
+            return tf.cast(-0.5 * (quad + logdet + n * _LOG2PI), tf.float32)
+        ks = tf.sqrt(kappa)
         A = tf.eye(self.n_lbo, dtype=self.gp_dtype) + ks[:, None] * self.gram * ks[None, :] / s2
         chol_A = tf.linalg.cholesky(A)
         u = tf.linalg.triangular_solve(chol_A, (ks * z)[:, None], lower=True)
         quad = (tf.reduce_sum(tf.square(yw)) - tf.reduce_sum(tf.square(u)) / s2) / s2
-        n = tf.cast(self.n_vx, self.gp_dtype)
         logdet = n * tf.math.log(s2) + 2.0 * tf.reduce_sum(tf.math.log(tf.linalg.diag_part(chol_A)))
         return tf.cast(-0.5 * (quad + logdet + n * _LOG2PI), tf.float32)
 

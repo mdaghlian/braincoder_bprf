@@ -148,6 +148,17 @@ class TestGPSpec:
         assert lp.dtype == tf.float32
         assert np.isclose(lp.numpy(), exact_lp(Y, 0.0, self._exact(evecs, evals, np.arange(N))), rtol=1e-4)
 
+    def test_orthonormal_fast_path_matches_cholesky_path(self):
+        g, evecs, evals = spec_gp()
+        assert g.orthonormal
+        lp_fast = g.return_log_prob(tf.constant(Y, tf.float32), **self.HPS).numpy()
+        g.orthonormal = False
+        g2, _, _ = spec_gp()
+        g2.orthonormal = False
+        lp_chol = g2.return_log_prob(tf.constant(Y, tf.float32), **self.HPS).numpy()
+        assert np.isclose(lp_fast, lp_chol, rtol=1e-6)
+        assert not g.subset(np.arange(10, 30)).orthonormal
+
     def test_subset_matches_dense(self):
         g, evecs, evals = spec_gp()
         rows = np.arange(5, 30)
