@@ -161,7 +161,7 @@ class TestGPInit:
     def test_n_vx_stored(self):
         from braincoder.bprf_GPs import GP
         gp = GP(n_vx=N_VX, gp_dtype=tf.float32)
-        assert gp.n_vx.numpy() == N_VX
+        assert gp.n_vx == N_VX
 
     def test_empty_kernel_lists(self):
         from braincoder.bprf_GPs import GP
@@ -294,12 +294,12 @@ class TestGPLogProb:
         gp, _ = _make_gp_with_kernel()
         kwargs = _gp_kwargs_for_log_prob(gp)
         gp.set_log_prob_fixed(**kwargs)
-        assert gp.return_log_prob == gp._return_log_prob_fixed
+        assert gp._log_prob_mode == 'fixed' and gp.is_fixed
 
     def test_set_log_prob_univariate_changes_mode(self):
         gp, _ = _make_gp_with_kernel()
         gp.set_log_prob_univariate()
-        assert gp.return_log_prob == gp._return_log_prob_univariate
+        assert gp._log_prob_mode == 'univariate'
 
     def test_nystrom_approximation_changes_mode(self):
         from braincoder.bprf_GPs import GP
@@ -307,17 +307,24 @@ class TestGPLogProb:
         coords = _random_coordinates(N_VX)
         gp.add_xid_stationary_kernel('k0', Xs=coords, kernel_type='RBF')
         gp.add_nystrom_approximation(n_inducers=4)
-        assert gp.return_log_prob == gp._return_log_prob_nystrom
+        assert gp._log_prob_mode == 'nystrom'
         assert gp.n_inducers == 4
 
 
 class TestGPUpdateNVx:
 
-    def test_update_n_vx(self):
+    def test_update_n_vx_raises(self):
+        """GPs are immutable: resizing in place would leave stale tf.function traces"""
         from braincoder.bprf_GPs import GP
         gp = GP(n_vx=10)
-        gp.update_n_vx(20)
-        assert gp.n_vx.numpy() == 20
+        with pytest.raises(NotImplementedError):
+            gp.update_n_vx(20)
+
+    def test_subset_sets_n_vx(self):
+        from braincoder.bprf_GPs import GP
+        gp = GP(n_vx=10)
+        gp.add_xid_stationary_kernel('k0', Xs=np.arange(10.), kernel_type='RBF')
+        assert gp.subset(np.arange(4)).n_vx == 4 and gp.n_vx == 10
 
 
 class TestGPMfuncBijector:

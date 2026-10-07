@@ -214,14 +214,14 @@ class BPRF(object):
         print(f'Priors to loop through: {self.priors_to_loop}')
         self.model_labels_inv = {v:k for k,v in self.model_labels.items()}
 
-    @tf.function
+    # (plain methods, not tf.function: only called inside the per-fit tf.functions, and a tf.function
+    #  method would keep the bijector list of its first trace for every later fit)
     def _bprf_transform_parameters_forward(self, parameters):
         # Loop through parameters & bijectors (forward)
         p_out = [
             self.p_bijector_list[i].forward(parameters[:,i]) for i in range(self.n_params)
             ]
         return tf.stack(p_out, axis=-1)
-    @tf.function
     def _bprf_transform_parameters_backward(self, parameters):
         # Loop through parameters & bijectors... (but apply inverse)
         p_out = [
