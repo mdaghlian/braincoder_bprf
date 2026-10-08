@@ -496,6 +496,13 @@ class GPSpec(GP):
         # so the log prob costs O(N M) with no Cholesky
         self.orthonormal = bool(np.max(np.abs(self.gram.numpy() - np.eye(self.n_lbo))) < 1e-6)
 
+    def default_hyperpriors(self):
+        """As GP, but no default prior on gpk_var: it scales the spectral density (e.g. v^2 * 2 pi l^2 for a
+        2-D heat kernel), so a fixed-scale prior on it biases the lengthscale"""
+        priors = super().default_hyperpriors()
+        priors['gpk_var'] = None
+        return priors
+
     def positive_pids(self):
         pos = super().positive_pids() | {'gpk_var'}
         for s in self.spec_kernel_list:
