@@ -180,7 +180,14 @@ class ParameterFitter(object):
             pbar = tqdm(pbar)
 
         best_r2 = tf.ones(y.shape[1]) * -1e3
-        best_parameters = tf.zeros(init_pars.shape)
+        # Voxels that never produce a finite, improving fit keep their initial
+        # (untransformed) parameters rather than zeros.
+        best_parameters = tf.identity(
+            self.model._transform_parameters_forward(init_pars))
+
+        meaningful_np = meaningful_ts.numpy()
+        nonfinite_seen = np.zeros(n_voxels, dtype=bool)
+        warned_nonfinite_gradients = False
 
         for step in pbar:
             with tf.GradientTape() as tape:
@@ -207,8 +214,36 @@ class ParameterFitter(object):
             gradients = tape.gradient(cost, trainable_variables)
             r2 = (1 - (ssq / ssq_data))
 
+            # A voxel is non-finite if its R2 or any of its parameters is
+            # NaN/inf (constant voxels are excluded: their R2 is undefined).
+            voxel_ok = tf.math.is_finite(r2) & tf.reduce_all(
+                tf.math.is_finite(untransformed_parameters), axis=1)
+            voxel_ok_np = voxel_ok.numpy()
+            newly_bad = ~voxel_ok_np & meaningful_np & ~nonfinite_seen
+            if newly_bad.any():
+                bad_names = list(self.data.columns[newly_bad][:10])
+                logging.warning(
+                    f'Non-finite R2/parameters at step {step} for {int(newly_bad.sum())} '
+                    f'voxel(s) (first: {bad_names}). Their gradients are zeroed and '
+                    f'their last finite parameters are kept.')
+                nonfinite_seen |= newly_bad
+
+            # Zero non-finite gradients so one bad voxel cannot poison the
+            # optimizer state (or shared parameters).
+            finite_grads = [tf.where(tf.math.is_finite(g), g, tf.zeros_like(g))
+                            for g in gradients]
+            if not warned_nonfinite_gradients:
+                n_bad_grad = sum(int(tf.reduce_sum(tf.cast(~tf.math.is_finite(g), tf.int32)))
+                                 for g in gradients)
+                if n_bad_grad:
+                    logging.warning(
+                        f'{n_bad_grad} non-finite gradient value(s) at step {step}; '
+                        f'zeroed (further occurrences not reported).')
+                    warned_nonfinite_gradients = True
+            gradients = finite_grads
+
             if shared_pars is None:
-                improved_r2s = r2 > best_r2
+                improved_r2s = (r2 > best_r2) & voxel_ok
                 best_parameters = tf.where(
                     improved_r2s[:, tf.newaxis], untransformed_parameters, best_parameters)
                 best_r2 = tf.where(improved_r2s, r2, best_r2)
@@ -216,7 +251,8 @@ class ParameterFitter(object):
                 best_parameters = untransformed_parameters
                 best_r2 = r2
 
-            mean_current_r2 = r2[meaningful_ts].numpy().mean()
+            usable = meaningful_np & voxel_ok_np
+            mean_current_r2 = r2.numpy()[usable].mean() if usable.any() else np.nan
             mean_best_r2 = best_r2[meaningful_ts].numpy().mean()
 
             if step >= min_n_iterations:
@@ -239,6 +275,12 @@ class ParameterFitter(object):
                 intermediate_parameters[-1] = np.concatenate(
                     (intermediate_parameters[-1], r2), 0)
 
+
+        self.nonfinite_voxels = self.data.columns[nonfinite_seen]
+        if nonfinite_seen.any():
+            logging.warning(
+                f'{int(nonfinite_seen.sum())} voxel(s) hit non-finite values during '
+                f'fitting; see ParameterFitter.nonfinite_voxels.')
 
         self.estimated_parameters = format_parameters(
             best_parameters.numpy(), self.model.parameter_labels)
@@ -355,8 +397,8 @@ class ParameterFitter(object):
                 return ssq, best_ixs
 
         # n features x n_chunks x n_pars
-        best_pars = np.zeros((n_features, n_chunks, n_pars))
-        best_cost = np.zeros((n_features, n_chunks))
+        best_pars = np.zeros((n_features, n_chunks, n_pars), dtype=np.float32)
+        best_cost = np.zeros((n_features, n_chunks), dtype=np.float32)
 
         vox_ix = tf.range(n_features, dtype=tf.int64)
 
@@ -366,11 +408,12 @@ class ParameterFitter(object):
             best_cost[:, chunk] = tf.gather_nd(cost_, gather_ix)
             best_pars[:, chunk] = tf.gather(pg.values, best_ix)
 
-        best_chunks = tf.argmin(best_cost, 1)
-        best_pars = tf.gather_nd(
-            best_pars, tf.stack((vox_ix, best_chunks), axis=1))
+        # Pure indexing on large host arrays: do it in numpy (avoids copying
+        # a big float64 tensor to the GPU, which fails on Metal)
+        best_chunks = np.argmin(best_cost, 1)
+        best_pars = best_pars[np.arange(n_features), best_chunks]
 
-        best_pars = pd.DataFrame(best_pars.numpy(), index=self.data.columns,
+        best_pars = pd.DataFrame(best_pars, index=self.data.columns,
                                  columns=self.model.parameter_labels).astype(np.float32)
 
         if not best_pars.index.name:
@@ -436,6 +479,72 @@ class ParameterFitter(object):
             return parameters
         else:
             return self.refine_baseline_and_amplitude(parameters, n_iterations - 1)
+
+    def ols_amplitudes(self, parameters, positive_amplitude=True, min_amplitude=1e-4,
+                       return_betas=False):
+        """Exact per-voxel OLS for the linear parameters of a CRF model.
+
+        For CRF / CRFWithHRF the prediction is linear in the per-SF amplitudes
+        and the baseline(s) once the CRF shape (c50, exponent, ...) and HRF are
+        fixed. Each linear parameter's regressor is the prediction with that
+        parameter set to 1 and all other linear parameters set to 0; the
+        non-linear parameters are taken from `parameters`. Works for a single
+        post-convolution baseline (CRFWithHRF) and for per-SF baselines (CRF).
+
+        Unlike refine_baseline_and_amplitude, every SF amplitude is solved
+        independently (the SF ratio is not fixed by the input parameters).
+
+        Parameters
+        ----------
+        parameters : pd.DataFrame
+            n_voxels x n_params; supplies the shape (and HRF) parameters.
+            Amplitude/baseline values are ignored.
+        positive_amplitude : bool
+            Clip amplitudes at `min_amplitude` (they are Softplus-constrained,
+            so this gives a valid starting point for `fit`). The baselines are
+            not re-estimated after clipping.
+        return_betas : bool
+            Also return the unclipped OLS betas (n_voxels x n_linear).
+
+        Returns
+        -------
+        new_parameters (, betas)
+        """
+        if not (hasattr(self.model, '_amp_idx') and hasattr(self.model, '_base_idx')):
+            raise NotImplementedError(
+                'ols_amplitudes needs a model with per-SF amplitude/baseline indices '
+                f'(CRF, CRFWithHRF); got {type(self.model).__name__}')
+
+        labels = self.model.parameter_labels
+        amp_labels = [labels[i] for i in self.model._amp_idx]
+        base_labels = [labels[i] for i in self.model._base_idx if i is not None]
+        linear_labels = base_labels + amp_labels
+
+        parameters = parameters.copy().astype(np.float32)
+
+        # One regressor per linear parameter -> n_voxels x n_timepoints x n_linear
+        regressors = []
+        for label in linear_labels:
+            p = parameters.copy()
+            p[linear_labels] = 0.0
+            p[label] = 1.0
+            regressors.append(self.model.predict(
+                parameters=p, paradigm=self.paradigm).values)
+        X = np.stack(regressors, -1).transpose(1, 0, 2).astype(np.float64)
+        Y = self.data.T.values[..., np.newaxis].astype(np.float64)
+
+        beta = tf.linalg.lstsq(X, Y, fast=False).numpy()[..., 0]
+        betas = pd.DataFrame(beta, index=parameters.index, columns=linear_labels)
+
+        new_parameters = parameters.copy()
+        new_parameters[linear_labels] = betas.values.astype(np.float32)
+        if positive_amplitude:
+            new_parameters[amp_labels] = np.clip(
+                new_parameters[amp_labels], min_amplitude, np.inf)
+
+        if return_betas:
+            return new_parameters, betas
+        return new_parameters
 
     def _partly_fit_grid(self, fixed_pars, n_voxels, chunk_size, **kwargs):
 

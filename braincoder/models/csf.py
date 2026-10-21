@@ -336,27 +336,23 @@ class CRF(EncodingModel):
 
     Parameterisation
     ----------------
-    SF0 (the lowest SF) is the reference:
-        amplitude  – SF0 absolute amplitude (Softplus > 0)
-        baseline   – SF0 absolute baseline  (unconstrained)
-        <shape>_sf0 – SF0 shape parameters (c50, exponent, etc.)
+    Every SF has its own *absolute* amplitude (Softplus > 0), baseline
+    (unconstrained) and shape parameters (c50, exponent, ...).  The lowest SF
+    (SF0) uses the bare names `amplitude` / `baseline`; the others carry an
+    `_sf{i}` suffix:
 
-    All other SFs are expressed relative to SF0:
-        amplitude_sf{i}  – ratio of SF_i amplitude to SF0 amplitude (Softplus > 0)
-        baseline_sf{i}   – additive delta from SF0 baseline (unconstrained)
-        <shape>_sf{i}    – independent shape parameters per SF
+        SF_i response = amplitude_sf{i} * f(CON, shape_sf{i}) + baseline_sf{i}
 
-    The prediction for a timepoint at SF_i is:
-        i == 0:  amplitude * f(CON, shape_sf0) + baseline
-        i  > 0:  amplitude * amplitude_sf{i} * f(CON, shape_sf{i})
-                   + baseline + baseline_sf{i}
+    Timepoints whose SF matches no level (e.g. blanks, SF = NaN) predict SF0's
+    `baseline`.
 
-    `amplitude` and `baseline` are directly compatible with
-    refine_baseline_and_amplitude (the relative baseline deltas introduce a
-    small approximation there, which is acceptable for a refinement step).
+    `amplitude` and `baseline` are the SF0 values only, so
+    refine_baseline_and_amplitude (which rescales a single amplitude and
+    baseline) is NOT appropriate for this model.
 
-    Parameter labels: amplitude, <shape>_sf0, baseline, amplitude_sf1,
-                      <shape>_sf1, baseline_sf1, …
+    Parameter labels (per SF): amplitude, <shape>, baseline, i.e.
+        amplitude, <shape>_sf0, baseline, amplitude_sf1, <shape>_sf1,
+        baseline_sf1, ...
     """
 
     CRF_PARAM_NAMES = {
@@ -374,6 +370,9 @@ class CRF(EncodingModel):
     }
 
     stimulus_type = ContrastSensitivityStimulus
+    SF_TOLERANCE = 1e-3  # absolute tolerance when matching a timepoint's SF to a level
+    PER_SF_BASELINE = True  # False: a single (SF0) baseline shared by all SFs
+    SHARED_SHAPE = False    # True: one set of shape params (no _sf suffix) shared by all SFs
 
     def __init__(self, data=None, parameters=None,
                  SF_seq=None, CON_seq=None,
@@ -396,14 +395,35 @@ class CRF(EncodingModel):
         self.sf_levels = np.sort(sf_unique).astype('float32')
         self.n_sf = len(self.sf_levels)
 
-        # SF0 uses bare 'amplitude'/'baseline'; later SFs use relative names.
-        labels = []
+        # SF0 uses bare 'amplitude'/'baseline'; later SFs use an _sf{i} suffix.
+        # Order per SF: amplitude, <shape params>, baseline.
+        bijector_by_name = dict(zip(self._crf_param_names,
+                                    self.CRF_BIJECTORS[crf_type]))
+        shape_names = [p for p in self._crf_param_names
+                       if p not in ('amplitude', 'baseline')]
+        labels, self.p_bijector = [], {}
+        self._amp_idx, self._shape_idx, self._base_idx = [], [], []
+
+        def _add(label, pname):
+            labels.append(label)
+            self.p_bijector[label] = bijector_by_name[pname]
+            return len(labels) - 1
+
         for i in range(self.n_sf):
-            for pname in self._crf_param_names:
-                if i == 0 and pname in ('amplitude', 'baseline'):
-                    labels.append(pname)
-                else:
-                    labels.append(f'{pname}_sf{i}')
+            sfx = f'_sf{i}'
+            self._amp_idx.append(_add('amplitude' if i == 0 else 'amplitude' + sfx,
+                                      'amplitude'))
+            if not self.SHARED_SHAPE:
+                self._shape_idx.append([_add(p + sfx, p) for p in shape_names])
+            elif i == 0:
+                self._shape_idx.append([_add(p, p) for p in shape_names])
+            else:
+                self._shape_idx.append(self._shape_idx[0])
+            if i == 0 or self.PER_SF_BASELINE:
+                self._base_idx.append(_add('baseline' if i == 0 else 'baseline' + sfx,
+                                           'baseline'))
+            else:
+                self._base_idx.append(None)  # shares SF0's baseline
         self.parameter_labels = labels
 
         self.data = data
@@ -418,11 +438,6 @@ class CRF(EncodingModel):
         self.paradigm = self.stimulus.clean_paradigm(self.stim_sequence)
         self.n_params = len(self.parameter_labels)
 
-        crf_bijectors = self.CRF_BIJECTORS[crf_type]
-        self.p_bijector = {
-            label: crf_bijectors[j % self.n_crf_params]
-            for j, label in enumerate(self.parameter_labels)
-        }
         self.transformations = [(b.forward, b.inverse) for b in self.p_bijector.values()]
 
     def update_transformations(self):
@@ -450,30 +465,30 @@ class CRF(EncodingModel):
         stim    = paradigm[0]                                    # [n_timepoints, 2]
         SF_seq  = stim[:, 0][tf.newaxis, tf.newaxis, :]          # [1, 1, n_timepoints]
         CON_seq = stim[:, 1][tf.newaxis, tf.newaxis, :]          # [1, 1, n_timepoints]
+        # Blank timepoints may carry NaN contrast; NaN * mask(0) would still be NaN
+        CON_seq = tf.where(tf.math.is_nan(CON_seq), tf.zeros_like(CON_seq), CON_seq)
 
-        n = self.n_crf_params
         sf_levels = tf.constant(self.sf_levels, dtype=tf.float32)
 
-        # SF0 reference amplitude and baseline (absolute)
-        ref_amplitude = parameters[:, :, 0,     tf.newaxis]  # 'amplitude'
-        ref_baseline  = parameters[:, :, n - 1, tf.newaxis]  # 'baseline'
+        # Baseline used for SF0 and for blank / unmatched timepoints
+        ref_baseline = parameters[:, :, self._base_idx[0], tf.newaxis]
 
         crf_sum = 0.0
+        matched = 0.0  # 1 where the timepoint's SF equals one of the fitted levels
         for i in range(self.n_sf):
-            sf_mask = tf.cast(tf.abs(SF_seq - sf_levels[i]) < 1e-3, tf.float32)
-            base = i * n
+            sf_mask = tf.cast(tf.abs(SF_seq - sf_levels[i]) < self.SF_TOLERANCE, tf.float32)
+            matched = matched + sf_mask
 
-            if i == 0:
-                amplitude_i = ref_amplitude
-                baseline_i  = ref_baseline
+            amplitude_i = parameters[:, :, self._amp_idx[i], tf.newaxis]
+            if self._base_idx[i] is None:
+                baseline_i = ref_baseline
             else:
-                # amplitude_sf{i} is a ratio; baseline_sf{i} is an additive delta
-                amplitude_i = ref_amplitude * parameters[:, :, base,         tf.newaxis]
-                baseline_i  = ref_baseline  + parameters[:, :, base + n - 1, tf.newaxis]
+                baseline_i = parameters[:, :, self._base_idx[i], tf.newaxis]
+            shape = self._shape_idx[i]
 
             if self.crf_type == 'naka_rushton':
-                c50      = parameters[:, :, base + 1, tf.newaxis]
-                exponent = parameters[:, :, base + 2, tf.newaxis]
+                c50      = parameters[:, :, shape[0], tf.newaxis]
+                exponent = parameters[:, :, shape[1], tf.newaxis]
                 con_safe = tf.maximum(CON_seq, 1e-8)
                 Cn   = tf.math.pow(con_safe, exponent)
                 c50n = tf.math.pow(tf.maximum(c50, 1e-8), exponent)
@@ -481,7 +496,7 @@ class CRF(EncodingModel):
             elif self.crf_type == 'sqrt':
                 resp = amplitude_i * tf.math.sqrt(tf.maximum(CON_seq, 0.0)) + baseline_i
             elif self.crf_type == 'power':
-                exponent = parameters[:, :, base + 1, tf.newaxis]
+                exponent = parameters[:, :, shape[0], tf.newaxis]
                 con_safe = tf.maximum(CON_seq, 1e-8)
                 resp = amplitude_i * tf.math.pow(con_safe, exponent) + baseline_i
             else:  # linear
@@ -489,10 +504,44 @@ class CRF(EncodingModel):
 
             crf_sum = crf_sum + resp * sf_mask
 
+        # Blank / unmatched timepoints (e.g. SF is NaN) carry no stimulus: predict
+        # the reference baseline, consistent with CRFWithHRF (where baseline is
+        # added after convolution).
+        crf_sum = crf_sum + ref_baseline * (1.0 - tf.minimum(matched, 1.0))
+
         return tf.transpose(crf_sum, [0, 2, 1])
+
+    def _warn_unmatched_sf(self, paradigm):
+        """Warn if non-NaN SFs in the paradigm match none of the fitted SF levels."""
+        if paradigm is None:
+            return
+        sf = np.asarray(getattr(paradigm, 'values', paradigm))[:, 0].astype('float32')
+        sf = sf[~np.isnan(sf)]
+        if len(sf) == 0:
+            return
+        dist = np.abs(sf[:, np.newaxis] - self.sf_levels[np.newaxis, :]).min(1)
+        n_bad = int((dist >= self.SF_TOLERANCE).sum())
+        if n_bad:
+            logging.warning(
+                f'{n_bad} timepoint(s) have an SF not among the fitted levels '
+                f'{self.sf_levels.tolist()} (tol={self.SF_TOLERANCE}); they are '
+                f'treated as blank (baseline only).')
+
+    def predict(self, paradigm=None, parameters=None, weights=None):
+        self._warn_unmatched_sf(self.get_paradigm(paradigm))
+        return super().predict(paradigm=paradigm, parameters=parameters, weights=weights)
 
 
 class CRFWithHRF(HRFEncodingModel, CRF):
+    """CRF with HRF convolution.
+
+    The baseline is a single per-voxel scalar added after convolution (there
+    are no per-SF baselines, unlike CRF).  Amplitudes are absolute per SF and
+    are applied *before* convolution, so `_predict` is overridden rather than
+    using HRFEncodingModel's global amplitude scaling.
+    """
+    PER_SF_BASELINE = False
+
     def __init__(
         self, data=None, parameters=None,
         SF_seq=None, CON_seq=None,
@@ -520,6 +569,67 @@ class CRFWithHRF(HRFEncodingModel, CRF):
         self.transformations = [(b.forward, b.inverse) for b in self.p_bijector.values()]
         if self.flexible_hrf_parameters:
             self.transformations = self.transformations + self.hrf_model.transformations
+
+    @tf.function
+    def _predict(self, paradigm, parameters, weights=None):
+        """Per-SF amplitudes pre-convolution; single baseline post-convolution."""
+        baseline_idx = self.parameter_labels.index('baseline')
+        keep = np.ones(len(self.parameter_labels), dtype='float32')
+        keep[baseline_idx] = 0.0
+        pre_convolve = EncodingModel._predict(
+            self, paradigm, parameters * tf.constant(keep), weights)
+
+        kwargs = {}
+        if self.flexible_hrf_parameters:
+            n_hrf = len(self.hrf_model.parameter_labels)
+            for ix, label in enumerate(self.hrf_model.parameter_labels):
+                kwargs[label] = parameters[:, :, -n_hrf + ix]
+
+        pred_convolved = self.hrf_model.convolve(pre_convolve, **kwargs)
+        return pred_convolved + parameters[:, :, baseline_idx][:, tf.newaxis, :]
+
+
+class CRFSharedExponent(CRF):
+    """Power-law CRF per SF with a single exponent shared across all SFs.
+
+        SF_i response = amplitude_sf{i} * CON ** exponent + baseline_sf{i}
+
+    Parameter labels: amplitude, exponent, baseline, amplitude_sf1,
+    baseline_sf1, ...
+    """
+    SHARED_SHAPE = True
+
+    def __init__(self, data=None, parameters=None,
+                 SF_seq=None, CON_seq=None,
+                 weights=None, omega=None,
+                 verbosity=logging.INFO, **kwargs):
+        kwargs.pop('crf_type', None)
+        super().__init__(data=data, parameters=parameters,
+                         SF_seq=SF_seq, CON_seq=CON_seq,
+                         weights=weights, omega=omega,
+                         crf_type='power', verbosity=verbosity, **kwargs)
+
+
+class CRFSharedExponentWithHRF(CRFWithHRF):
+    """CRFSharedExponent with HRF convolution (single post-convolution baseline).
+
+    Parameter labels: amplitude, exponent, baseline, amplitude_sf1, ...
+    """
+    SHARED_SHAPE = True
+
+    def __init__(self, data=None, parameters=None,
+                 SF_seq=None, CON_seq=None,
+                 weights=None, omega=None,
+                 hrf_model=None, flexible_hrf_parameters=False,
+                 verbosity=logging.INFO, **kwargs):
+        kwargs.pop('crf_type', None)
+        super().__init__(data=data, parameters=parameters,
+                         SF_seq=SF_seq, CON_seq=CON_seq,
+                         weights=weights, omega=omega,
+                         crf_type='power',
+                         hrf_model=hrf_model,
+                         flexible_hrf_parameters=flexible_hrf_parameters,
+                         verbosity=verbosity, **kwargs)
 
 
 # class ContrastSensitivityTruncatedLogWithHrf(ContrastSensitivityWithHRF):    
