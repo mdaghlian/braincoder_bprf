@@ -539,6 +539,19 @@ class BPRF(object):
                 resid_ln_likelihood = tf.reduce_sum(resid_ln_likelihood, axis=0)
                 return resid_ln_likelihood              
         
+        elif self.noise_method == 'fit_ar1':
+            # Exact AR(1) likelihood: Gaussian innovations r[t] - phi*r[t-1] with SD noise_scale, plus the
+            # first sample from the stationary distribution N(0, noise_scale / sqrt(1 - phi^2))
+            @tf.function
+            def residual_ln_likelihood_fn(parameters, residuals):
+                noise_scale = parameters[:, self.model_labels['noise_scale']]
+                noise_ar1 = parameters[:, self.model_labels['noise_ar1']]
+                innov = residuals[1:] - tf.expand_dims(noise_ar1, 0) * residuals[:-1]
+                innov_ln = tf.reduce_sum(tfd.Normal(loc=0.0, scale=noise_scale).log_prob(innov), axis=0)
+                init_scale = noise_scale / tf.sqrt(1.0 - noise_ar1 ** 2)
+                init_ln = tfd.Normal(loc=0.0, scale=init_scale).log_prob(residuals[0])
+                return innov_ln + init_ln
+
         elif self.noise_method == 'none': 
             # Do not fit the noise - assume it is normally distributed
             # -> calculate scale based on the standard deviation of the residuals 

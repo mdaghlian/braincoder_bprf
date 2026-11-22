@@ -679,7 +679,7 @@ class BPRF_hier(BPRF):
                 )
                 innov_ln_sum = tf.reduce_sum(innov_ln, axis=0)
                 denom = 1.0 - noise_ar1 ** 2
-                init_scale = noise_scale / denom
+                init_scale = noise_scale / tf.sqrt(denom)   # stationary SD of the first sample
                 init_ln = calculate_log_prob_gauss_loc0(
                     data=residuals[0,:],
                     scale=init_scale,
