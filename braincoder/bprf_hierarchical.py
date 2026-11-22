@@ -37,8 +37,20 @@ class BPRF_hier(BPRF):
         self.h_mcmc_summary = None
         self.h_mcmc_mean = None
         self.h_fixed_pars = {}
+        # Tie the stationary-kernel lengthscales (gpk{xid}_l) of GPs on different parameters?
+        # -> {pid}_gpk{xid}_l all point to one h-parameter, shared_gpk{xid}_l (per kernel xid)
+        self.shared_lengthscale = kwargs.get('shared_lengthscale', False)
+        self.h_label_alias = {}     # {pid}_{gp key} -> shared label
+        self._shared_l_median = {}  # shared label -> median distance of the first GP (to check units)
+        self.masked_voxels = np.array([], dtype='int64')
         # MAP
         self.h_MAP_parameters = None
+        self.MAP_fit_info = None
+
+    def _h_label(self, pid, k):
+        ''' h-parameter label of GP key k on parameter pid (resolving shared lengthscales) '''
+        label = f'{pid}_{k}'
+        return self.h_label_alias.get(label, label)
 
     def h_add_param(self, pid, h_prior_to_apply, **kwargs):
         ''' Add the parameters for the hierarchical priors
@@ -54,6 +66,9 @@ class BPRF_hier(BPRF):
             gp_space    : 'constrained' (default; GP on the parameter value) or 'unconstrained'
                           (GP on the bijector-inverse of the parameter, e.g. log amplitude with an Exp bijector)
             hyperpriors : {gp key: tfd distribution or None} overriding gp.default_hyperpriors()
+            shared_lengthscale : tie gpk{xid}_l to the other GPs with a kernel xid (default: self.shared_lengthscale).
+                          The shared h-parameter is called shared_gpk{xid}_l; its bijector & prior come from
+                          the first GP added with that kernel.
         '''
         # [1] make sure the 'p_prior' is none, because we are doing hierarchical priors now! (i.e., the direct prior is not used)
         self.p_prior[pid] = PriorNone()
@@ -84,9 +99,23 @@ class BPRF_hier(BPRF):
             assert self.h_gp_space[pid] in ('constrained', 'unconstrained')
             hyperpriors = {**gp.default_hyperpriors(), **kwargs.pop('hyperpriors', {})}
             positive = gp.positive_pids()
+            shared = kwargs.pop('shared_lengthscale', self.shared_lengthscale)
+            shared_keys = {f'gpk{s}_l': s for s in gp.stat_kernel_list} if shared else {}
             for k in gp.pids_inv.keys():
                 # Bijector & prior are decided on the GP's own key (k), never on the full label
                 label = f'{pid}_{k}'
+                if k in shared_keys:
+                    s = shared_keys[k]
+                    self.h_label_alias[label] = f'shared_{k}'
+                    label = f'shared_{k}'
+                    if label in self.h_labels:
+                        # already added by another parameter's GP
+                        other = self._shared_l_median[label]
+                        if not np.isclose(other, gp.median_dX[s], rtol=1e-2):
+                            print(f'Warning: {label} is shared, but the median distances of the GPs differ '
+                                  f'({other:.3g} vs {gp.median_dX[s]:.3g}); are they in the same units?')
+                        continue
+                    self._shared_l_median[label] = gp.median_dX[s]
                 self.h_labels[label] = len(self.h_labels)
                 self.h_add_bijector(pid=label, bijector_type=tfb.Softplus() if k in positive else tfb.Identity())
                 if hyperpriors.get(k) is None:
@@ -154,8 +183,15 @@ class BPRF_hier(BPRF):
         (the stored priors / bijectors are left untouched).
         '''
         # hyperparameters frozen in a GP (gp.set_log_prob_fixed) are held fixed, so they are reported correctly
-        h_fixed = {f'{pid}_{k}': float(v) for pid, gp in self.h_gp_function.items() if gp.is_fixed
-                   for k, v in gp._fixed_kwargs.items()}
+        h_fixed = {}
+        for pid, gp in self.h_gp_function.items():
+            if not gp.is_fixed:
+                continue
+            for k, v in gp._fixed_kwargs.items():
+                label = self._h_label(pid, k)
+                if label in h_fixed and not np.isclose(h_fixed[label], float(v)):
+                    raise ValueError(f'{label} is shared, but fixed to {h_fixed[label]} and {float(v)} by different GPs')
+                h_fixed[label] = float(v)
         user_fixed = self.h_fixed_pars
         if isinstance(user_fixed, pd.DataFrame):
             user_fixed = user_fixed.iloc[0].to_dict()
@@ -216,10 +252,133 @@ class BPRF_hier(BPRF):
     def _restore_gps(self):
         self.h_gp_active = dict(self.h_gp_function)
 
+    def _valid_voxel_mask(self):
+        ''' Voxels with finite, non-constant data [n_voxels] '''
+        y = self.data.values
+        finite = np.all(np.isfinite(y), axis=0)
+        return finite & (np.nanstd(y, axis=0) > 0)
+
+    def _drop_invalid_idx(self, idx, valid):
+        ''' Remove vertices that are not valid from idx. They are not fit (and are left out of the GPs),
+        so they keep their init values. Returns (idx, keep) with keep a bool mask over the input idx
+        '''
+        keep = valid[idx]
+        self.masked_voxels = idx[~keep]
+        if not keep.all():
+            print(f'Masking {int((~keep).sum())} constant/non-finite voxel(s); they keep their init values '
+                  f'(see self.masked_voxels)')
+        if not keep.any():
+            raise ValueError('No voxels left to fit after masking constant/non-finite voxels')
+        return idx[keep], keep
+
+    @staticmethod
+    def _subset_fixed_pars(fixed_pars, keep):
+        ''' Per-vertex fixed values (one per vertex in the original idx) -> the kept vertices only '''
+        n = len(keep)
+        if isinstance(fixed_pars, pd.DataFrame):
+            return fixed_pars.iloc[keep].reset_index(drop=True) if len(fixed_pars) == n else fixed_pars
+        out = {}
+        for k, v in fixed_pars.items():
+            a = np.asarray(v)
+            out[k] = a[keep] if (a.ndim > 0 and len(a) == n and n > 1) else v
+        return out
+
+    @staticmethod
+    def _pop_optimizer_kwargs(kwargs):
+        ''' The _run_MAP_optimizer options, popped from kwargs '''
+        names = ['clipnorm', 'patience', 'min_rel_improvement', 'restore_best', 'max_nonfinite']
+        return {n: kwargs.pop(n) for n in names if n in kwargs}
+
+    def _run_MAP_optimizer(self, neg_log_posterior_fn, opt_vars, num_steps, desc,
+                           adam_kwargs=None, clipnorm=1.0, patience=None, min_rel_improvement=1e-6,
+                           restore_best=True, max_nonfinite=20, step_callback=None):
+        ''' Adam on neg_log_posterior_fn (no arguments) over opt_vars, with guard rails:
+        * non-finite loss: no update; the variables go back to the last finite state and the
+          learning rate is halved. Stops after max_nonfinite non-finite steps in a row.
+        * non-finite gradient entries are zeroed (as in ParameterFitter)
+        * gradients are clipped to a global norm of clipnorm (None: no clipping)
+        * early stopping after patience steps without a relative improvement of min_rel_improvement
+          in the best loss (patience=None: always run num_steps)
+        * restore_best: finish on the lowest-loss state seen rather than the last one
+        step_callback(step, loss, gradients) is called after each update.
+        Returns a dict with info on the run (also stored as self.MAP_fit_info)
+        '''
+        optimizer = tf.optimizers.Adam(**(adam_kwargs or {}))
+        snapshot = lambda: [tf.identity(v) for v in opt_vars]
+        def assign(state):
+            for v, x in zip(opt_vars, state):
+                v.assign(x)
+
+        best_loss, best_step = np.inf, -1
+        best_state = last_good = snapshot()
+        n_nonfinite, nonfinite_run, since_improved = 0, 0, 0
+        warned_grad, stopped_early = False, False
+        loss_history = []
+        progress_bar = tqdm(range(num_steps), desc=desc)
+        for step in progress_bar:
+            with tf.GradientTape() as tape:
+                loss = neg_log_posterior_fn()
+            loss_np = float(loss.numpy())
+            loss_history.append(loss_np)
+            if not np.isfinite(loss_np):
+                n_nonfinite += 1
+                nonfinite_run += 1
+                assign(last_good)
+                try:
+                    optimizer.learning_rate = float(optimizer.learning_rate) * 0.5
+                except Exception:   # e.g. a learning rate schedule
+                    pass
+                if nonfinite_run >= max_nonfinite:
+                    print(f'Warning: {nonfinite_run} non-finite losses in a row at step {step}; stopping')
+                    break
+                continue
+            nonfinite_run = 0
+            last_good = snapshot()
+
+            # best state & early stopping
+            significant = (not np.isfinite(best_loss)) or (
+                best_loss - loss_np > min_rel_improvement * max(1.0, abs(best_loss)))
+            since_improved = 0 if significant else since_improved + 1
+            if loss_np < best_loss:
+                best_loss, best_step, best_state = loss_np, step, last_good
+            if patience is not None and since_improved >= patience:
+                stopped_early = True
+                break
+
+            gradients = tape.gradient(loss, opt_vars)
+            gradients = [tf.zeros_like(v) if g is None else g for g, v in zip(gradients, opt_vars)]
+            n_bad = sum(int(tf.reduce_sum(tf.cast(~tf.math.is_finite(g), tf.int32))) for g in gradients)
+            if n_bad:
+                if not warned_grad:
+                    print(f'Warning: {n_bad} non-finite gradient value(s) at step {step}; zeroed '
+                          f'(further occurrences not reported)')
+                    warned_grad = True
+                gradients = [tf.where(tf.math.is_finite(g), g, tf.zeros_like(g)) for g in gradients]
+            if clipnorm is not None:
+                gradients, _ = tf.clip_by_global_norm(gradients, clipnorm)
+            optimizer.apply_gradients(zip(gradients, opt_vars))
+            progress_bar.set_description(f'{desc}, Loss: {loss_np:.4f} (best {best_loss:.4f})')
+            if step_callback is not None:
+                step_callback(step, loss_np, gradients)
+
+        # the state after the last update has not been evaluated yet
+        final_loss = float(neg_log_posterior_fn().numpy())
+        if np.isfinite(final_loss) and final_loss < best_loss:
+            best_loss, best_step, best_state = final_loss, len(loss_history), snapshot()
+        if restore_best or not np.isfinite(final_loss):
+            assign(best_state if restore_best else last_good)
+        if n_nonfinite:
+            print(f'Warning: {n_nonfinite} step(s) with a non-finite loss were skipped')
+        self.MAP_fit_info = dict(
+            n_steps=len(loss_history), best_step=best_step, best_loss=best_loss, final_loss=final_loss,
+            n_nonfinite=n_nonfinite, stopped_early=stopped_early, loss=loss_history,
+        )
+        return self.MAP_fit_info
+
     def _gp_kwargs(self, pid, h_parameters):
         ''' Hyperparameters of the GP on pid, by exact label '''
         gp = self.h_gp_active[pid]
-        return {k: h_parameters[:, self.h_labels[f'{pid}_{k}']] for k in gp.pids_inv}
+        return {k: h_parameters[:, self.h_labels[self._h_label(pid, k)]] for k in gp.pids_inv}
 
     def _gp_log_prior(self, pid, parameters, h_parameters):
         ''' log GP prior of parameter pid, as a density over the constrained parameter '''
@@ -420,6 +579,9 @@ class BPRF_hier(BPRF):
 
         Vertices not in idx keep their init_pars values in self.MAP_parameters.
         kwargs: h_fixed_pars, adam_kwargs, verbose (print per-parameter gradients), track_params/loss/gradients
+            mask_constant (True): leave out voxels with constant / non-finite data (they keep their init values)
+            clipnorm (1.0), patience (None), min_rel_improvement (1e-6), restore_best (True), max_nonfinite (20):
+                see _run_MAP_optimizer. Info on the run is stored in self.MAP_fit_info
         '''
         optimizer_type = kwargs.get('optimizer', 'adam' )
         track_params = kwargs.get('track_params', False)
@@ -427,7 +589,11 @@ class BPRF_hier(BPRF):
         track_gradients = kwargs.get('track_gradients', False)
         verbose = kwargs.pop('verbose', False)
         adam_kwargs = kwargs.pop('adam_kwargs', {})
+        opt_kwargs = self._pop_optimizer_kwargs(kwargs)
         idx = self._clean_idx(idx, self.n_voxels)
+        if kwargs.pop('mask_constant', True):
+            idx, keep = self._drop_invalid_idx(idx, self._valid_voxel_mask())
+            fixed_pars = self._subset_fixed_pars(fixed_pars, keep)
         self.idx_to_fit = idx
         self._update_gps_for_idx(idx)
 
@@ -528,21 +694,13 @@ class BPRF_hier(BPRF):
             self._print_gradients(tape.gradient(loss, all_opt_vars))
         # **** **** **** ****
 
-        optimizer = tf.optimizers.Adam(**adam_kwargs)
-        # Optimization loop with tqdm progress bar
-        progress_bar = tqdm(tf.range(num_steps), desc="MAP hier")
         track_params_list = []
         track_h_params_list = []
         track_loss_list = []
         track_gradients_list = []
-        for step in progress_bar:
-            with tf.GradientTape() as tape:
-                loss = neg_log_posterior_fn()
-            gradients = tape.gradient(loss, all_opt_vars)
-            optimizer.apply_gradients(zip(gradients, all_opt_vars))
-            progress_bar.set_description(f"MAP hier, Loss: {loss.numpy():.4f}")
+        def step_callback(step, loss, gradients):
             if track_loss:
-                track_loss_list.append(loss.numpy())
+                track_loss_list.append(loss)
             if track_gradients:
                 track_gradients_list.append([grad.numpy() for grad in gradients])
             if track_params:
@@ -550,6 +708,9 @@ class BPRF_hier(BPRF):
                 track_params_list.append(current_p)
                 current_h = [self.h_bijector_list[i](ov).numpy() for i, ov in enumerate(all_opt_vars[self.n_params:])]
                 track_h_params_list.append(current_h)
+
+        self._run_MAP_optimizer(neg_log_posterior_fn, all_opt_vars, num_steps, 'MAP hier',
+                                adam_kwargs=adam_kwargs, step_callback=step_callback, **opt_kwargs)
 
         self.MAP_track ={}
         if track_params:
@@ -732,13 +893,34 @@ class BPRF_hier(BPRF):
 
         A sort of "empirical bayesian approach
 
-        pid_pars: DataFrame over all n_voxels (rows idx are used)
+        pid_pars: DataFrame over all n_voxels (rows idx are used). Vertices where a pid_pars value is
+                  non-finite (in the GP's space) are always left out.
+        kwargs: h_fixed_pars, adam_kwargs, verbose,
+            mask_constant (True): also leave out voxels with constant / non-finite data
+            clipnorm (1.0), patience (None), min_rel_improvement (1e-6), restore_best (True), max_nonfinite (20):
+                see _run_MAP_optimizer
         This is an alternative to fitting everything at the same time. Which is also an option in
         '''
         optimizer_type = kwargs.get('optimizer', 'adam' )
         verbose = kwargs.pop('verbose', False)
         adam_kwargs = kwargs.pop('adam_kwargs', {})
-        idx = self._clean_idx(idx, self.n_voxels)
+        opt_kwargs = self._pop_optimizer_kwargs(kwargs)
+        if not isinstance(pid, list):
+            pid = [pid]
+        # values of each parameter in the space of its GP (all vertices)
+        pid_vals = {}
+        for p in pid:
+            if self.h_prior_to_apply[p] != 'gp':
+                raise ValueError(f'{p} has no GP prior')
+            vals = tf.convert_to_tensor(pid_pars[p].values.astype(np.float32), dtype=tf.float32, name=p)
+            if self.h_gp_space[p] == 'unconstrained':
+                vals = self.p_bijector[p].inverse(vals)
+            pid_vals[p] = vals.numpy()
+
+        valid = np.all([np.isfinite(v) for v in pid_vals.values()], axis=0)
+        if kwargs.pop('mask_constant', True):
+            valid &= self._valid_voxel_mask()
+        idx, _ = self._drop_invalid_idx(self._clean_idx(idx, self.n_voxels), valid)
         self.idx_to_fit = idx
         self._update_gps_for_idx(idx)
         vx_bool = np.zeros(self.n_voxels, dtype=bool)
@@ -749,16 +931,7 @@ class BPRF_hier(BPRF):
         self.h_prep_for_fitting(**kwargs)
         self.h_n_params = len(self.h_labels)
 
-        if not isinstance(pid, list):
-            pid = [pid]
-        pid_pars_tf = {}
-        for p in pid:
-            if self.h_prior_to_apply[p] != 'gp':
-                raise ValueError(f'{p} has no GP prior')
-            vals = tf.convert_to_tensor(pid_pars[p].values.astype(np.float32)[vx_bool], dtype=tf.float32, name=p)
-            if self.h_gp_space[p] == 'unconstrained':
-                vals = self.p_bijector[p].inverse(vals)
-            pid_pars_tf[p] = vals
+        pid_pars_tf = {p: tf.constant(v[vx_bool], dtype=tf.float32) for p, v in pid_vals.items()}
         h_init_pars = self.sort_h_parameters(h_init_pars)
         h_init_pars = format_parameters(h_init_pars)
         h_init_pars = h_init_pars.values.astype(np.float32)
@@ -830,16 +1003,8 @@ class BPRF_hier(BPRF):
                 print(f' Hierarchical {self.h_labels_inv[i]}: {None if grad is None else grad.numpy()}')
         # **** **** **** ****
 
-        optimizer = tf.optimizers.Adam(**adam_kwargs)
-        progress_bar = tqdm(tf.range(num_steps), desc="MAP GP only")
-
-        for step in progress_bar:
-            with tf.GradientTape() as tape:
-                loss = neg_log_posterior_fn()
-            gradients = tape.gradient(loss, h_opt_vars)
-            optimizer.apply_gradients(zip(gradients, h_opt_vars))
-            progress_bar.set_description(f"MAP GP only, Loss: {loss.numpy():.4f}")
-
+        self._run_MAP_optimizer(neg_log_posterior_fn, h_opt_vars, num_steps, 'MAP GP only',
+                                adam_kwargs=adam_kwargs, **opt_kwargs)
 
         # Extract optimized parameters
         # -> apply the fixed values, then transform parameters forward
@@ -848,3 +1013,153 @@ class BPRF_hier(BPRF):
         self.h_MAP_parameters = pd.DataFrame(h_final, columns=list(self.h_labels))
         print('MAP optimization finished.')
         self._restore_gps()
+
+    def h_default_init_pars(self, pars):
+        ''' Data-driven starting values for every h-parameter, from per-vertex estimates pars
+        (DataFrame over all n_voxels, e.g. a classical fit; constant / non-finite voxels are ignored).
+        normal: loc, scale = mean, std. GP (in its gp_space): mfunc_mean = mean, slopes 0, half the variance
+        in the nugget and half spread over the kernels, lengthscales = half the median distance,
+        warp weights = 1/std(Xs), spectral parameters 1.
+        Returns a 1-row DataFrame with columns h_labels
+        '''
+        valid = self._valid_voxel_mask()
+        h = {}
+        for pid, how in self.h_prior_to_apply.items():
+            x = pars[pid].values.astype(np.float32)
+            if how == 'gp' and self.h_gp_space[pid] == 'unconstrained':
+                x = self.p_bijector[pid].inverse(x).numpy()
+            x = x[valid & np.isfinite(x)].astype('float64')
+            mu = float(np.mean(x)) if len(x) else 0.0
+            var = max(float(np.var(x)) if len(x) > 1 else 1.0, 1e-6)
+            if how == 'normal':
+                h[f'{pid}_loc'], h[f'{pid}_scale'] = mu, np.sqrt(var)
+                continue
+            gp = self.h_gp_function[pid]
+            kernels = gp.stat_kernel_list + gp.warp_kernel_list
+            init = {'gpk_nugget': 0.5 * var, 'mfunc_mean': mu}
+            init.update({f'gpk{s}_v': np.sqrt(0.5 * var / len(kernels)) for s in kernels})
+            init.update({f'gpk{s}_l': gp.median_dX[s] / 2 for s in gp.stat_kernel_list})
+            for s in gp.warp_kernel_list:
+                sd = np.std(gp.Xs[s].numpy(), axis=0)
+                init.update({f'gpk{s}_w{i}': 1.0 / sd[i] if sd[i] > 0 else 1.0 for i in range(len(sd))})
+            if isinstance(gp, GPSpec):
+                # sum(kappa) / n_vx ~ prior variance per vertex, with an orthonormal basis
+                init['gpk_var'] = 0.5 * var * gp.n_vx / gp.n_lbo
+            for k in gp.pids_inv:
+                # remaining keys: mean-function slopes (0) and spectral kernel parameters (1)
+                default = 0.0 if k.startswith('mfunc') else 1.0
+                h.setdefault(self._h_label(pid, k), float(init.get(k, default)))
+        return pd.DataFrame([h])[list(self.h_labels)].astype('float32')
+
+    def fit_MAP_empirical_bayes(self,
+                init_pars,
+                gp_pids=None,
+                h_init_pars=None,
+                idx=None,
+                fixed_pars={},
+                classical_fit=True,
+                fix_hyperparameters=True,
+                classical_kwargs=None,
+                gp_only_kwargs=None,
+                map_kwargs=None):
+        '''
+        The 3-stage empirical-Bayes recipe in one call:
+        [1] classical fit: ParameterFitter from init_pars (e.g. a grid fit). Skip with classical_fit=False.
+            Noise parameters are set from the stage-1 residuals (unless given in init_pars and [1] is skipped)
+        [2] GP hyperparameters fitted to the stage-1 estimates of gp_pids (fit_MAP_hier_GP_only)
+        [3] MAP refit of all parameters under the GP priors (fit_MAP_hier), with the hyperparameters of
+            gp_pids held at their stage-2 values (fix_hyperparameters=True; exact GPs are then factorised
+            once, not every step) or refined jointly (False)
+
+        init_pars       : DataFrame over all n_voxels; model parameters (+ optionally noise parameters)
+        gp_pids         : parameters whose GP hyperparameters are fit in [2] (default: all with a GP prior)
+        h_init_pars     : starting h-parameters; missing ones come from h_default_init_pars
+        idx             : vertices to fit (others keep init_pars)
+        fixed_pars      : {label: value(s)} held fixed in [1] and [3] (per-vertex values follow idx)
+        classical_kwargs: to ParameterFitter.fit (e.g. max_n_iterations, learning_rate)
+        gp_only_kwargs, map_kwargs: to fit_MAP_hier_GP_only / fit_MAP_hier (defaults: num_steps=1000, patience=100)
+        Returns self.MAP_parameters; the output of each stage is kept in self.EB_stages
+        '''
+        from .optimize import ParameterFitter
+        model_cols = list(self.model.parameter_labels)
+        idx_ = self._clean_idx(idx, self.n_voxels)
+        pars = init_pars.reset_index(drop=True).astype('float32')
+        for k, v in fixed_pars.items():
+            if k not in pars:
+                pars[k] = np.float32(np.nan)
+            pars.iloc[idx_, pars.columns.get_loc(k)] = np.asarray(v, dtype='float32')
+
+        # [1] classical fit
+        if classical_fit:
+            print('*** Stage 1: classical fit ***')
+            pf = ParameterFitter(self.model, self.data.iloc[:, idx_], self.paradigm)
+            fit_fixed = [k for k in fixed_pars if k in model_cols]
+            est = pf.fit(init_pars=pars.iloc[idx_][model_cols].set_axis(pf.data.columns),
+                         fixed_pars=fit_fixed or None, **(classical_kwargs or {}))
+            pars.iloc[idx_, [pars.columns.get_loc(k) for k in model_cols]] = est[model_cols].values
+
+        # noise parameters from the residuals
+        resid = self.data.values - self.model.predict(self.paradigm, pars[model_cols], None).values
+        sd = np.nanstd(resid, axis=0)
+        ok = np.isfinite(sd) & (sd > 0)
+        sd = np.where(ok, sd, np.median(sd[ok]) if ok.any() else 1.0)
+        noise_init = {'noise_scale': sd}
+        if self.noise_method == 'fit_tdist':
+            noise_init['noise_dof'] = np.full(self.n_voxels, 5.0)
+        elif self.noise_method == 'fit_ar1':
+            r = resid - np.nanmean(resid, axis=0)
+            ar1 = np.nansum(r[1:] * r[:-1], axis=0) / np.maximum(np.nansum(r * r, axis=0), 1e-12)
+            ar1 = np.clip(np.nan_to_num(ar1), -0.9, 0.9)
+            noise_init.update(noise_ar1=ar1, noise_scale=sd * np.sqrt(1 - ar1 ** 2))   # innovation sd
+        for k, v in noise_init.items():
+            if k in self.model_labels and (classical_fit or k not in pars) and k not in fixed_pars:
+                pars[k] = v.astype('float32')
+        pars = pars[list(self.model_labels)]
+
+        # [2] GP hyperparameters on the stage-1 estimates
+        if gp_pids is None:
+            gp_pids = [p for p, how in self.h_prior_to_apply.items() if how == 'gp']
+        gp_pids = [gp_pids] if isinstance(gp_pids, str) else list(gp_pids)
+        h0 = self.h_default_init_pars(pars)
+        if h_init_pars is not None:
+            for k in h_init_pars.columns:
+                if k in h0:
+                    h0[k] = np.float32(h_init_pars[k].values[0])
+        print('*** Stage 2: GP hyperparameters ***')
+        self.fit_MAP_hier_GP_only(pid=gp_pids, pid_pars=pars, h_init_pars=h0, idx=idx,
+                                  **{'num_steps': 1000, 'patience': 100, **(gp_only_kwargs or {})})
+        h_stage2 = self.h_MAP_parameters.copy()
+
+        # [3] MAP refit with the GP priors
+        print('*** Stage 3: MAP with GP priors ***')
+        map_kwargs = {'num_steps': 1000, 'patience': 100, **(map_kwargs or {})}
+        h_fixed = dict(map_kwargs.pop('h_fixed_pars', {}))
+        originals = dict(self.h_gp_function)
+        try:
+            if fix_hyperparameters:
+                for p in gp_pids:
+                    gp = originals[p]
+                    hyp = {k: float(h_stage2[self._h_label(p, k)].values[0]) for k in gp.pids_inv}
+                    if gp.is_fixed:
+                        continue
+                    if gp.nystrom or gp._log_prob_mode == 'univariate':
+                        # (a fixed dense covariance would change the approximation)
+                        h_fixed.update({self._h_label(p, k): v for k, v in hyp.items()})
+                    else:
+                        # a frozen copy: the user's GP objects are left as they are
+                        gp_fixed = copy.copy(gp)
+                        gp_fixed.set_log_prob_fixed(**hyp)
+                        self.h_gp_function[p] = gp_fixed
+            self.fit_MAP_hier(init_pars=pars, h_init_pars=h_stage2, idx=idx, fixed_pars=fixed_pars,
+                              h_fixed_pars=h_fixed, **map_kwargs)
+        finally:
+            self.h_gp_function = originals
+            self._restore_gps()
+
+        self.EB_stages = {
+            'classical': pars,
+            'hyperparameters': h_stage2,
+            'MAP': self.MAP_parameters,
+            'h_MAP': self.h_MAP_parameters,
+        }
+        return self.MAP_parameters

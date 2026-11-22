@@ -40,17 +40,18 @@ class GP():
         Args:
             n_vx: number of vertices
             **kwargs: Optional parameters, such as:
-                - psd_control: 'none' (default) or 'euclidean'. 'euclidean' replaces each distance
-                  matrix with distances in a classical-MDS embedding (embedding_dim), which makes
-                  e.g. geodesic distances give a positive definite kernel.
-                - embedding_dim: dimensions for the MDS embedding (default 10)
+                - psd_control: 'euclidean' (default) or 'none'. 'euclidean' replaces each precomputed
+                  distance matrix (dXs) with distances in a classical-MDS embedding, which makes e.g.
+                  geodesic distances give a positive definite kernel. Kernels built from coordinates
+                  (Xs) are Euclidean already and are left alone.
+                - embedding_dim: dimensions for the MDS embedding (default None: all positive eigenvalues)
                 - gp_dtype: dtype for the covariance algebra (default tf.float64)
                 - eps: relative jitter added to the diagonal: eps * (1 + total kernel variance)
         """
         self.n_vx = int(n_vx)
-        self.psd_control   = kwargs.get('psd_control', 'none')  # 'euclidean' or 'none'
+        self.psd_control   = kwargs.get('psd_control', 'euclidean')  # 'euclidean' or 'none'
         self.eps           = kwargs.get('eps', 1e-6)
-        self.embedding_dim = kwargs.get('embedding_dim', 10)
+        self.embedding_dim = kwargs.get('embedding_dim', None)
         self.gp_dtype      = kwargs.get('gp_dtype', tf.float64)
 
         self.stat_kernel_list = []
@@ -182,13 +183,13 @@ class GP():
             if Xs.ndim == 1:
                 Xs = Xs[:, None]
             self.Xs[xid] = tf.convert_to_tensor(Xs, dtype=self.gp_dtype)
-            dXs = _pairwise_dist_np(Xs)
-        dXs = np.array(dXs, dtype='float64')
-        if psd_control == 'euclidean':
-            print('Embedding in Euclidean space...')
+            dXs = _pairwise_dist_np(Xs)     # Euclidean already: no embedding needed
+        elif psd_control == 'euclidean':
+            dXs = np.array(dXs, dtype='float64')
             emb = mds_embedding(tf.constant(dXs), embedding_dim).numpy()
+            print(f'Embedding in Euclidean space ({emb.shape[1]} dims)...')
             dXs = _pairwise_dist_np(emb)
-            self.Xs.pop(xid, None)            # distances no longer match the raw coordinates
+        dXs = np.array(dXs, dtype='float64')
         dXs = (dXs + dXs.T) / 2.0
         np.fill_diagonal(dXs, 0.0)
         self.dXs[xid] = tf.convert_to_tensor(dXs, dtype=self.gp_dtype)
@@ -593,7 +594,7 @@ class GPSpec(GP):
 
 # ******* SUPPORTING FUNCTIONS *********
 @tf.function
-def mds_embedding(distance_matrix, embedding_dim=10, eps=1e-3):
+def mds_embedding(distance_matrix, embedding_dim=10, eps=1e-8):
     """
     Converts a geodesic distance matrix into a Euclidean embedding using classical MDS.
 
@@ -608,8 +609,8 @@ def mds_embedding(distance_matrix, embedding_dim=10, eps=1e-3):
     Args:
         distance_matrix: A [n x n] tensor of geodesic distances.
         embedding_dim: Optional integer specifying the number of dimensions for the embedding.
-            If None, it uses the number of positive eigenvalues.
-        eps: A threshold to consider eigenvalues as positive.
+            If None, it uses all positive eigenvalues.
+        eps: Eigenvalues above eps * (largest eigenvalue) count as positive (only used if embedding_dim is None).
 
     Returns:
         A [n x d] tensor of embedded coordinates.
@@ -627,9 +628,9 @@ def mds_embedding(distance_matrix, embedding_dim=10, eps=1e-3):
     K = -0.5 * tf.matmul(J, tf.matmul(D2, J))
     # 5. Eigen decomposition (ascending eigenvalues)
     eigenvalues, eigenvectors = tf.linalg.eigh(K)
-    # 6. Embedding dimension: number of eigenvalues > eps, if not given
+    # 6. Embedding dimension: number of (relatively) positive eigenvalues, if not given
     if embedding_dim is None:
-        positive_mask = eigenvalues > eps
+        positive_mask = eigenvalues > eps * tf.maximum(eigenvalues[-1], 0)
         embedding_dim = tf.reduce_sum(tf.cast(positive_mask, tf.int32))
     # 7. Largest 'embedding_dim' eigenpairs
     eigenvalues = eigenvalues[-embedding_dim:]
